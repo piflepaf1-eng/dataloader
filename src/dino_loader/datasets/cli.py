@@ -6,15 +6,55 @@ from typing import Dict, Set
 from dino_loader.datasets.dataset import Dataset
 from dino_loader.datasets.settings import resolve_datasets_root
 from dino_loader.datasets.stub_gen import generate_stubs
+from dino_loader.datasets.utils import validate_webdataset_shard
+
+# ── ANSI colour helpers ───────────────────────────────────────────────────────
+_GREEN  = "\033[32m"
+_RED    = "\033[31m"
+_RESET  = "\033[0m"
+_BOLD   = "\033[1m"
+
+
+def _green(text: str) -> str:
+    return f"{_GREEN}{text}{_RESET}"
+
+
+def _red(text: str) -> str:
+    return f"{_RED}{text}{_RESET}"
+
+
+def _is_split_compliant(split_path: str) -> bool:
+    """
+    Returns True iff the split directory contains at least one .tar file
+    **and** every .tar has a matching (non-stale) .idx file beside it.
+
+    A folder is deemed non-compliant if:
+      - it contains no .tar files at all, or
+      - any .tar is missing its .idx counterpart, or
+      - any .tar/.idx pair fails the fast structural validation.
+    """
+    tar_files = [f for f in os.listdir(split_path) if f.endswith(".tar")]
+    if not tar_files:
+        return False
+
+    for fname in tar_files:
+        tar_path = os.path.join(split_path, fname)
+        idx_path = os.path.join(split_path, fname[:-4] + ".idx")
+        if not validate_webdataset_shard(tar_path, idx_path):
+            return False
+
+    return True
 
 
 def preview_datasets(root_path: str = None):
     """
     Prints a tree-like view of available datasets organised by
     confidentiality / modality.
+
+    Split directories are highlighted:
+      • 🟢 green  — WebDataset + .idx compliant (all shards valid)
+      • 🔴 red    — non-compliant (missing .idx, corrupt tar, or empty dir)
     """
-    # [FIX-F] Call resolve_datasets_root() directly instead of constructing a
-    # dummy Dataset object just to access its .root_path attribute.
     base_dir = resolve_datasets_root(root_path)
 
     if not os.path.exists(base_dir):
@@ -22,6 +62,7 @@ def preview_datasets(root_path: str = None):
         return
 
     print(f"Dataset Root: {base_dir}\n")
+    print(f"  {_green('■')} webdataset + idx compliant    {_red('■')} non-compliant\n")
 
     for conf in sorted(os.listdir(base_dir)):
         conf_path = os.path.join(base_dir, conf)
@@ -45,8 +86,16 @@ def preview_datasets(root_path: str = None):
                     split_path = os.path.join(dataset_path, split)
                     if not os.path.isdir(split_path):
                         continue
-                    shards = [f for f in os.listdir(split_path) if f.endswith(".tar")]
-                    print(f"      └── {split} ({len(shards)} shards)")
+
+                    shards    = [f for f in os.listdir(split_path) if f.endswith(".tar")]
+                    compliant = _is_split_compliant(split_path)
+
+                    label = (
+                        _green(f"✔ {split} ({len(shards)} shards)")
+                        if compliant
+                        else _red(f"✘ {split} ({len(shards)} shards)")
+                    )
+                    print(f"      └── {label}")
 
 
 def count_elements(dataset_name: str, root_path: str = None):
@@ -94,9 +143,7 @@ def add_dataset(conf: str, mod: str, name: str, split: str, root_path: str = Non
     """
     Scaffolds the directory structure for a new dataset split.
     """
-    # [FIX-F] Direct call — no dummy Dataset needed.
     base_dir = resolve_datasets_root(root_path)
-
     target_dir = os.path.join(base_dir, conf, mod, name, split)
     os.makedirs(target_dir, exist_ok=True)
     print(f"✅ Scaffolded empty dataset directory at:\n  {target_dir}")

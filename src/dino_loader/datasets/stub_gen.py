@@ -2,9 +2,8 @@ import os
 import logging
 from typing import Dict, Set
 
-from dino_loader.datasets.dataset import Dataset
 from dino_loader.datasets.settings import resolve_datasets_root
-from dino_loader.datasets.utils import validate_webdataset_shard
+from dino_loader.datasets.utils import ensure_idx_exists, validate_webdataset_shard
 
 log = logging.getLogger(__name__)
 
@@ -12,13 +11,19 @@ log = logging.getLogger(__name__)
 def generate_stubs(root_path: str = None, output_file: str = None):
     """
     Scans the webdatasets directory and generates a hub.py file with IDE stubs.
-    Checks the validity of .tar shards and .idx files during discovery.
 
-    [FIX-F] Calls ``resolve_datasets_root()`` directly instead of constructing
-    a throwaway ``Dataset("dummy", ...)`` instance just to access its
-    ``.root_path`` attribute.
+    Two-pass strategy per split
+    ───────────────────────────
+    Pass 1  — ``ensure_idx_exists`` is called for **every** .tar in the split so
+              that *all* missing .idx files are generated, not just the first one.
+              The previous code had a ``break`` after the first valid shard which
+              caused subsequent shards to never be visited, leaving their .idx
+              files ungenerated.  [FIX-IDX]
+
+    Pass 2  — ``validate_webdataset_shard`` is called for the same shards to
+              confirm structural validity; the split is marked as valid as soon
+              as one shard passes (the fast header check is already O(1 KB)).
     """
-    # [FIX-F] Direct resolution — no dummy Dataset needed.
     base_dir = resolve_datasets_root(root_path)
 
     if output_file is None:
@@ -65,30 +70,44 @@ def generate_stubs(root_path: str = None, output_file: str = None):
                     if not os.path.isdir(split_path):
                         continue
 
+                    tar_files = sorted(
+                        f for f in os.listdir(split_path) if f.endswith(".tar")
+                    )
+
+                    # ── Pass 1: ensure ALL .idx files exist ───────────────────
+                    # [FIX-IDX] The previous loop had a ``break`` after the first
+                    # valid shard, so only one .idx was ever generated per split.
+                    # We now decouple idx generation (must visit every shard) from
+                    # validity checking (one passing shard is sufficient).
+                    for fname in tar_files:
+                        tar_path = os.path.join(split_path, fname)
+                        idx_path = os.path.join(split_path, fname[:-4] + ".idx")
+                        ensure_idx_exists(tar_path, idx_path)
+
+                    # ── Pass 2: structural validation (stop at first passing shard)
                     has_valid_shard = False
-                    for f in os.listdir(split_path):
-                        if f.endswith(".tar"):
-                            tar_path = os.path.join(split_path, f)
-                            idx_path = os.path.join(split_path, f[:-4] + ".idx")
-                            if validate_webdataset_shard(tar_path, idx_path):
-                                has_valid_shard = True
-                                break   # one valid shard is enough to confirm the split
-                            else:
-                                log.warning(f"Corrupted or invalid shard found: {tar_path}")
+                    for fname in tar_files:
+                        tar_path = os.path.join(split_path, fname)
+                        idx_path = os.path.join(split_path, fname[:-4] + ".idx")
+                        if validate_webdataset_shard(tar_path, idx_path):
+                            has_valid_shard = True
+                            break
+                        else:
+                            log.warning("Corrupted or invalid shard found: %s", tar_path)
 
                     if has_valid_shard:
                         datasets_info[dname]["splits"].add(split)
 
-    # Generate the stub file
+    # ── Generate the stub file ────────────────────────────────────────────────
     with open(output_file, "w") as f:
         f.write("# Auto-generated dataset stubs by dino_loader.datasets.stub_gen\n")
         f.write("# Do not edit manually.\n\n")
         f.write("from dino_loader.datasets.dataset import Dataset\n\n")
 
         for dname, info in sorted(datasets_info.items()):
-            confs   = sorted(info["confidentialities"])
-            mods    = sorted(info["modalities"])
-            splits  = sorted(info["splits"])
+            confs  = sorted(info["confidentialities"])
+            mods   = sorted(info["modalities"])
+            splits = sorted(info["splits"])
 
             f.write(f"{dname}: Dataset = Dataset('{dname}')\n")
             f.write('"""\n')
@@ -97,6 +116,8 @@ def generate_stubs(root_path: str = None, output_file: str = None):
             f.write(f"Supported Modalities: {', '.join(mods)}\n")
             f.write(f"Available Splits: {', '.join(splits)}\n")
             f.write('"""\n\n')
+
+    log.info("Stubs written to %s", output_file)
 
 
 if __name__ == "__main__":
