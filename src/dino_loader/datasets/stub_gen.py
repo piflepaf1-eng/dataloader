@@ -30,6 +30,36 @@ Pass 1 — ensure **every** shard's ``.idx`` file exists (generates missing ones
          via :func:`ensure_idx_exists`).  Must visit all shards.
 Pass 2 — structural validation: stop at the *first* passing shard per split
          (O(1 KB) header check).  A split is valid as soon as one shard passes.
+
+Generated hub.py structure
+---------------------------
+For each valid dataset (e.g. ``imagenet``), ``hub.py`` emits:
+
+1.  ``IMAGENETSpec(DatasetSpec)`` — a typed subclass with ``Literal``-annotated
+    class-level overrides for ``confidentialities``, ``modalities``, ``splits``,
+    and ``strategies``.  IDEs see the concrete values when accessing
+    ``spec.confidentialities`` etc.
+
+2.  ``IMAGENETDataset(Dataset)`` — a typed subclass whose ``to_spec()`` is
+    annotated to return ``Optional[IMAGENETSpec]`` rather than the base
+    ``Optional[DatasetSpec]``.  This propagates the Literal types through
+    the full call chain.
+
+3.  ``imagenet: IMAGENETDataset = IMAGENETDataset('imagenet')`` — the
+    module-level variable, same as before but now typed as the narrowed
+    subclass.
+
+Example IDE experience after regenerating stubs::
+
+    from dino_loader.datasets.hub import imagenet
+
+    spec = imagenet.to_spec()
+    if spec:
+        reveal_type(spec)                   # IMAGENETSpec
+        reveal_type(spec.confidentialities) # List[Literal["public"]]
+        reveal_type(spec.modalities)        # List[Literal["rgb"]]
+        reveal_type(spec.splits)            # List[Literal["train", "val"]]
+        reveal_type(spec.strategies)        # List[Literal["default"]]
 """
 
 from __future__ import annotations
@@ -146,8 +176,6 @@ def generate_stubs(
                                 info["splits"].add(split)
                                 # No break here — continue collecting all
                                 # strategy/split combos for this dataset.
-                            # Break after first valid shard per split (perf)
-                            break
 
     if not datasets_info:
         log.info("No valid datasets found across all mounts; writing empty hub.py.")
@@ -175,40 +203,164 @@ def _write_hub(
     output_file: str,
     datasets_info: Dict[str, Dict[str, Set[str]]],
 ) -> None:
+    """
+    Write hub.py with per-dataset Literal-typed ``TypedDatasetSpec`` and
+    ``Dataset`` subclasses, plus module-level instance variables.
+
+    The generated structure for a dataset named ``imagenet`` looks like::
+
+        class IMAGENETSpec(DatasetSpec):
+            confidentialities: List[Literal["public"]]
+            modalities:        List[Literal["rgb"]]
+            splits:            List[Literal["train", "val"]]
+            strategies:        List[Literal["default"]]
+
+        class IMAGENETDataset(Dataset):
+            def to_spec(...) -> Optional[IMAGENETSpec]: ...
+
+        imagenet: IMAGENETDataset = IMAGENETDataset('imagenet')
+
+    This gives IDEs full Literal type information through the entire call chain.
+    """
     lines: list[str] = [
         "# Auto-generated dataset stubs by dino_loader.datasets.stub_gen",
         "# Do not edit manually — run: python -m dino_loader.datasets stubs",
         "",
-        "from dino_loader.datasets.dataset import Dataset",
+        "from __future__ import annotations",
+        "",
+        "from typing import List, Literal, Optional",
+        "",
+        "from dino_loader.config import DatasetSpec",
+        "from dino_loader.datasets.dataset import Dataset, DatasetConfig, GlobalDatasetFilter",
+        "",
         "",
     ]
 
     for dname in sorted(datasets_info.keys()):
-        info = datasets_info[dname]
-        confs      = ", ".join(sorted(info["confidentialities"]))
-        mods       = ", ".join(sorted(info["modalities"]))
-        strategies = ", ".join(sorted(info["strategies"]))
-        splits     = ", ".join(sorted(info["splits"]))
+        info       = datasets_info[dname]
+        class_base = _to_class_base(dname)   # e.g. "imagenet" → "IMAGENET"
 
-        var_name = _to_identifier(dname)
+        # Build Literal[...] annotation strings for each metadata dimension.
+        confs_lit      = _literal(*sorted(info["confidentialities"]))
+        mods_lit       = _literal(*sorted(info["modalities"]))
+        splits_lit     = _literal(*sorted(info["splits"]))
+        strategies_lit = _literal(*sorted(info["strategies"]))
+
+        spec_cls    = f"{class_base}Spec"       # e.g. IMAGENETSpec
+        dataset_cls = f"{class_base}Dataset"    # e.g. IMAGENETDataset
+        var_name    = _to_identifier(dname)     # e.g. imagenet
+
+        # ── 1. TypedDatasetSpec subclass ───────────────────────────────────────
+        # Overrides only the annotation of the four metadata fields with Literal
+        # types.  All other DatasetSpec fields (shards, weight, ...) are inherited.
         lines += [
-            f"{var_name}: Dataset = Dataset({dname!r})",
+            f"class {spec_cls}(DatasetSpec):",
+            f'    """',
+            f"    Typed :class:`~dino_loader.config.DatasetSpec` for dataset ``{dname}``.",
+            f"",
+            f"    The four metadata fields are narrowed to ``Literal`` types that",
+            f"    reflect exactly what was found on the filesystem when the stubs",
+            f"    were last generated.  All other DatasetSpec fields are inherited.",
+            f"",
+            f"    Supported Confidentialities : {', '.join(sorted(info['confidentialities']))}",
+            f"    Supported Modalities        : {', '.join(sorted(info['modalities']))}",
+            f"    Available Strategies        : {', '.join(sorted(info['strategies']))}",
+            f"    Available Splits            : {', '.join(sorted(info['splits']))}",
+            f'    """',
+            f"",
+            f"    # Class-level annotation overrides — values are constrained to the",
+            f"    # exact strings discovered during filesystem traversal.",
+            f"    confidentialities: List[{confs_lit}]  # type: ignore[assignment]",
+            f"    modalities:        List[{mods_lit}]  # type: ignore[assignment]",
+            f"    splits:            List[{splits_lit}]  # type: ignore[assignment]",
+            f"    strategies:        List[{strategies_lit}]  # type: ignore[assignment]",
+            f"",
+            f"",
+        ]
+
+        # ── 2. Typed Dataset subclass ──────────────────────────────────────────
+        # The only change from the base Dataset is the narrowed to_spec() return
+        # type.  Runtime behaviour is identical: super().to_spec() is called and
+        # the result is re-boxed into the typed subclass so that isinstance checks
+        # and attribute access work correctly at runtime too.
+        lines += [
+            f"class {dataset_cls}(Dataset):",
+            f'    """',
+            f"    Typed :class:`~dino_loader.datasets.dataset.Dataset` for ``{dname}``.",
+            f"",
+            f"    ``to_spec()`` is narrowed to return ``Optional[{spec_cls}]``",
+            f"    so that IDEs propagate ``Literal`` types on the result.",
+            f'    """',
+            f"",
+            f"    def to_spec(  # type: ignore[override]",
+            f"        self,",
+            f"        global_filter: Optional[GlobalDatasetFilter] = None,",
+            f"        config: Optional[DatasetConfig] = None,",
+            f"    ) -> Optional[{spec_cls}]:",
+            f"        result = super().to_spec(global_filter=global_filter, config=config)",
+            f"        if result is None:",
+            f"            return None",
+            f"        # Re-box the base DatasetSpec into the typed subclass.",
+            f"        # __dict__ carries all dataclass fields; no data is lost.",
+            f"        return {spec_cls}(**result.__dict__)",
+            f"",
+            f"",
+        ]
+
+        # ── 3. Module-level variable ───────────────────────────────────────────
+        lines += [
+            f"{var_name}: {dataset_cls} = {dataset_cls}({dname!r})",
             f'"""',
             f"Dataset: {dname}",
-            f"Supported Confidentialities: {confs}",
-            f"Supported Modalities: {mods}",
-            f"Available Strategies: {strategies}",
-            f"Available Splits: {splits}",
+            f"Supported Confidentialities: {', '.join(sorted(info['confidentialities']))}",
+            f"Supported Modalities: {', '.join(sorted(info['modalities']))}",
+            f"Available Strategies: {', '.join(sorted(info['strategies']))}",
+            f"Available Splits: {', '.join(sorted(info['splits']))}",
             f'"""',
-            "",
+            f"",
         ]
 
     _atomic_write(output_file, "\n".join(lines))
 
 
+# ── String helpers ─────────────────────────────────────────────────────────────
+
+def _to_class_base(name: str) -> str:
+    """
+    Convert a dataset name to an UPPER_SNAKE_CASE class prefix.
+
+    This is used to build both the ``Spec`` and ``Dataset`` class names.
+
+    Examples
+    --------
+    >>> _to_class_base("imagenet")
+    'IMAGENET'
+    >>> _to_class_base("my-dataset-v2")
+    'MY_DATASET_V2'
+    >>> _to_class_base("laion.400m")
+    'LAION_400M'
+    """
+    return name.upper().replace("-", "_").replace(".", "_")
+
+
 def _to_identifier(name: str) -> str:
-    """Convert a dataset name to a valid Python identifier."""
+    """Convert a dataset name to a valid Python identifier (for module variables)."""
     return name.replace("-", "_").replace(".", "_")
+
+
+def _literal(*values: str) -> str:
+    """
+    Render a ``Literal[...]`` annotation string from one or more string values.
+
+    Examples
+    --------
+    >>> _literal("public")
+    'Literal["public"]'
+    >>> _literal("train", "val")
+    'Literal["train", "val"]'
+    """
+    inner = ", ".join(f'"{v}"' for v in values)
+    return f"Literal[{inner}]"
 
 
 def _atomic_write(path: str, content: str) -> None:

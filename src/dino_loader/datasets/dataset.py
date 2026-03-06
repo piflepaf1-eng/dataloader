@@ -36,6 +36,16 @@ Key design decisions
 - A dataset with the same name can exist under several
   (confidentiality, modality) combinations; :meth:`Dataset.resolve` aggregates
   shards from all matching pairs.
+
+Discovery metadata
+------------------
+:meth:`Dataset.to_spec` performs a **single** filesystem pass and populates
+:attr:`~dino_loader.config.DatasetSpec.confidentialities`,
+:attr:`~dino_loader.config.DatasetSpec.modalities`,
+:attr:`~dino_loader.config.DatasetSpec.splits`, and
+:attr:`~dino_loader.config.DatasetSpec.strategies` on the returned spec.
+The stub generator reads these fields to emit ``Literal``-typed
+``TypedDatasetSpec`` subclasses in ``hub.py`` for IDE autocomplete.
 """
 
 from __future__ import annotations
@@ -166,6 +176,10 @@ class Dataset:
             )
         )
         spec = ds.to_spec(global_filter=...)
+        # spec.confidentialities == ["public"]
+        # spec.modalities        == ["rgb"]
+        # spec.splits            == ["train"]
+        # spec.strategies        == ["default"]
     """
 
     def __init__(self, name: str) -> None:
@@ -207,19 +221,17 @@ class Dataset:
             return global_filter.strategy
         return DEFAULT_STRATEGY
 
-    # ── Public API ────────────────────────────────────────────────────────
-
-    def resolve(
+    def _resolve_with_metadata(
         self,
         global_filter: Optional[GlobalDatasetFilter] = None,
         config: Optional[DatasetConfig] = None,
-    ) -> List[str]:
+    ) -> Tuple[List[str], Dict[str, Set[str]]]:
         """
-        Discover and return all valid shard paths for this dataset.
+        Walk all registered confidentiality mounts and return both the resolved
+        shard paths **and** the discovery metadata collected along the way.
 
-        The method walks all registered confidentiality mounts, filtering at
-        each level.  A shard is included only when its companion ``.idx``
-        file exists alongside it.
+        This is the single canonical filesystem traversal used by both
+        :meth:`resolve` and :meth:`to_spec`, avoiding a double walk.
 
         Parameters
         ----------
@@ -230,8 +242,14 @@ class Dataset:
 
         Returns
         -------
-        list[str]
+        shards : List[str]
             Absolute paths to all valid ``.tar`` shards, sorted lexicographically.
+        meta : Dict[str, Set[str]]
+            Keys ``"confidentialities"``, ``"modalities"``, ``"splits"``,
+            ``"strategies"`` — each value is the set of directory names that
+            actually contributed at least one valid shard.  Only directories
+            from which shards were accepted are recorded, so the metadata
+            always reflects what is *reachable*, not what was *visited*.
         """
         allowed_confs  = self._effective_set(global_filter, config, "allowed_confidentialities")
         allowed_mods   = self._effective_set(global_filter, config, "allowed_modalities")
@@ -239,6 +257,12 @@ class Dataset:
         strategy       = self._effective_strategy(global_filter, config)
 
         shards: List[str] = []
+        meta: Dict[str, Set[str]] = {
+            "confidentialities": set(),
+            "modalities":        set(),
+            "splits":            set(),
+            "strategies":        set(),
+        }
 
         for mount in get_confidentiality_mounts():
             if allowed_confs is not None and mount.name not in allowed_confs:
@@ -270,6 +294,8 @@ class Dataset:
                         continue
 
                     split_path = os.path.join(outputs_path, split)
+                    contributed = False
+
                     for fname in sorted(os.listdir(split_path)):
                         if not fname.endswith(".tar"):
                             continue
@@ -277,10 +303,52 @@ class Dataset:
                         idx_path = os.path.join(split_path, fname[:-4] + ".idx")
                         if os.path.isfile(idx_path):
                             shards.append(tar_path)
+                            contributed = True
                         else:
                             log.debug("Missing .idx for shard %s, skipping.", tar_path)
 
-        return sorted(shards)
+                    # Only record metadata for splits that contributed shards.
+                    # This keeps discovery metadata *tight*: it reflects what is
+                    # actually reachable, not everything that was visited.
+                    if contributed:
+                        meta["confidentialities"].add(mount.name)
+                        meta["modalities"].add(mod)
+                        meta["splits"].add(split)
+                        meta["strategies"].add(strategy)
+
+        return sorted(shards), meta
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def resolve(
+        self,
+        global_filter: Optional[GlobalDatasetFilter] = None,
+        config: Optional[DatasetConfig] = None,
+    ) -> List[str]:
+        """
+        Discover and return all valid shard paths for this dataset.
+
+        The method walks all registered confidentiality mounts, filtering at
+        each level.  A shard is included only when its companion ``.idx``
+        file exists alongside it.
+
+        Parameters
+        ----------
+        global_filter:
+            Broad filters (confidentialities, modalities, splits, strategy).
+        config:
+            Per-dataset overrides (take precedence over *global_filter*).
+
+        Returns
+        -------
+        list[str]
+            Absolute paths to all valid ``.tar`` shards, sorted lexicographically.
+        """
+        shards, _ = self._resolve_with_metadata(
+            global_filter=global_filter,
+            config=config,
+        )
+        return shards
 
     def locations(self) -> List[Tuple[str, str, Path]]:
         """
@@ -303,24 +371,62 @@ class Dataset:
         self,
         global_filter: Optional[GlobalDatasetFilter] = None,
         config: Optional[DatasetConfig] = None,
-    ) -> DatasetSpec:
+    ) -> Optional[DatasetSpec]:
         """
         Build a :class:`~dino_loader.config.DatasetSpec` from resolved shards.
 
+        Unlike a raw :meth:`resolve` call, this method populates the four
+        *discovery metadata* fields on the returned spec:
+
+        * ``confidentialities`` — sorted list of confidentiality names that
+          contributed at least one shard.
+        * ``modalities`` — sorted list of modality directories.
+        * ``splits`` — sorted list of split directories.
+        * ``strategies`` — sorted list of strategy directories.
+
+        The stub generator (``stub_gen.py``) reads these fields to emit
+        ``Literal``-typed ``TypedDatasetSpec`` subclasses in ``hub.py``,
+        giving IDEs concrete autocomplete for per-dataset metadata.
+
+        The filesystem is traversed **once** (via :meth:`_resolve_with_metadata`)
+        regardless of whether only shards or full metadata is needed.
+
         Parameters
         ----------
-        global_filter, config:
-            Forwarded to :meth:`resolve`.
+        global_filter:
+            Broad filters forwarded to :meth:`_resolve_with_metadata`.
+        config:
+            Per-dataset overrides forwarded to :meth:`_resolve_with_metadata`.
 
         Returns
         -------
         DatasetSpec
+            Fully populated spec including discovery metadata.
+        None
+            When no valid shards are found (unknown dataset name, missing
+            mount, or all shards filtered out).  Callers can use::
+
+                specs = [s for s in (ds.to_spec() for ds in datasets) if s is not None]
         """
+        shards, meta = self._resolve_with_metadata(
+            global_filter=global_filter,
+            config=config,
+        )
+
+        if not shards:
+            return None
+
         weight = config.weight if config else 1.0
         return DatasetSpec(
-            name=self.name,
-            shard_paths=self.resolve(global_filter=global_filter, config=config),
-            weight=weight,
+            name              = self.name,
+            shards            = shards,
+            weight            = weight,
+            # ── Discovery metadata ────────────────────────────────────────
+            # Sorted for determinism: same filesystem → same spec, always.
+            confidentialities = sorted(meta["confidentialities"]),
+            modalities        = sorted(meta["modalities"]),
+            splits            = sorted(meta["splits"]),
+            strategies        = sorted(meta["strategies"]),
         )
 
     def __repr__(self) -> str:
