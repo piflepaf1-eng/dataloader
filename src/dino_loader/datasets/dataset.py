@@ -1,48 +1,58 @@
 """
 dino_loader.datasets.dataset
 ============================
-Dataset discovery and shard resolution for the new filesystem hierarchy:
+Dataset discovery and shard resolution.
 
-    <root>/
-      <confidentiality>/
-        <modality>/
-          <dataset_name>/
-            raw/
-            pivot/
-            outputs/
-              <strategy>/          ← e.g. "default"
-                <split>/           ← e.g. "train", "val"
-                  shard-000000.tar
-                  shard-000000.idx
-            metadonnees/
-            subset_selection/
+Filesystem hierarchy
+---------------------
+Each confidentiality lives in its **own** root directory, registered in the
+global :class:`~dino_loader.datasets.settings.ConfidentialityRegistry`.
+Within a confidentiality root the layout is::
+
+    <conf_root>/
+      <modality>/
+        <dataset_name>/
+          raw/
+          pivot/
+          outputs/
+            <strategy>/          ← e.g. "default"
+              <split>/           ← e.g. "train", "val"
+                shard-000000.tar
+                shard-000000.idx
+          metadonnees/
+          subset_selection/
+
+Multiple confidentialities can be active simultaneously; each has its own
+path (possibly on different filesystems / Lustre mount points).
 
 Key design decisions
 --------------------
 - The dataloader **always** resolves shards under ``outputs/<strategy>/<split>/``.
   It never touches ``raw/``, ``pivot/``, ``metadonnees/``, or ``subset_selection/``.
 - ``strategy`` is a single string (default: ``"default"``).  Only one strategy
-  is active per training run; selecting multiple strategies simultaneously is
-  intentionally not supported.
-- ``allowed_splits`` filters the split sub-directories (train / val / test / …)
-  independently from the strategy.
-- A dataset is considered **invalid** (ignored by stub generation and listing)
-  if it has no valid ``.tar`` + ``.idx`` pair anywhere under ``outputs/``.
+  is active per training run.
+- A dataset is considered **invalid** if it has no valid ``.tar`` + ``.idx``
+  pair anywhere under ``outputs/``.
 - A dataset with the same name can exist under several
-  confidentiality / modality combinations; ``resolve()`` aggregates shards
-  from all matching (conf, mod) pairs.
+  (confidentiality, modality) combinations; :meth:`Dataset.resolve` aggregates
+  shards from all matching pairs.
 """
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 from dino_loader.config import DatasetSpec
+from dino_loader.datasets.settings import (
+    ConfidentialityMount,
+    get_confidentiality_mounts,
+    resolve_path_for_confidentiality,
+)
 from dino_loader.datasets.utils import validate_webdataset_shard
-from dino_loader.datasets.settings import resolve_datasets_root
 
 log = logging.getLogger(__name__)
 
@@ -50,15 +60,28 @@ log = logging.getLogger(__name__)
 
 DEFAULT_STRATEGY = "default"
 
-#: Sub-directories inside a dataset root that are NOT strategy folders.
-#: They are always skipped when scanning ``outputs/``.
-_OUTPUTS_NON_STRATEGY_DIRS: frozenset[str] = frozenset()
-
-#: Top-level sub-directories inside a dataset root that are not
-#: confidentiality/modality hierarchies (used only by the CLI scaffolder).
+#: Top-level sub-directories inside a dataset root that are reserved names
+#: (not modality folders).  Used by the CLI scaffolder and stub generator.
 DATASET_RESERVED_DIRS = frozenset(
     {"raw", "pivot", "outputs", "metadonnees", "subset_selection"}
 )
+
+
+# ── Private filesystem helpers ─────────────────────────────────────────────────
+
+def _listdirs(path: str) -> List[str]:
+    """
+    Return sorted sub-directory names under *path*, ignoring hidden entries
+    and any filesystem errors (e.g. permission denied).
+    """
+    try:
+        return sorted(
+            entry for entry in os.listdir(path)
+            if not entry.startswith(".")
+            and os.path.isdir(os.path.join(path, entry))
+        )
+    except OSError:
+        return []
 
 
 # ── Filter dataclasses ────────────────────────────────────────────────────────
@@ -67,25 +90,25 @@ DATASET_RESERVED_DIRS = frozenset(
 class GlobalDatasetFilter:
     """
     Filters applied globally to every dataset unless overridden by a
-    per-dataset ``DatasetConfig``.
+    per-dataset :class:`DatasetConfig`.
 
     Parameters
     ----------
-    allowed_confidentialities
-        If set, only confidentiality directories in this list are visited.
-        ``None`` means "all confidentialities".
-    allowed_modalities
+    allowed_confidentialities:
+        If set, only confidentialities whose **name** appears in this list are
+        visited.  ``None`` means all registered confidentialities.
+    allowed_modalities:
         If set, only modality directories in this list are visited.
-        ``None`` means "all modalities".
-    allowed_datasets
+        ``None`` means all modalities.
+    allowed_datasets:
         If set, only datasets whose name is in this list are resolved.
-        ``None`` means "all datasets".
-    allowed_splits
+        ``None`` means all datasets.
+    allowed_splits:
         If set, only split sub-directories in this list are included.
-        ``None`` means "all splits".
-    strategy
+        ``None`` means all splits.
+    strategy:
         Strategy folder to look in under ``outputs/``.
-        Defaults to ``DEFAULT_STRATEGY`` (``"default"``).
+        Defaults to :data:`DEFAULT_STRATEGY` (``"default"``).
     """
 
     allowed_confidentialities: Optional[List[str]] = None
@@ -98,30 +121,26 @@ class GlobalDatasetFilter:
 @dataclass
 class DatasetConfig:
     """
-    Per-dataset overrides; take precedence over ``GlobalDatasetFilter``.
+    Per-dataset overrides; take precedence over :class:`GlobalDatasetFilter`.
 
     Parameters
     ----------
-    allowed_confidentialities
-        Restricts which confidentiality directories are visited for *this*
-        dataset.  Overrides the global filter when set.
-    allowed_modalities
-        Restricts which modality directories are visited for *this* dataset.
-        Overrides the global filter when set.
-    allowed_splits
-        Restricts which splits are included for *this* dataset.
-        Overrides the global filter when set.
-    strategy
-        Strategy to use for *this* dataset.  Overrides the global filter
-        when set.  ``None`` means "fall back to the global strategy".
-    weight
+    allowed_confidentialities:
+        Restrict which confidentialities are visited for *this* dataset.
+    allowed_modalities:
+        Restrict which modalities are visited for *this* dataset.
+    allowed_splits:
+        Restrict which splits are included for *this* dataset.
+    strategy:
+        Strategy for *this* dataset.  ``None`` inherits from the global filter.
+    weight:
         Mixing weight for this dataset (re-normalised automatically).
     """
 
     allowed_confidentialities: Optional[List[str]] = None
     allowed_modalities: Optional[List[str]] = None
     allowed_splits: Optional[List[str]] = None
-    strategy: Optional[str] = None          # None → inherit from global
+    strategy: Optional[str] = None
     weight: float = 1.0
 
 
@@ -130,7 +149,8 @@ class DatasetConfig:
 class Dataset:
     """
     Represents a named dataset that may exist under multiple
-    (confidentiality, modality) pairs in the filesystem.
+    ``(confidentiality, modality)`` pairs across potentially different
+    filesystem roots.
 
     Usage
     -----
@@ -143,25 +163,31 @@ class Dataset:
             global_filter=GlobalDatasetFilter(
                 allowed_confidentialities=["public"],
                 allowed_splits=["train"],
-                strategy="default",
             )
         )
         spec = ds.to_spec(global_filter=...)
     """
 
-    def __init__(self, name: str, root_path: Optional[str] = None) -> None:
+    def __init__(self, name: str) -> None:
+        """
+        Parameters
+        ----------
+        name:
+            Dataset name, e.g. ``"imagenet"``, ``"custom"``.
+            The library discovers actual paths from the
+            :class:`~dino_loader.datasets.settings.ConfidentialityRegistry`.
+        """
         self.name = name
-        self.root_path = resolve_datasets_root(root_path)
 
-    # ── Private helpers ───────────────────────────────────────────────────────
+    # ── Private helpers ───────────────────────────────────────────────────
 
-    def _effective(
-        self,
+    @staticmethod
+    def _effective_set(
         global_filter: Optional[GlobalDatasetFilter],
         config: Optional[DatasetConfig],
         attr: str,
     ) -> Optional[Set[str]]:
-        """Return the effective allowed-set for *attr*, as a set or None."""
+        """Return the effective allowed-set for *attr* (local overrides global)."""
         local_val = getattr(config, attr, None) if config else None
         if local_val is not None:
             return set(local_val)
@@ -170,19 +196,18 @@ class Dataset:
             return set(global_val)
         return None
 
+    @staticmethod
     def _effective_strategy(
-        self,
         global_filter: Optional[GlobalDatasetFilter],
         config: Optional[DatasetConfig],
     ) -> str:
-        """Return the active strategy string (never None)."""
         if config and config.strategy is not None:
             return config.strategy
         if global_filter:
             return global_filter.strategy
         return DEFAULT_STRATEGY
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────
 
     def resolve(
         self,
@@ -192,141 +217,111 @@ class Dataset:
         """
         Discover and return all valid shard paths for this dataset.
 
-        The method walks::
-
-            <root>/<conf>/<mod>/<name>/outputs/<strategy>/<split>/*.tar
-
-        filtering at each level according to the active ``GlobalDatasetFilter``
-        and ``DatasetConfig``.  A shard is included only when its companion
-        ``.idx`` file exists alongside it.
+        The method walks all registered confidentiality mounts, filtering at
+        each level.  A shard is included only when its companion ``.idx``
+        file exists alongside it.
 
         Parameters
         ----------
-        global_filter
+        global_filter:
             Broad filters (confidentialities, modalities, splits, strategy).
-        config
-            Per-dataset overrides; take precedence over *global_filter*.
+        config:
+            Per-dataset overrides (take precedence over *global_filter*).
 
         Returns
         -------
-        list of str
-            Sorted list of absolute ``.tar`` paths.  Empty if nothing matches
-            or the dataset root does not exist.
+        list[str]
+            Absolute paths to all valid ``.tar`` shards, sorted lexicographically.
         """
-        # ── Global dataset name filter ────────────────────────────────────────
-        if global_filter and global_filter.allowed_datasets is not None:
-            if self.name not in global_filter.allowed_datasets:
-                return []
+        allowed_confs  = self._effective_set(global_filter, config, "allowed_confidentialities")
+        allowed_mods   = self._effective_set(global_filter, config, "allowed_modalities")
+        allowed_splits = self._effective_set(global_filter, config, "allowed_splits")
+        strategy       = self._effective_strategy(global_filter, config)
 
-        if not os.path.exists(self.root_path):
-            log.warning("Dataset root path does not exist: %s", self.root_path)
-            return []
+        shards: List[str] = []
 
-        allowed_confs   = self._effective(global_filter, config, "allowed_confidentialities")
-        allowed_mods    = self._effective(global_filter, config, "allowed_modalities")
-        allowed_splits  = self._effective(global_filter, config, "allowed_splits")
-        strategy        = self._effective_strategy(global_filter, config)
-
-        valid_shards: List[str] = []
-
-        # ── Walk conf / mod ───────────────────────────────────────────────────
-        for conf in _listdirs(self.root_path):
-            if allowed_confs is not None and conf not in allowed_confs:
+        for mount in get_confidentiality_mounts():
+            if allowed_confs is not None and mount.name not in allowed_confs:
+                continue
+            if not mount.path.is_dir():
+                log.debug("Confidentiality path does not exist, skipping: %s", mount.path)
                 continue
 
-            conf_path = os.path.join(self.root_path, conf)
+            conf_root = str(mount.path)
 
-            for mod in _listdirs(conf_path):
+            for mod in _listdirs(conf_root):
                 if allowed_mods is not None and mod not in allowed_mods:
                     continue
 
-                dataset_path = os.path.join(conf_path, mod, self.name)
+                dataset_path = os.path.join(conf_root, mod, self.name)
                 if not os.path.isdir(dataset_path):
                     continue
 
-                outputs_path = os.path.join(dataset_path, "outputs")
+                outputs_path = os.path.join(dataset_path, "outputs", strategy)
                 if not os.path.isdir(outputs_path):
                     log.debug(
-                        "Dataset '%s' has no outputs/ directory at %s",
-                        self.name, dataset_path,
+                        "No outputs/%s for %s/%s/%s",
+                        strategy, mount.name, mod, self.name,
                     )
                     continue
 
-                strategy_path = os.path.join(outputs_path, strategy)
-                if not os.path.isdir(strategy_path):
-                    log.debug(
-                        "Dataset '%s': strategy '%s' not found at %s",
-                        self.name, strategy, outputs_path,
-                    )
-                    continue
-
-                # ── Walk splits ───────────────────────────────────────────────
-                for split in _listdirs(strategy_path):
+                for split in _listdirs(outputs_path):
                     if allowed_splits is not None and split not in allowed_splits:
                         continue
 
-                    split_path = os.path.join(strategy_path, split)
-                    valid_shards.extend(
-                        _collect_shards(split_path, self.name)
-                    )
+                    split_path = os.path.join(outputs_path, split)
+                    for fname in sorted(os.listdir(split_path)):
+                        if not fname.endswith(".tar"):
+                            continue
+                        tar_path = os.path.join(split_path, fname)
+                        idx_path = os.path.join(split_path, fname[:-4] + ".idx")
+                        if os.path.isfile(idx_path):
+                            shards.append(tar_path)
+                        else:
+                            log.debug("Missing .idx for shard %s, skipping.", tar_path)
 
-        return sorted(valid_shards)
+        return sorted(shards)
+
+    def locations(self) -> List[Tuple[str, str, Path]]:
+        """
+        Return all ``(confidentiality_name, modality, dataset_path)`` triples
+        where this dataset has been found across the registered mounts.
+
+        Useful for introspection and diagnostics.
+        """
+        results: List[Tuple[str, str, Path]] = []
+        for mount in get_confidentiality_mounts():
+            if not mount.path.is_dir():
+                continue
+            for mod in _listdirs(str(mount.path)):
+                dataset_path = mount.path / mod / self.name
+                if dataset_path.is_dir():
+                    results.append((mount.name, mod, dataset_path))
+        return results
 
     def to_spec(
         self,
         global_filter: Optional[GlobalDatasetFilter] = None,
         config: Optional[DatasetConfig] = None,
-    ) -> Optional[DatasetSpec]:
+    ) -> DatasetSpec:
         """
-        Resolve shards and build a ``DatasetSpec`` ready for ``DINODataLoader``.
+        Build a :class:`~dino_loader.config.DatasetSpec` from resolved shards.
 
-        Returns ``None`` if no valid shards are found (so callers can safely
-        filter with ``filter(None, [ds.to_spec(...) for ds in datasets])``).
+        Parameters
+        ----------
+        global_filter, config:
+            Forwarded to :meth:`resolve`.
+
+        Returns
+        -------
+        DatasetSpec
         """
-        shards = self.resolve(global_filter, config)
-        if not shards:
-            return None
         weight = config.weight if config else 1.0
-        return DatasetSpec(name=self.name, shards=shards, weight=weight)
-
-
-# ── Module-level helpers ──────────────────────────────────────────────────────
-
-def _listdirs(path: str) -> List[str]:
-    """Return sorted list of sub-directory names under *path* (no files)."""
-    try:
-        return sorted(
-            e for e in os.listdir(path)
-            if os.path.isdir(os.path.join(path, e))
+        return DatasetSpec(
+            name=self.name,
+            shard_paths=self.resolve(global_filter=global_filter, config=config),
+            weight=weight,
         )
-    except PermissionError as exc:
-        log.warning("Cannot list directory %s: %s", path, exc)
-        return []
 
-
-def _collect_shards(split_path: str, dataset_name: str) -> List[str]:
-    """
-    Return all ``.tar`` paths in *split_path* that have a companion ``.idx``.
-
-    Logs a warning for any shard missing its index file.
-    """
-    result: List[str] = []
-    try:
-        entries = os.listdir(split_path)
-    except PermissionError as exc:
-        log.warning("Cannot list split directory %s: %s", split_path, exc)
-        return result
-
-    for fname in sorted(entries):
-        if not fname.endswith(".tar"):
-            continue
-        tar_path = os.path.join(split_path, fname)
-        idx_path = os.path.join(split_path, fname[:-4] + ".idx")
-        if os.path.exists(idx_path):
-            result.append(tar_path)
-        else:
-            log.warning(
-                "Dataset '%s': missing .idx for shard %s — shard skipped.",
-                dataset_name, tar_path,
-            )
-    return result
+    def __repr__(self) -> str:
+        return f"Dataset({self.name!r})"
