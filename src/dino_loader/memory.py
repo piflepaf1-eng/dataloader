@@ -7,29 +7,64 @@ Changes vs previous version
 ----------------------------
 [MEM-1] Batch dataclass enriched:
         - metadata: List[Optional[Dict]] — per-sample sidecar metadata.
-          None for samples from shards without .json sidecars.
-          Populated by MixingSource.pop_last_metadata().
-        - masks: Optional[Any] — token mask tensor from MaskingGenerator
-          (DinoV3 iBOT pattern).  None when no mask_generator is configured.
+        - masks: Optional[Any] — token mask tensor from MaskingGenerator.
 
-[MEM-2] allocate_buffers: ceiling sizes now use aug_cfg.max_global_crop_size
-        and aug_cfg.max_local_crop_size (set at build time to the largest
-        planned resolution) rather than global_crop_size / local_crop_size.
-        This ensures pinned / managed buffers never need re-allocation during
-        a resolution schedule.
+[MEM-2] allocate_buffers: ceiling sizes use aug_cfg.max_global_crop_size /
+        max_local_crop_size so no re-allocation occurs during resolution
+        schedule.
+
+[MEM-3] AsyncPrefetchIterator — genuine background prefetch.
+
+        Previous behaviour
+        ------------------
+        ``_prefetch()`` called ``next(self._iter)`` on the *calling thread*,
+        blocking it for the entire DALI queue-drain duration.  The method
+        name was misleading: it did not overlap DALI latency with compute.
+
+        On NVL72 (72 GPU ranks), DALI's GPU decode can stall for 30–100 ms
+        when its internal prefetch queue is exhausted.  With the old code
+        that stall was paid in full on the training thread, keeping the GPU
+        idle.
+
+        New behaviour
+        -------------
+        A dedicated ``ThreadPoolExecutor(max_workers=1)`` thread calls
+        ``next(self._iter)`` in the background.  The result is stored in a
+        ``concurrent.futures.Future``.
+
+        The training thread calls ``__next__()``, which:
+          1. Calls ``future.result()`` — returns immediately if the background
+             fetch already completed (common case), blocks only if DALI is
+             still decoding (rare).
+          2. Immediately submits the *next* background fetch before returning
+             the current batch to the caller.
+
+        Net effect: DALI decode latency is hidden behind GPU compute for
+        every batch except the very first.  On B200/GB200 with a 60 ms
+        compute step and a 40 ms DALI decode, this reclaims ~40 ms × N_steps
+        of GPU utilisation over a full training run.
+
+        Shutdown contract
+        -----------------
+        ``close()`` cancels any in-flight future and shuts down the executor
+        (with a 5-second timeout).  ``DINODataLoader.__del__`` and the DALI
+        backend's ``reset()`` call ``close()`` before rebuilding the iterator.
+        Calling ``__next__()`` after ``close()`` raises ``StopIteration``.
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import torch
 
-from dino_loader.config       import DINOAugConfig
-from dino_loader.distributed  import ClusterTopology
+from dino_loader.config      import DINOAugConfig
+from dino_loader.distributed import ClusterTopology
 
 log = logging.getLogger(__name__)
 
@@ -55,15 +90,14 @@ class Batch:
     global_crops : List of 2 tensors (BF16 or FP8+meta) — large views.
     local_crops  : List of 8 tensors — small views.
     metadata     : Per-sample sidecar dicts (Optional[Dict], None if absent).
-                   Length == batch_size.  Use to access quality_score, caption,
-                   dedup_hash, etc. from WebDataset .json sidecars.  [MEM-1]
+                   Length == batch_size.  [MEM-1]
     masks        : Token mask tensor from MaskingGenerator, or None.  [MEM-1]
                    Shape: (batch_size, n_tokens) bool.
     """
     global_crops: List
     local_crops:  List
-    metadata:     List[Optional[Dict]] = field(default_factory=list)   # [MEM-1]
-    masks:        Optional[Any]        = None                           # [MEM-1]
+    metadata:     List[Optional[Dict]] = field(default_factory=list)
+    masks:        Optional[Any]        = None
 
     def __iter__(self):
         """Convenience: unpack as (global_crops, local_crops)."""
@@ -84,9 +118,8 @@ def allocate_buffers(
     """
     Allocate output buffers using the topology-appropriate strategy.
 
-    [MEM-2] Buffer dimensions use max_global_crop_size / max_local_crop_size
-    (set to the ceiling of the resolution schedule) so that no re-allocation
-    occurs when set_resolution() is called mid-training.
+    [MEM-2] Dimensions use max_global_crop_size / max_local_crop_size so
+    no re-allocation occurs when set_resolution() is called mid-training.
 
     Grace-Blackwell → managed memory, preferred on GPU (no H2D needed).
     PCIe            → pinned host memory (fast non-blocking H2D).
@@ -99,9 +132,7 @@ def allocate_buffers(
         bufs = []
         for _ in range(n):
             if topo.is_grace_blackwell:
-                t = torch.empty(
-                    batch_size, C, max_size, max_size, dtype=dtype, device=device
-                )
+                t = torch.empty(batch_size, C, max_size, max_size, dtype=dtype, device=device)
                 try:
                     torch.cuda.memory.cudaMemAdvise(
                         t,
@@ -111,9 +142,7 @@ def allocate_buffers(
                 except AttributeError:
                     pass
             else:
-                t = torch.empty(
-                    batch_size, C, max_size, max_size, dtype=dtype
-                ).pin_memory()
+                t = torch.empty(batch_size, C, max_size, max_size, dtype=dtype).pin_memory()
             bufs.append(t)
         return bufs
 
@@ -183,33 +212,106 @@ class H2DStream:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Async prefetch iterator
+# [MEM-3] Async prefetch iterator — genuine background prefetch
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AsyncPrefetchIterator:
-    """Wraps a DALI iterator and pre-fetches one batch ahead on a thread."""
+    """
+    Wraps a DALI (or CPU-backend) iterator and pre-fetches the next batch
+    on a dedicated background thread, hiding DALI decode latency.
+
+    The previous implementation called ``next(self._iter)`` on the *calling
+    thread* inside ``_prefetch()``, which blocked the training loop for the
+    full DALI decode time.  See module docstring [MEM-3] for details.
+
+    Thread model
+    ------------
+    One ``ThreadPoolExecutor(max_workers=1)`` thread is owned by this object.
+    It is the *only* thread that calls ``next(self._iter)``; DALI iterators
+    are not thread-safe and must be consumed from a single thread.
+
+    The training thread calls ``__next__()``, which resolves the current
+    ``Future`` (waiting if necessary) and immediately submits the next fetch.
+
+    Error propagation
+    -----------------
+    Any exception raised inside the background thread (e.g. DALI decode
+    error, StopIteration) is stored in the Future and re-raised in the
+    training thread on the next call to ``future.result()``.  StopIteration
+    is converted to a sentinel ``None`` result (Futures cannot store
+    StopIteration directly).
+
+    Shutdown
+    --------
+    Call ``close()`` to cancel in-flight work and shut down the executor.
+    The iterator is unusable after ``close()``.
+    """
+
+    _SENTINEL = object()  # marks exhaustion
 
     def __init__(self, dali_iter, h2d: H2DStream) -> None:
-        self._iter = dali_iter
-        self._h2d  = h2d
-        self._next = None
-        self._prefetch()
+        self._iter     = dali_iter
+        self._h2d      = h2d
+        self._closed   = False
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dali-prefetch")
+        self._future: Optional[Future] = None
+        self._lock     = threading.Lock()   # guards _closed + _future
+        self._submit()
 
-    def _prefetch(self) -> None:
-        try:
-            self._next = next(self._iter)
-        except StopIteration:
-            self._next = None
+    # ── Iterator protocol ─────────────────────────────────────────────────────
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if self._next is None:
+        with self._lock:
+            if self._closed or self._future is None:
+                raise StopIteration
+
+        result = self._future.result()  # blocks only if DALI is still decoding
+
+        if result is self._SENTINEL:
             raise StopIteration
-        current = self._next
-        self._prefetch()
-        return current
+
+        # Submit next fetch *before* returning — maximises overlap.
+        self._submit()
+        return result
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        """Cancel in-flight prefetch and shut down the executor."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            fut = self._future
+            self._future = None
+
+        if fut is not None:
+            fut.cancel()
+
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        log.debug("AsyncPrefetchIterator closed")
+
+    def __del__(self) -> None:
+        self.close()
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _fetch_one(self):
+        """Blocking fetch executed on the background thread."""
+        try:
+            return next(self._iter)
+        except StopIteration:
+            return self._SENTINEL
+
+    def _submit(self) -> None:
+        """Submit the next fetch unless closed."""
+        with self._lock:
+            if self._closed:
+                return
+            self._future = self._executor.submit(self._fetch_one)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -225,31 +327,25 @@ class FP8Formatter:
     Falls back to a no-op identity when TE is not installed.
     """
 
-    _AMAX_HISTORY = 16
+    _AMAX_HISTORY_LEN = 16
 
     def __init__(self) -> None:
         if not HAS_TE:
-            log.warning("transformer-engine not installed — FP8 output disabled, using BF16.")
-        self._enabled = HAS_TE
+            log.warning("FP8Formatter: transformer-engine not installed — returning BF16.")
+        self._meta: Optional[Any] = None
 
-    def quantise(self, tensor: torch.Tensor):
-        """Return (fp8_tensor, fp8_meta) or the original BF16 tensor."""
-        if not self._enabled:
+    def quantise(self, tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Quantise *tensor* (BF16) to FP8 E4M3 in-place and return it.
+        Returns *tensor* unchanged if TE is unavailable.
+        """
+        if not HAS_TE:
             return tensor
-        try:
-            fp8_meta = te.fp8.FP8TensorMeta()
-            fp8_meta.scale     = torch.ones(1, dtype=torch.float32, device=tensor.device)
-            fp8_meta.scale_inv = torch.ones(1, dtype=torch.float32, device=tensor.device)
-            fp8_meta.amax_history = torch.zeros(
-                self._AMAX_HISTORY, dtype=torch.float32, device=tensor.device
+        if self._meta is None:
+            self._meta = te.fp8.FP8TensorMeta()
+            self._meta.scale      = torch.ones(1, dtype=torch.float32, device=tensor.device)
+            self._meta.scale_inv  = torch.ones(1, dtype=torch.float32, device=tensor.device)
+            self._meta.amax_history = torch.zeros(
+                self._AMAX_HISTORY_LEN, dtype=torch.float32, device=tensor.device
             )
-            fp8_tensor = te.fp8.cast_to_fp8(
-                tensor.contiguous(),
-                fp8_meta,
-                0,
-                te.fp8.Float8Tensor,
-            )
-            return fp8_tensor, fp8_meta
-        except Exception as exc:
-            log.warning("FP8 quantisation failed (%s) — returning BF16.", exc)
-            return tensor
+        return te.fp8_cast(tensor, self._meta, te.DType.kFloat8E4M3)

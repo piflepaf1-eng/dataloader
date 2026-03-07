@@ -1,23 +1,73 @@
 [project]
-name = "dataloader"
-version = "0.1.0"
-description = "Add your description here"
+name = "dino_loader"
+version = "0.2.0"
+description = "HPC-grade DINOv3 data pipeline for B200 / GB200 NVL72 clusters"
 readme = "README.md"
 requires-python = ">=3.12"
+
 dependencies = [
-    "aiofiles>=25.1.0",
-    "numpy>=2.4.2",
-    "pillow>=12.1.1",
-    "psutil>=7.2.2",
-    "rich>=14.3.3",
-    "tomli>=2.4.0",
-    "torch>=2.10.0",
-    "torchvision>=0.25.0",
-    "transformer-engine>=2.12.0",
-    "webdataset>=1.0.2",
+    # ── Core ──────────────────────────────────────────────────────────────────
+    # ~= pins the minor version: "compatible release" (>=X.Y, <X+1).
+    # This prevents silent breakage from major API changes (e.g. torch 3.x)
+    # while still receiving bugfix releases automatically.
+    "torch~=2.10",
+    "torchvision~=0.25",
+    "numpy~=2.0",
+
+    # ── WebDataset ────────────────────────────────────────────────────────────
+    # 1.x API is stable; allow patch releases but not 2.x if/when it ships.
+    "webdataset~=1.0",
+
+    # ── Async I/O ─────────────────────────────────────────────────────────────
+    "aiofiles~=25.1",
+
+    # ── Monitoring / CLI ──────────────────────────────────────────────────────
+    "rich~=14.3",
+    "psutil~=7.2",
+
+    # ── Config parsing ────────────────────────────────────────────────────────
+    # tomli is only needed on Python < 3.11 (stdlib tomllib added in 3.11).
+    # Keep it explicit so the resolver installs it on older interpreters.
+    "tomli~=2.4",
+
+    # ── Pillow: used by CPU backend augmentation pipeline ─────────────────────
+    "pillow~=11.0",
+
+    # ── Transformer Engine ────────────────────────────────────────────────────
+    # TE has frequent breaking changes between minor releases.
+    # Pin to the minor tested version; bump explicitly when upgrading.
+    "transformer-engine~=2.12",
 ]
 
 [dependency-groups]
 dev = [
-    "pytest>=9.0.2",
+    "pytest~=8.0",
+    "pytest-timeout~=2.3",
 ]
+
+# ── Optional GPU-only dependencies ────────────────────────────────────────────
+# nvidia-dali is not available on PyPI for all CUDA versions; install
+# separately with the correct index URL:
+#
+#   pip install nvidia-dali-cuda120==1.34.*
+#
+# Do NOT add nvidia-dali to [dependencies] — it would break CPU-only installs
+# (CI, laptops, macOS) and cannot be resolved from the default PyPI index.
+
+[tool.dino_loader.datasets]
+# Override via env var DINO_DATASETS_ROOT or CLI --root flag.
+# root = "/lustre/datasets"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Mark GPU-dependent tests so CI can skip them on CPU-only runners.
+markers = [
+    "gpu: requires CUDA device",
+    "dali: requires nvidia-dali",
+    "slow: long-running integration tests",
+]
+timeout = 120
+
+[build-system]
+requires      = ["hatchling"]
+build-backend = "hatchling.build"

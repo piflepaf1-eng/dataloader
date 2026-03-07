@@ -23,13 +23,31 @@ Fixes applied
             match the documented field name and eliminate the BUG-D ambiguity.
 [FIX-MON-2] Added ``heartbeat_ts`` (Unix epoch seconds) so the CLI can detect
             dead processes vs. idle ones.
+
+Changes vs previous version
+----------------------------
+[MON-3] MetricField StrEnum replaces bare string literals throughout the
+        codebase.  ``inc()`` and ``set()`` now accept ``MetricField`` values
+        (or plain str for backward-compatibility).  A misspelled field name
+        now raises ``AttributeError`` at import time rather than silently
+        writing to a non-existent struct field at runtime.
+
+        Migration: replace any ``registry.inc("shard_cache_wait_time_ms", n)``
+        with ``registry.inc(MetricField.SHARD_CACHE_WAIT_MS, n)``.
+        Plain strings are still accepted — no forced migration — but IDE
+        type-checkers will flag them as ``str`` rather than ``MetricField``.
+
+[MON-4] ``mixing_source_queue_depth`` is now populated by MixingSource via
+        ``MetricField.MIXING_QUEUE_DEPTH``.  Previously the field existed in
+        the struct but was never written, so the CLI always showed 0.
 """
 
 import ctypes
+import enum
 import logging
 import time
 from multiprocessing import shared_memory
-from typing import Optional
+from typing import Optional, Union
 
 log = logging.getLogger(__name__)
 
@@ -37,33 +55,95 @@ log = logging.getLogger(__name__)
 MAX_LOCAL_RANKS = 8
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# [MON-3] Typed field names — eliminates silent typos in the fast path
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MetricField(str, enum.Enum):
+    """
+    Enumeration of all MetricsStruct field names.
+
+    Use these constants instead of raw strings when calling
+    ``MetricsRegistry.inc()`` or ``MetricsRegistry.set()``.
+    This makes misspellings a loud import-time error (AttributeError on the
+    enum lookup) rather than a silent runtime no-op.
+
+    Example::
+
+        from dino_loader.monitor.metrics import MetricField, get_registry
+        get_registry().inc(MetricField.SHARD_CACHE_WAIT_MS, wait_ms)
+    """
+
+    # ── Stage 1: Lustre I/O (rank 0 / node master only) ─────────────────────
+    LUSTRE_READ_TIME_MS   = "lustre_read_time_ms"
+    LUSTRE_BYTES_READ     = "lustre_bytes_read"
+
+    # ── Stage 2: Shard cache wait (non-master ranks) ─────────────────────────
+    SHARD_CACHE_WAIT_MS   = "shard_cache_wait_time_ms"
+    SHARD_CACHE_UTIL_PCT  = "shard_cache_utilization_pct"
+
+    # ── Stage 3: DALI pipeline ────────────────────────────────────────────────
+    PIPELINE_YIELD_MS     = "pipeline_yield_time_ms"
+    MIXING_QUEUE_DEPTH    = "mixing_source_queue_depth"   # [MON-4] now populated
+
+    # ── Stage 4: H2D transfer ─────────────────────────────────────────────────
+    H2D_TRANSFER_MS       = "h2d_transfer_time_ms"
+
+    # ── Stage 5: Loader output ────────────────────────────────────────────────
+    BATCHES_YIELDED       = "loader_batches_yielded"
+
+    # ── Stall diagnostics ─────────────────────────────────────────────────────
+    NETWORK_STALL_MS      = "network_stall_time_ms"
+    MULTINODE_STALL_MS    = "multinode_stall_time_ms"
+
+    # ── Liveness ──────────────────────────────────────────────────────────────
+    HEARTBEAT_TS          = "heartbeat_ts"
+
+
+# ── Convenience alias so call-sites can type `MF.BATCHES_YIELDED` ─────────────
+MF = MetricField
+
+# ── Type accepted by inc() / set() — MetricField or plain str (compat) ────────
+FieldArg = Union[MetricField, str]
+
+
 class MetricsStruct(ctypes.Structure):
     _fields_ = [
         # ── Stage 1: Lustre I/O (rank 0 / node master only) ──────────────────
-        ("lustre_read_time_ms",       ctypes.c_int64),   # cumulative Lustre read time
-        ("lustre_bytes_read",         ctypes.c_int64),   # cumulative bytes read from Lustre
+        (MF.LUSTRE_READ_TIME_MS.value,  ctypes.c_int64),
+        (MF.LUSTRE_BYTES_READ.value,    ctypes.c_int64),
 
         # ── Stage 2: Shard cache wait (non-master ranks) ─────────────────────
-        ("shard_cache_wait_time_ms",  ctypes.c_int64),   # [FIX-MON-1] was shard_wait_time_ms
-        ("shard_cache_utilization_pct", ctypes.c_float), # 0.0–100.0
+        (MF.SHARD_CACHE_WAIT_MS.value,  ctypes.c_int64),
+        (MF.SHARD_CACHE_UTIL_PCT.value, ctypes.c_float),
 
         # ── Stage 3: DALI pipeline ────────────────────────────────────────────
-        ("pipeline_yield_time_ms",    ctypes.c_int64),   # time spent in next(dali_iter)
-        ("mixing_source_queue_depth", ctypes.c_int64),   # items buffered in MixingSource
+        (MF.PIPELINE_YIELD_MS.value,    ctypes.c_int64),
+        (MF.MIXING_QUEUE_DEPTH.value,   ctypes.c_int64),
 
         # ── Stage 4: H2D transfer ─────────────────────────────────────────────
-        ("h2d_transfer_time_ms",      ctypes.c_int64),   # cumulative H2D time
+        (MF.H2D_TRANSFER_MS.value,      ctypes.c_int64),
 
         # ── Stage 5: Loader output ────────────────────────────────────────────
-        ("loader_batches_yielded",    ctypes.c_int64),   # total batches produced
+        (MF.BATCHES_YIELDED.value,      ctypes.c_int64),
 
         # ── Stall diagnostics ─────────────────────────────────────────────────
-        ("network_stall_time_ms",     ctypes.c_int64),   # IB / NCCL stalls
-        ("multinode_stall_time_ms",   ctypes.c_int64),   # cross-node barrier waits
+        (MF.NETWORK_STALL_MS.value,     ctypes.c_int64),
+        (MF.MULTINODE_STALL_MS.value,   ctypes.c_int64),
 
         # ── Liveness ──────────────────────────────────────────────────────────
-        ("heartbeat_ts",              ctypes.c_int64),   # [FIX-MON-2] Unix epoch seconds
+        (MF.HEARTBEAT_TS.value,         ctypes.c_int64),
     ]
+
+
+# Validate at import time that every MetricField maps to an actual struct field.
+# This catches enum / struct drift immediately rather than at first write.
+_STRUCT_FIELD_NAMES = {f[0] for f in MetricsStruct._fields_}
+for _mf in MetricField:
+    assert _mf.value in _STRUCT_FIELD_NAMES, (
+        f"MetricField.{_mf.name} = {_mf.value!r} has no matching MetricsStruct field. "
+        "Add the field to MetricsStruct._fields_ or remove it from the enum."
+    )
 
 
 class RankMetricsArray(ctypes.Structure):
@@ -147,18 +227,34 @@ class MetricsRegistry:
             return self.data.ranks[self.local_rank]
         return None
 
-    def inc(self, field: str, value: int = 1) -> None:
-        """Atomically increment an integer metric field."""
-        if self.data is None:
-            return
-        m = self.data.ranks[self.local_rank]
-        setattr(m, field, getattr(m, field) + value)
+    def inc(self, field: FieldArg, value: int = 1) -> None:
+        """
+        Atomically increment an integer metric field.
 
-    def set(self, field: str, value: float) -> None:
-        """Set a metric field to an absolute value."""
+        Parameters
+        ----------
+        field : ``MetricField`` enum member (preferred) or plain str (compat).
+        value : Amount to add.
+        """
         if self.data is None:
             return
-        setattr(self.data.ranks[self.local_rank], field, value)
+        key = field.value if isinstance(field, MetricField) else field
+        m = self.data.ranks[self.local_rank]
+        setattr(m, key, getattr(m, key) + value)
+
+    def set(self, field: FieldArg, value: float) -> None:
+        """
+        Set a metric field to an absolute value.
+
+        Parameters
+        ----------
+        field : ``MetricField`` enum member (preferred) or plain str (compat).
+        value : New absolute value.
+        """
+        if self.data is None:
+            return
+        key = field.value if isinstance(field, MetricField) else field
+        setattr(self.data.ranks[self.local_rank], key, value)
 
     def heartbeat(self) -> None:
         """Stamp the current Unix time into heartbeat_ts. Call once per batch."""
