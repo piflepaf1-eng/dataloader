@@ -10,14 +10,18 @@ Importing this package triggers two side-effects:
    all confidentiality → path mappings from every configured source (pyproject,
    env vars, legacy root, entry points).
 
-2. **Hub completion** — if ``hub.py`` is stale or missing, it is regenerated
+2. **Hub refresh** — if ``hub/`` is stale or missing, it is regenerated
    in-process so that IDE autocomplete is always consistent with the current
-   filesystem state.  This is a lightweight pass (O(n_mounts) directory stat
-   calls) and is skipped when the mounts have not changed since the last run.
+   filesystem state.
+
+   Staleness is detected via a **registry hash** stored in
+   ``hub/_registry_hash.txt`` rather than per-mount mtime comparison.
+   This makes the check O(n_mounts) dict operations with a single tiny file
+   read — zero filesystem stat calls against the HPC mount points.
 
 Public re-exports
 -----------------
-The most commonly needed symbols are re-exported here for convenience::
+::
 
     from dino_loader.datasets import (
         Dataset,
@@ -36,7 +40,7 @@ import logging
 log = logging.getLogger(__name__)
 
 # ── 1. Bootstrap registry (side-effect: loads all auto-sources) ───────────────
-from dino_loader.datasets.settings import (  # noqa: E402  (import after log setup)
+from dino_loader.datasets.settings import (  # noqa: E402
     ConfidentialityMount,
     ConfidentialityRegistry,
     get_confidentiality_mounts,
@@ -49,54 +53,78 @@ from dino_loader.datasets.settings import (  # noqa: E402  (import after log set
 from dino_loader.datasets.dataset import (
     DatasetConfig,
     GlobalDatasetFilter,
+    _merge_filters,
     Dataset,
     DEFAULT_STRATEGY,
 )
 
-# ── 3. Regenerate hub.py at init time ─────────────────────────────────────────
+
+# ── 3. Hub refresh ─────────────────────────────────────────────────────────────
+
+def _hub_dir() -> str:
+    """Canonical path to the hub/ package directory."""
+    import os
+    return os.path.join(os.path.dirname(__file__), "hub")
+
+
 def _maybe_refresh_hub() -> None:
     """
-    Regenerate ``hub.py`` if any registered confidentiality mount is newer
-    than the existing stub file, or if the stub file does not exist.
+    Regenerate ``hub/`` if the registry has changed since it was last written.
 
-    This keeps IDE autocomplete in sync without requiring a manual
-    ``python -m dino_loader.datasets stubs`` call.
+    Staleness check
+    ---------------
+    We read ``hub/_registry_hash.txt`` (a 16-char hex string written by the
+    generator) and compare it with :func:`~dino_loader.datasets.stub_gen.\
+compute_registry_hash` — computed from the current set of
+    ``(mount.name, mount.path)`` pairs in O(n_mounts) without any filesystem
+    I/O against HPC mount points.
+
+    This replaces the previous mtime-per-mount approach, which required
+    ``os.path.getmtime()`` calls against potentially slow Lustre paths.
+
+    Legacy migration
+    ----------------
+    If a legacy ``hub.py`` file exists alongside the package (left over from
+    before the hub/ package layout), it is deleted automatically on the first
+    run.  This is a one-time, silent migration.
+
+    Safety
+    ------
+    All exceptions during regeneration are caught and logged at WARNING level
+    so that a broken stub generator never prevents training from starting.
     """
     import os
-    from dino_loader.datasets.stub_gen import generate_stubs
+    from dino_loader.datasets.stub_gen import generate_stubs_to_dir, hub_is_stale
 
-    hub_path = os.path.join(os.path.dirname(__file__), "hub.py")
+    # ── Remove legacy hub.py (one-time migration, silent) ─────────────────────
+    legacy = os.path.join(os.path.dirname(__file__), "hub.py")
+    if os.path.isfile(legacy):
+        try:
+            os.remove(legacy)
+            log.info("Removed legacy hub.py — migrated to hub/ package layout.")
+        except OSError as exc:
+            log.warning("Could not remove legacy hub.py: %s", exc)
 
-    # Determine the most recent modification time across all mount roots.
+    # ── Check if mounts are registered at all ─────────────────────────────────
     mounts = get_confidentiality_mounts()
     if not mounts:
-        return  # Nothing to scan; don't wipe an existing hub.py.
+        return  # Nothing to scan — don't wipe an existing hub/.
 
-    hub_mtime = os.path.getmtime(hub_path) if os.path.exists(hub_path) else 0.0
+    # ── Hash-based staleness check ─────────────────────────────────────────────
+    hub = _hub_dir()
+    if not hub_is_stale(hub):
+        log.debug("hub/ is up-to-date (registry hash match).")
+        return
 
-    needs_refresh = False
-    if hub_mtime == 0.0:
-        needs_refresh = True
-    else:
-        for mount in mounts:
-            if mount.path.is_dir():
-                try:
-                    if os.path.getmtime(str(mount.path)) > hub_mtime:
-                        needs_refresh = True
-                        break
-                except OSError:
-                    pass
-
-    if needs_refresh:
-        log.debug("Refreshing hub.py (stale or missing).")
-        try:
-            generate_stubs(output_file=hub_path)
-        except Exception as exc:  # noqa: BLE001
-            # Never let hub generation crash an import.
-            log.warning("hub.py auto-refresh failed: %s", exc)
+    log.debug("hub/ is stale or missing — regenerating.")
+    try:
+        generate_stubs_to_dir(hub)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("hub/ auto-refresh failed: %s", exc)
 
 
 _maybe_refresh_hub()
+
 
 # ── Public API surface ─────────────────────────────────────────────────────────
 __all__ = [
@@ -112,4 +140,5 @@ __all__ = [
     "DatasetConfig",
     "DEFAULT_STRATEGY",
     "GlobalDatasetFilter",
+    "_merge_filters",
 ]

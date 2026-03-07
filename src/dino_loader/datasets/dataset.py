@@ -45,7 +45,19 @@ Discovery metadata
 :attr:`~dino_loader.config.DatasetSpec.splits`, and
 :attr:`~dino_loader.config.DatasetSpec.strategies` on the returned spec.
 The stub generator reads these fields to emit ``Literal``-typed
-``TypedDatasetSpec`` subclasses in ``hub.py`` for IDE autocomplete.
+``TypedDatasetSpec`` subclasses in ``hub/`` for IDE autocomplete.
+
+_default_filter
+---------------
+:class:`Dataset` accepts an optional ``_default_filter`` constructor argument.
+Modality sub-modules in ``hub/`` use this to pre-restrict every
+``to_spec()`` / ``resolve()`` call to a single modality without requiring
+the caller to pass a filter explicitly.
+
+:func:`_merge_filters` merges two :class:`GlobalDatasetFilter` objects with
+*override* winning per field over *base*.  This is the mechanism that allows
+callers to further restrict a pre-filtered dataset (e.g. additionally
+filtering to ``allowed_splits=["train"]``).
 """
 
 from __future__ import annotations
@@ -122,10 +134,10 @@ class GlobalDatasetFilter:
     """
 
     allowed_confidentialities: Optional[List[str]] = None
-    allowed_modalities: Optional[List[str]] = None
-    allowed_datasets: Optional[List[str]] = None
-    allowed_splits: Optional[List[str]] = None
-    strategy: str = DEFAULT_STRATEGY
+    allowed_modalities:        Optional[List[str]] = None
+    allowed_datasets:          Optional[List[str]] = None
+    allowed_splits:            Optional[List[str]] = None
+    strategy:                  str                 = DEFAULT_STRATEGY
 
 
 @dataclass
@@ -148,10 +160,84 @@ class DatasetConfig:
     """
 
     allowed_confidentialities: Optional[List[str]] = None
-    allowed_modalities: Optional[List[str]] = None
-    allowed_splits: Optional[List[str]] = None
-    strategy: Optional[str] = None
-    weight: float = 1.0
+    allowed_modalities:        Optional[List[str]] = None
+    allowed_splits:            Optional[List[str]] = None
+    strategy:                  Optional[str]       = None
+    weight:                    float               = 1.0
+
+
+# ── Filter merge helper ───────────────────────────────────────────────────────
+
+def _merge_filters(
+    base: Optional[GlobalDatasetFilter],
+    override: Optional[GlobalDatasetFilter],
+) -> Optional[GlobalDatasetFilter]:
+    """
+    Merge two :class:`GlobalDatasetFilter` objects.
+
+    *override* wins on every field it explicitly sets (i.e. is not ``None``
+    for list fields, or not the default value for ``strategy``).  *base*
+    fills anything *override* leaves unset.
+
+    If both are ``None``, returns ``None``.
+
+    This is used by:
+
+    - :meth:`Dataset.resolve` and :meth:`Dataset.to_spec` to merge
+      ``self._default_filter`` (set by modality hub modules) with the
+      caller-supplied filter.
+    - The generated typed Dataset subclasses in ``hub/<modality>.py``.
+
+    Examples
+    --------
+    ::
+
+        base     = GlobalDatasetFilter(allowed_modalities=["rgb"],
+                                       allowed_splits=["train"])
+        override = GlobalDatasetFilter(allowed_splits=["val"])
+
+        result = _merge_filters(base, override)
+        # result.allowed_modalities == ["rgb"]   ← from base
+        # result.allowed_splits     == ["val"]   ← override wins
+    """
+    if base is None and override is None:
+        return None
+    if base is None:
+        return override
+    if override is None:
+        return base
+
+    # Both set: override wins per field, base fills unset fields.
+    return GlobalDatasetFilter(
+        allowed_confidentialities=(
+            override.allowed_confidentialities
+            if override.allowed_confidentialities is not None
+            else base.allowed_confidentialities
+        ),
+        allowed_modalities=(
+            override.allowed_modalities
+            if override.allowed_modalities is not None
+            else base.allowed_modalities
+        ),
+        allowed_datasets=(
+            override.allowed_datasets
+            if override.allowed_datasets is not None
+            else base.allowed_datasets
+        ),
+        allowed_splits=(
+            override.allowed_splits
+            if override.allowed_splits is not None
+            else base.allowed_splits
+        ),
+        # strategy: override wins only if it differs from the default,
+        # so that a modality filter's default strategy doesn't silently
+        # stomp a caller's explicit strategy choice.
+        strategy=(
+            override.strategy
+            if override.strategy != DEFAULT_STRATEGY
+            else base.strategy
+        ),
+    )
 
 
 # ── Dataset class ─────────────────────────────────────────────────────────────
@@ -180,9 +266,28 @@ class Dataset:
         # spec.modalities        == ["rgb"]
         # spec.splits            == ["train"]
         # spec.strategies        == ["default"]
+
+    Modality-scoped access (set automatically by hub modality modules)
+    ------------------------------------------------------------------
+    ::
+
+        # hub/infrared.py sets _default_filter automatically:
+        from dino_loader.datasets.hub import infrared
+        spec = infrared.laion.to_spec()
+        # spec.modalities == ["infrared"]  — no filter arg needed
+
+        # Callers can still further restrict:
+        spec = infrared.laion.to_spec(
+            global_filter=GlobalDatasetFilter(allowed_splits=["train"])
+        )
+        # Both the modality filter and the split filter are applied.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        _default_filter: Optional[GlobalDatasetFilter] = None,
+    ) -> None:
         """
         Parameters
         ----------
@@ -190,8 +295,17 @@ class Dataset:
             Dataset name, e.g. ``"imagenet"``, ``"custom"``.
             The library discovers actual paths from the
             :class:`~dino_loader.datasets.settings.ConfidentialityRegistry`.
+        _default_filter:
+            Optional base filter applied before any caller-supplied filter.
+            Set automatically by modality sub-modules in ``hub/`` so that
+            ``infrared.laion.to_spec()`` restricts to modality ``"infrared"``
+            without the caller having to pass a filter explicitly.
+
+            Regular user code **never** sets this directly.  It is a private
+            contract between ``stub_gen.py`` and the generated hub modules.
         """
         self.name = name
+        self._default_filter: Optional[GlobalDatasetFilter] = _default_filter
 
     # ── Private helpers ───────────────────────────────────────────────────
 
@@ -237,6 +351,8 @@ class Dataset:
         ----------
         global_filter:
             Broad filters (confidentialities, modalities, splits, strategy).
+            Merged with ``self._default_filter`` (default filter wins on
+            fields it sets; caller filter can further restrict).
         config:
             Per-dataset overrides (take precedence over *global_filter*).
 
@@ -247,46 +363,40 @@ class Dataset:
         meta : Dict[str, Set[str]]
             Keys ``"confidentialities"``, ``"modalities"``, ``"splits"``,
             ``"strategies"`` — each value is the set of directory names that
-            actually contributed at least one valid shard.  Only directories
-            from which shards were accepted are recorded, so the metadata
-            always reflects what is *reachable*, not what was *visited*.
+            actually contributed at least one valid shard.
         """
-        allowed_confs  = self._effective_set(global_filter, config, "allowed_confidentialities")
-        allowed_mods   = self._effective_set(global_filter, config, "allowed_modalities")
-        allowed_splits = self._effective_set(global_filter, config, "allowed_splits")
-        strategy       = self._effective_strategy(global_filter, config)
+        # Merge the instance-level default filter with the caller's filter.
+        # The caller's filter wins per field, allowing further restriction.
+        effective_filter = _merge_filters(self._default_filter, global_filter)
 
         shards: List[str] = []
         meta: Dict[str, Set[str]] = {
             "confidentialities": set(),
-            "modalities":        set(),
-            "splits":            set(),
-            "strategies":        set(),
+            "modalities": set(),
+            "splits": set(),
+            "strategies": set(),
         }
+
+        allowed_confs = self._effective_set(effective_filter, config, "allowed_confidentialities")
+        allowed_mods  = self._effective_set(effective_filter, config, "allowed_modalities")
+        allowed_splits = self._effective_set(effective_filter, config, "allowed_splits")
+        strategy = self._effective_strategy(effective_filter, config)
 
         for mount in get_confidentiality_mounts():
             if allowed_confs is not None and mount.name not in allowed_confs:
                 continue
-            if not mount.path.is_dir():
-                log.debug("Confidentiality path does not exist, skipping: %s", mount.path)
-                continue
-
             conf_root = str(mount.path)
+            if not os.path.isdir(conf_root):
+                continue
 
             for mod in _listdirs(conf_root):
                 if allowed_mods is not None and mod not in allowed_mods:
                     continue
 
                 dataset_path = os.path.join(conf_root, mod, self.name)
-                if not os.path.isdir(dataset_path):
-                    continue
-
                 outputs_path = os.path.join(dataset_path, "outputs", strategy)
+
                 if not os.path.isdir(outputs_path):
-                    log.debug(
-                        "No outputs/%s for %s/%s/%s",
-                        strategy, mount.name, mod, self.name,
-                    )
                     continue
 
                 for split in _listdirs(outputs_path):
@@ -301,15 +411,12 @@ class Dataset:
                             continue
                         tar_path = os.path.join(split_path, fname)
                         idx_path = os.path.join(split_path, fname[:-4] + ".idx")
-                        if os.path.isfile(idx_path):
-                            shards.append(tar_path)
-                            contributed = True
-                        else:
-                            log.debug("Missing .idx for shard %s, skipping.", tar_path)
+                        if not os.path.isfile(idx_path):
+                            log.debug("Missing .idx for %s — skipping.", tar_path)
+                            continue
+                        shards.append(tar_path)
+                        contributed = True
 
-                    # Only record metadata for splits that contributed shards.
-                    # This keeps discovery metadata *tight*: it reflects what is
-                    # actually reachable, not everything that was visited.
                     if contributed:
                         meta["confidentialities"].add(mount.name)
                         meta["modalities"].add(mod)
@@ -331,6 +438,9 @@ class Dataset:
         The method walks all registered confidentiality mounts, filtering at
         each level.  A shard is included only when its companion ``.idx``
         file exists alongside it.
+
+        If ``self._default_filter`` is set (as done by hub modality modules),
+        it is merged with *global_filter* before resolution.
 
         Parameters
         ----------
@@ -384,12 +494,9 @@ class Dataset:
         * ``splits`` — sorted list of split directories.
         * ``strategies`` — sorted list of strategy directories.
 
-        The stub generator (``stub_gen.py``) reads these fields to emit
-        ``Literal``-typed ``TypedDatasetSpec`` subclasses in ``hub.py``,
-        giving IDEs concrete autocomplete for per-dataset metadata.
-
-        The filesystem is traversed **once** (via :meth:`_resolve_with_metadata`)
-        regardless of whether only shards or full metadata is needed.
+        If ``self._default_filter`` is set (as done by hub modality modules),
+        it is merged with *global_filter* before resolution — allowing callers
+        to further restrict without losing the modality pre-filter.
 
         Parameters
         ----------
@@ -403,10 +510,7 @@ class Dataset:
         DatasetSpec
             Fully populated spec including discovery metadata.
         None
-            When no valid shards are found (unknown dataset name, missing
-            mount, or all shards filtered out).  Callers can use::
-
-                specs = [s for s in (ds.to_spec() for ds in datasets) if s is not None]
+            When no valid shards are found.
         """
         shards, meta = self._resolve_with_metadata(
             global_filter=global_filter,
@@ -421,8 +525,6 @@ class Dataset:
             name              = self.name,
             shards            = shards,
             weight            = weight,
-            # ── Discovery metadata ────────────────────────────────────────
-            # Sorted for determinism: same filesystem → same spec, always.
             confidentialities = sorted(meta["confidentialities"]),
             modalities        = sorted(meta["modalities"]),
             splits            = sorted(meta["splits"]),
@@ -430,4 +532,6 @@ class Dataset:
         )
 
     def __repr__(self) -> str:
+        if self._default_filter is not None:
+            return f"Dataset({self.name!r}, _default_filter={self._default_filter!r})"
         return f"Dataset({self.name!r})"

@@ -5,12 +5,13 @@ Command-line interface for the dataset hub.
 
 Commands
 --------
-preview   Display a tree of all datasets, organised by conf / mod /
-          dataset / strategy / split.  Splits are colour-coded by validity.
-count     Approximate the number of samples in a dataset (reads .idx files).
-add       Scaffold the full directory structure for a new dataset split.
-stubs     Regenerate hub.py for IDE autocomplete.
-confs     List all registered confidentiality mounts.
+preview     Display a tree of all datasets, organised by conf / mod /
+            dataset / strategy / split.  Splits are colour-coded by validity.
+count       Approximate the number of samples in a dataset (reads .idx files).
+add         Scaffold the full directory structure for a new dataset split.
+stubs       Regenerate hub/ package for IDE autocomplete.
+confs       List all registered confidentiality mounts.
+modalities  List all modalities with their dataset counts and dataset names.
 
 Filesystem hierarchy
 --------------------
@@ -56,27 +57,21 @@ from dino_loader.datasets.utils import validate_webdataset_shard
 
 # ── ANSI colour helpers ───────────────────────────────────────────────────────
 
-_GREEN = "\033[32m"
-_RED   = "\033[31m"
-_RESET = "\033[0m"
-_BOLD  = "\033[1m"
-_DIM   = "\033[2m"
+_GREEN  = "\033[32m"
+_RED    = "\033[31m"
+_YELLOW = "\033[33m"
+_CYAN   = "\033[36m"
+_RESET  = "\033[0m"
+_BOLD   = "\033[1m"
+_DIM    = "\033[2m"
 
 
-def _green(text: str) -> str:
-    return f"{_GREEN}{text}{_RESET}"
-
-
-def _red(text: str) -> str:
-    return f"{_RED}{text}{_RESET}"
-
-
-def _dim(text: str) -> str:
-    return f"{_DIM}{text}{_RESET}"
-
-
-def _bold(text: str) -> str:
-    return f"{_BOLD}{text}{_RESET}"
+def _green(text: str) -> str:  return f"{_GREEN}{text}{_RESET}"
+def _red(text: str) -> str:    return f"{_RED}{text}{_RESET}"
+def _yellow(text: str) -> str: return f"{_YELLOW}{text}{_RESET}"
+def _cyan(text: str) -> str:   return f"{_CYAN}{text}{_RESET}"
+def _dim(text: str) -> str:    return f"{_DIM}{text}{_RESET}"
+def _bold(text: str) -> str:   return f"{_BOLD}{text}{_RESET}"
 
 
 # ── Validity helpers ──────────────────────────────────────────────────────────
@@ -120,6 +115,63 @@ def list_confidentialities() -> None:
         exists = mount.path.is_dir()
         status = _green("✓") if exists else _red("✗ (path not found)")
         print(f"  {_bold(mount.name):30s}  {mount.path}  {status}")
+    print()
+
+
+def list_modalities() -> None:
+    """
+    Print all modalities found across registered confidentiality mounts,
+    with dataset counts and dataset names.
+
+    Output example::
+
+        Modalities across all confidentiality mounts:
+
+          infrared        2 datasets   laion, thermal_cam
+          multispectral   1 dataset    sentinel2
+          rgb             3 datasets   custom, imagenet, laion
+
+    Datasets that appear in multiple modalities are listed in each.
+    """
+    mounts = get_confidentiality_mounts()
+    if not mounts:
+        print("No confidentiality mounts registered.")
+        return
+
+    # modality → set of dataset names
+    modality_datasets: dict[str, set[str]] = {}
+
+    for mount in mounts:
+        conf_root = str(mount.path)
+        if not os.path.isdir(conf_root):
+            continue
+        for mod in _listdirs(conf_root):
+            mod_path = os.path.join(conf_root, mod)
+            for dname in _listdirs(mod_path):
+                if dname in DATASET_RESERVED_DIRS:
+                    continue
+                outputs = os.path.join(mod_path, dname, "outputs")
+                if os.path.isdir(outputs):
+                    modality_datasets.setdefault(mod, set()).add(dname)
+
+    if not modality_datasets:
+        print("No modalities found.")
+        return
+
+    print(_bold("Modalities across all confidentiality mounts:"))
+    print()
+
+    col_w = max(len(m) for m in modality_datasets) + 2
+    for mod in sorted(modality_datasets):
+        datasets = sorted(modality_datasets[mod])
+        n        = len(datasets)
+        noun     = "dataset" if n == 1 else "datasets"
+        ds_list  = ", ".join(datasets)
+        print(
+            f"  {_cyan(mod):{col_w}s}"
+            f"  {_bold(str(n))} {noun:8s}"
+            f"  {_dim(ds_list)}"
+        )
     print()
 
 
@@ -311,6 +363,12 @@ def main() -> None:
         help="List all registered confidentiality mounts.",
     )
 
+    # ── modalities ────────────────────────────────────────────────────────────
+    subparsers.add_parser(
+        "modalities",
+        help="List all modalities with dataset counts and names.",
+    )
+
     # ── preview ───────────────────────────────────────────────────────────────
     subparsers.add_parser(
         "preview",
@@ -338,7 +396,7 @@ def main() -> None:
         help="Scaffold a new dataset directory with the full sub-directory layout.",
     )
     add_p.add_argument("conf",  type=str, help="Confidentiality name (e.g. public, private).")
-    add_p.add_argument("mod",   type=str, help="Modality (e.g. rgb, multispectral).")
+    add_p.add_argument("mod",   type=str, help="Modality (e.g. rgb, infrared).")
     add_p.add_argument("name",  type=str, help="Dataset name.")
     add_p.add_argument("split", type=str, help="Split name (e.g. train, val).")
     add_p.add_argument(
@@ -357,15 +415,21 @@ def main() -> None:
     # ── stubs ─────────────────────────────────────────────────────────────────
     stubs_p = subparsers.add_parser(
         "stubs",
-        help="Regenerate hub.py for IDE autocomplete.",
+        help="Regenerate hub/ package for IDE autocomplete.",
     )
-    stubs_p.add_argument("--out", type=str, help="Output file path for hub.py.")
+    stubs_p.add_argument(
+        "--out", type=str, default=None,
+        help="Override output directory for the hub/ package (default: src/dino_loader/datasets/hub/).",
+    )
 
     # ── Dispatch ──────────────────────────────────────────────────────────────
     args = parser.parse_args()
 
     if args.command == "confs":
         list_confidentialities()
+
+    elif args.command == "modalities":
+        list_modalities()
 
     elif args.command == "preview":
         preview_datasets()
@@ -388,8 +452,14 @@ def main() -> None:
         )
 
     elif args.command == "stubs":
-        generate_stubs(output_file=args.out)
-        print("✅ hub.py regenerated.")
+        from dino_loader.datasets.stub_gen import generate_stubs_to_dir
+        import os
+        hub_dir = args.out or os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "datasets", "hub",
+        )
+        generate_stubs_to_dir(hub_dir)
+        print(f"✅ hub/ package regenerated → {hub_dir}")
 
 
 if __name__ == "__main__":
