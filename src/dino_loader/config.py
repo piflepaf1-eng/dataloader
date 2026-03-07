@@ -4,65 +4,48 @@ dino_loader.config
 All configuration lives here.  No logic — pure dataclasses.
 Serialised to / from JSON for checkpointing (no pickle fragility).
 
-Changes vs previous version
-----------------------------
-[CFG-1] DatasetSpec enriched (DinoV3 alignment):
-        - shard_quality_scores: Optional[List[float]] — per-shard quality for
-          weighted shard sampling (replaces uniform random.choices at shard level).
-        - min_sample_quality: Optional[float] — hard filter threshold applied
-          per sample via .json sidecar metadata.  Requires wds.TarIterator
-          extraction (see mixing_source.py).
-        - metadata_key: str — sidecar extension to extract alongside JPEGs.
-          Defaults to "json" (standard WebDataset convention).
-        - mean / std: Optional per-dataset normalisation statistics.  When None,
-          falls back to DINOAugConfig.mean / DINOAugConfig.std (ImageNet).
-          Allows LAION-specific stats without changing global aug config.
+Changes in this version
+-----------------------
+[CFG-S1]  DatasetSpec.shard_sampling — explicit sampling mode.
+          Two modes:
+          - "epoch"     (default) — deterministic shuffle, one full pass per epoch.
+          - "resampled" — infinite sampling with replacement via wds.ResampledShards.
+            Ideal for heavily imbalanced datasets (e.g. a small curated set mixed
+            with a large noisy one) where you want controlled over-sampling without
+            duplicating shards on disk.
 
-[CFG-1b] DatasetSpec discovery metadata (new):
-        - confidentialities: List[str] — confidentiality labels under which
-          shards were found (e.g. ["public", "private"]).  Populated by
-          Dataset.to_spec(); defaults to [] so existing DatasetSpec(...)
-          constructions remain valid.
-        - modalities: List[str] — modality directories (e.g. ["rgb"]).
-        - splits: List[str] — split directories (e.g. ["train", "val"]).
-        - strategies: List[str] — strategy directories (e.g. ["default"]).
-        These fields are *informational only* — the dataloader does not read
-        them.  stub_gen.py reads them to emit Literal-typed TypedDatasetSpec
-        subclasses in hub.py for IDE autocomplete.
+[CFG-S2]  DatasetSpec.prob — alias for weight= aligned with wds.RandomMix API.
+          Both are accepted; weight= takes precedence if both provided (deprecation
+          warning emitted).  Lowers barrier for users already familiar with webdataset.
 
-[CFG-2] DINOAugConfig additions:
-        - preserve_aspect_ratio: bool — use resize-then-crop (aspect-ratio-safe)
-          instead of fn.resize with fixed output size.  Maps to DALI
-          fn.resize(mode="not_smaller") + fn.crop in pipeline.py.
-        - resolution_schedule: Optional[List[Tuple[int,int]]] — list of
-          (epoch, global_crop_size) pairs for progressive resolution training.
-          The loader applies these automatically via set_resolution() without
-          rebuilding the DALI pipeline (zero downtime).
-        - max_global_crop_size / max_local_crop_size: int — upper bounds used
-          to pre-allocate DALI nvjpeg buffers and output tensors at the maximum
-          planned resolution, avoiding GPU memory re-allocation during training.
+[CFG-S3]  LoaderConfig.debug_log_keys — optional path for per-sample key logging.
+          When set, every sample key (__key__), worker id, and rank is appended to
+          this file using fcntl POSIX locking (same pattern as wds.log_keys).
+          Overhead: ~1 syscall per sample — disable in production.
+          Useful for: reproducibility audits, corruption debugging, distribution bias
+          detection (e.g. detecting that one dataset is under-represented).
 
-[CFG-3] LoaderConfig additions:
-        - shuffle_buffer_size: int — intra-shard sample shuffle buffer depth.
-          Previously reserved as a comment; now wired in ShardIterator.
-          Default 512: large enough to break within-shard web-crawl correlations
-          without exceeding per-rank RAM budgets.
-        - stateful_dataloader: bool — expose state_dict() / load_state_dict()
-          on DINODataLoader, aligning with the PyTorch StatefulDataLoader
-          interface (torchdata ≥ 0.8).  Enables integration with Lightning,
-          torchtitan and other frameworks that call these methods automatically.
+[CFG-S4]  LoaderConfig.fuse_normalization — controls whether per-dataset
+          normalisation is fused into the DALI graph (True, default) or applied
+          post-DALI in memory.py (False, legacy).  When True, mean/std scalars are
+          emitted by an ExternalSource node in pipeline.py, enabling the DALI
+          compiler to fuse normalize → cast → transpose into a single GPU kernel.
 
-[CFG-4] CheckpointState additions:
-        - global_crop_size / local_crop_size: persisted so that a resumed run
-          starts at the correct resolution without re-reading the schedule.
+[CFG-S5]  LoaderConfig.dali_fp8_output — when True AND use_fp8_output is True,
+          the FP8 cast is performed inside the DALI graph via fn.cast(FLOAT8_E4M3)
+          rather than post-DALI in FP8Formatter.  Eliminates one kernel launch and
+          one BF16 intermediate buffer per batch.
+          Trade-off: loses Transformer Engine FP8TensorMeta (rolling amax window).
+          Set to False (default) to retain TE metadata for use with te.fp8_autocast.
 """
 
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -81,6 +64,15 @@ class DatasetSpec:
         List of absolute shard paths (.tar files on Lustre).
     weight
         Initial mixing weight (re-normalised automatically; need not sum to 1).
+    prob
+        Alias for weight= to align with the wds.RandomMix API.  If both are
+        provided, weight= takes precedence and a DeprecationWarning is emitted.
+    shard_sampling
+        How shards are sampled within this dataset:
+        - ``"epoch"``     : one full, deterministic-shuffled pass per epoch.
+        - ``"resampled"`` : infinite with-replacement sampling via
+          wds.ResampledShards — use for small curated sets you want to
+          over-sample, or for streaming datasets without epoch boundaries.
     shard_quality_scores
         Optional per-shard quality score in [0, 1].  When provided,
         ShardIterator samples shards proportionally to these scores rather
@@ -99,43 +91,57 @@ class DatasetSpec:
     std
         Per-channel normalisation std for this dataset.  When None, the
         global DINOAugConfig.std is used (ImageNet stats).
-    confidentialities
-        Confidentiality labels under which shards were found during filesystem
-        discovery (e.g. ``["public", "private"]``).  Populated automatically
-        by :meth:`Dataset.to_spec`; left empty when constructing manually.
-        *Informational only* — not read by the dataloader.
-    modalities
-        Modality directories found during discovery (e.g. ``["rgb"]``).
-        Populated by :meth:`Dataset.to_spec`.  *Informational only.*
-    splits
-        Split directories found during discovery (e.g. ``["train", "val"]``).
-        Populated by :meth:`Dataset.to_spec`.  *Informational only.*
-    strategies
-        Strategy directories found during discovery (e.g. ``["default"]``).
-        Populated by :meth:`Dataset.to_spec`.  *Informational only.*
+    confidentialities / modalities / splits / strategies
+        Discovery metadata populated by Dataset.to_spec().  Informational only.
     """
-    name:                 str
-    shards:               List[str]
-    weight:               float                = 1.0
+
+    name:   str
+    shards: List[str]
+    weight: float = 1.0
+
+    # [CFG-S2] wds.RandomMix-compatible alias
+    prob:   Optional[float] = None
+
+    # [CFG-S1] Shard sampling mode
+    shard_sampling: Literal["epoch", "resampled"] = "epoch"
+
+    # Quality gating
     shard_quality_scores: Optional[List[float]] = None
     min_sample_quality:   Optional[float]       = None
     metadata_key:         Optional[str]         = "json"
-    mean:                 Optional[Tuple[float, float, float]] = None
-    std:                  Optional[Tuple[float, float, float]] = None
 
-    # ── Discovery metadata (populated by Dataset.to_spec()) ───────────────────
-    # Defaults to [] so that DatasetSpec(name=..., shards=...) remains valid
-    # without specifying these fields — no breaking change.
-    confidentialities:    List[str]            = field(default_factory=list)
-    modalities:           List[str]            = field(default_factory=list)
-    splits:               List[str]            = field(default_factory=list)
-    strategies:           List[str]            = field(default_factory=list)
+    # Per-dataset normalisation stats (override DINOAugConfig.mean/std)
+    mean: Optional[Tuple[float, float, float]] = None
+    std:  Optional[Tuple[float, float, float]] = None
 
-    def __post_init__(self):
-        if not self.shards:
-            raise ValueError(f"DatasetSpec '{self.name}' has no shards.")
-        if self.weight < 0:
-            raise ValueError(f"DatasetSpec '{self.name}': weight must be ≥ 0.")
+    # Discovery metadata (populated by Dataset.to_spec, ignored by dataloader)
+    confidentialities: List[str] = field(default_factory=list)
+    modalities:        List[str] = field(default_factory=list)
+    splits:            List[str] = field(default_factory=list)
+    strategies:        List[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # [CFG-S2] Resolve weight / prob alias
+        if self.prob is not None:
+            if self.weight != 1.0:
+                warnings.warn(
+                    f"DatasetSpec '{self.name}': both weight= and prob= provided. "
+                    "weight= takes precedence.  prob= is deprecated; use weight= only.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+            else:
+                self.weight = self.prob
+        self.prob = None  # normalise: always use weight internally
+
+        # Validate shard_sampling
+        if self.shard_sampling not in ("epoch", "resampled"):
+            raise ValueError(
+                f"DatasetSpec '{self.name}': shard_sampling must be 'epoch' or "
+                f"'resampled', got {self.shard_sampling!r}."
+            )
+
+        # Validate shard_quality_scores
         if self.shard_quality_scores is not None:
             if len(self.shard_quality_scores) != len(self.shards):
                 raise ValueError(
@@ -147,6 +153,8 @@ class DatasetSpec:
                 raise ValueError(
                     f"DatasetSpec '{self.name}': shard_quality_scores must all be ≥ 0."
                 )
+
+        # Validate min_sample_quality
         if self.min_sample_quality is not None and not (
             0.0 <= self.min_sample_quality <= 1.0
         ):
@@ -162,7 +170,9 @@ class DatasetSpec:
 
     @classmethod
     def from_dict(cls, d: Dict) -> "DatasetSpec":
-        return cls(**d)
+        # Strip unknown keys for forward-compat
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
@@ -174,72 +184,80 @@ class DINOAugConfig:
 
     Parameters
     ----------
-    global_crop_size
-        Output resolution for global (teacher) crops in pixels.
-    local_crop_size
-        Output resolution for local (student) crops in pixels.
-    n_global_crops
-        Number of global crops per image.
-    n_local_crops
-        Number of local crops per image.
-    global_crop_scale
-        (min, max) scale range for global random-resized crop.
-    local_crop_scale
-        (min, max) scale range for local random-resized crop.
-    hflip_prob
+    global_crop_size / local_crop_size
+        Starting output resolution for global / local crops.
+    n_global_crops / n_local_crops
+        Number of crops per image (DINOv2 paper: 2 global, 8 local).
+    global_crops_scale / local_crops_scale
+        Area fraction ranges for random-resized crops.
+    flip_prob
         Horizontal-flip probability.
-    color_jitter_strength
-        Strength scalar applied to brightness / contrast / saturation / hue.
+    color_jitter_prob
+        Probability of applying colour jitter.
+    brightness / contrast / saturation / hue
+        Colour jitter magnitudes (strength = 1.0 → DINOv2 paper defaults).
     grayscale_prob
         Probability of converting to grayscale.
-    gaussian_blur_prob_g1
-        Gaussian-blur probability for the first global crop.
-    gaussian_blur_prob_g2
-        Gaussian-blur probability for the second global crop.
-    gaussian_blur_prob_local
-        Gaussian-blur probability for local crops.
+    blur_prob_global1 / blur_prob_global2 / blur_prob_local
+        Gaussian-blur probabilities per view type.
+    blur_sigma_min / blur_sigma_max
+        Sigma range for Gaussian blur.
     solarize_prob
-        Solarisation probability (applied to second global crop in DINOv2).
-    mean
-        Global normalisation mean (ImageNet default).
-    std
-        Global normalisation std (ImageNet default).
+        Solarisation probability (second global crop only in DINOv2).
+    mean / std
+        Global normalisation statistics (ImageNet defaults).
+        Per-dataset overrides live in DatasetSpec.mean / DatasetSpec.std.
     preserve_aspect_ratio
-        When True, uses resize-then-crop (aspect-ratio-safe) instead of
-        a direct resize to fixed output size.  Maps to DALI
-        ``fn.resize(mode="not_smaller")`` followed by ``fn.crop``.
+        True → resize shorter side then centre-crop (avoids distortion).
+        False → direct square resize (legacy, faster by one DALI op).
     resolution_schedule
-        List of ``(epoch, global_crop_size)`` pairs.  The loader calls
-        ``set_resolution()`` automatically at the appropriate epoch boundary.
-        ``None`` disables progressive resolution (train at fixed size).
-    max_global_crop_size
-        Upper bound for the global crop dimension used to pre-allocate DALI
-        nvjpeg buffers.  Defaults to ``global_crop_size`` (no headroom).
-        Set higher when using a resolution schedule (e.g. 518 for ViT-g).
-    max_local_crop_size
-        Same as ``max_global_crop_size`` but for local crops.
+        List of (epoch, global_crop_size) pairs for progressive resolution.
+        set_epoch() applies these automatically — no DALI rebuild required.
+    max_global_crop_size / max_local_crop_size
+        nvjpeg pre-allocation ceiling.  Must be ≥ the largest size in the
+        resolution schedule.  Default = initial crop size.
     """
-    global_crop_size:        int   = 224
-    local_crop_size:         int   = 96
-    n_global_crops:          int   = 2
-    n_local_crops:           int   = 8
-    global_crop_scale:       Tuple[float, float] = (0.32, 1.0)
-    local_crop_scale:        Tuple[float, float] = (0.05, 0.32)
-    hflip_prob:              float = 0.5
-    color_jitter_strength:   float = 0.4
-    grayscale_prob:          float = 0.2
-    gaussian_blur_prob_g1:   float = 1.0
-    gaussian_blur_prob_g2:   float = 0.1
-    gaussian_blur_prob_local: float = 0.5
-    solarize_prob:           float = 0.2
-    mean:  Tuple[float, float, float] = (0.485, 0.456, 0.406)
-    std:   Tuple[float, float, float] = (0.229, 0.224, 0.225)
-    preserve_aspect_ratio:   bool  = False
-    resolution_schedule:     Optional[List[Tuple[int, int]]] = None
-    max_global_crop_size:    Optional[int] = None
-    max_local_crop_size:     Optional[int] = None
 
-    def __post_init__(self):
+    # Crop sizes
+    global_crop_size:     int   = 224
+    local_crop_size:      int   = 96
+    n_global_crops:       int   = 2
+    n_local_crops:        int   = 8
+    global_crops_scale:   Tuple[float, float] = (0.32, 1.0)
+    local_crops_scale:    Tuple[float, float] = (0.05, 0.32)
+
+    # Geometric
+    flip_prob:            float = 0.5
+
+    # Colour
+    color_jitter_prob:    float = 0.8
+    brightness:           float = 0.4
+    contrast:             float = 0.4
+    saturation:           float = 0.2
+    hue:                  float = 0.1
+    grayscale_prob:       float = 0.2
+
+    # Blur / solarise
+    blur_prob_global1:    float = 1.0
+    blur_prob_global2:    float = 0.1
+    blur_prob_local:      float = 0.5
+    blur_sigma_min:       float = 0.1
+    blur_sigma_max:       float = 2.0
+    solarize_prob:        float = 0.2
+
+    # Normalisation (ImageNet defaults)
+    mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
+    std:  Tuple[float, float, float] = (0.229, 0.224, 0.225)
+
+    # Aspect ratio
+    preserve_aspect_ratio: bool = True
+
+    # Progressive resolution
+    resolution_schedule:    Optional[List[Tuple[int, int]]] = None
+    max_global_crop_size:   Optional[int] = None
+    max_local_crop_size:    Optional[int] = None
+
+    def __post_init__(self) -> None:
         if self.max_global_crop_size is None:
             self.max_global_crop_size = self.global_crop_size
         if self.max_local_crop_size is None:
@@ -247,106 +265,151 @@ class DINOAugConfig:
 
     @property
     def n_views(self) -> int:
-        """Total number of crop views per image."""
         return self.n_global_crops + self.n_local_crops
 
-    def to_dict(self) -> Dict:
-        return asdict(self)
+    def crop_size_at_epoch(self, epoch: int) -> int:
+        """Return the scheduled global crop size for a given epoch."""
+        if not self.resolution_schedule:
+            return self.global_crop_size
+        size = self.global_crop_size
+        for trigger_epoch, new_size in sorted(self.resolution_schedule):
+            if epoch >= trigger_epoch:
+                size = new_size
+        return size
 
-    @classmethod
-    def from_dict(cls, d: Dict) -> "DINOAugConfig":
-        return cls(**d)
 
-
-# ── Loader ────────────────────────────────────────────────────────────────────
+# ── Infrastructure ────────────────────────────────────────────────────────────
 
 @dataclass
 class LoaderConfig:
     """
-    Infrastructure knobs for :class:`~dino_loader.loader.DINODataLoader`.
+    Infrastructure knobs for DINODataLoader.
 
     Parameters
     ----------
-    prefetch_factor
-        Number of shards to prefetch per dataset per rank.
-    num_workers
-        CPU threads per shard prefetch pool.
-    seed
-        Base random seed; per-rank seed is derived as ``seed + rank``.
-    cache_max_gb
-        Maximum in-process shard cache size in GiB.
+    node_shm_gb
+        /dev/shm budget per node in GB.  ~50% of node RAM is a safe default.
+    shard_prefetch_window
+        Max concurrent Lustre → /dev/shm downloads (node master asyncio).
+    shard_timeout_s
+        Seconds a non-master rank waits for a shard to appear in /dev/shm.
+    shard_extraction_workers
+        Thread-pool workers for tar → JPEG extraction.
+    dali_cpu_queue / dali_gpu_queue
+        DALI prefetch queue depths (CPU and GPU sides).
+    dali_num_threads
+        DALI CPU worker threads for pre-decode operations.
+    hw_decoder_load
+        Fraction of JPEG decoding sent to nvjpeg HW ASIC (0–1).
     shuffle_buffer_size
-        Intra-shard sample shuffle reservoir depth.  Set to 0 to disable.
-        Default 512 breaks within-shard web-crawl correlations without
-        exceeding per-rank RAM budgets on typical Lustre-attached nodes.
+        Intra-shard sample shuffle buffer depth.
+    use_fp8_output
+        Quantise global/local crop tensors to FP8 E4M3 before yielding.
+    dali_fp8_output                                              [CFG-S5]
+        When True (and use_fp8_output=True), perform FP8 cast inside the
+        DALI graph rather than post-DALI, enabling kernel fusion with the
+        final normalise + transpose.  Loses TE FP8TensorMeta.
+    fuse_normalization                                           [CFG-S4]
+        When True (default), per-dataset mean/std is emitted via DALI
+        ExternalSource and fused with the final normalize kernel.
+    output_dtype
+        Intermediate computation dtype ("bf16" or "fp32").
     stateful_dataloader
-        When True, expose ``state_dict()`` / ``load_state_dict()`` on
-        :class:`~dino_loader.loader.DINODataLoader` for integration with
-        Lightning, torchtitan and PyTorch StatefulDataLoader-aware frameworks.
-    fp8_output
-        When True, pipeline outputs are formatted to FP8 (requires
-        TransformerEngine).
-    use_ibot_mask
-        When True, the loader generates iBOT token masks and attaches them
-        to each :class:`~dino_loader.memory.Batch`.
-    ibot_mask_ratio
-        Fraction of tokens to mask in iBOT mode.
+        Expose state_dict() / load_state_dict() (PyTorch StatefulDataLoader).
+    checkpoint_dir
+        Directory for JSON dataloader checkpoint files (rank 0 only).
+    checkpoint_every_steps
+        Checkpoint write frequency (steps).
+    force_topology
+        Override topology detection: "nvl72" | "pcie" | None (auto).
+    seed
+        Base random seed for shard shuffling and augmentation.
+    debug_log_keys                                               [CFG-S3]
+        When set to a file path, every sample's __key__, worker id, and rank
+        are appended using POSIX fcntl locking (wds.log_keys pattern).
+        Set to None (default) to disable — zero overhead in production.
     """
-    prefetch_factor:      int   = 2
-    num_workers:          int   = 4
-    seed:                 int   = 42
-    cache_max_gb:         float = 4.0
-    shuffle_buffer_size:  int   = 512
-    stateful_dataloader:  bool  = False
-    fp8_output:           bool  = False
-    use_ibot_mask:        bool  = False
-    ibot_mask_ratio:      float = 0.5
+
+    # I/O
+    node_shm_gb:              float = 128.0
+    shard_prefetch_window:    int   = 64
+    shard_timeout_s:          float = 300.0
+    shard_extraction_workers: int   = 4
+
+    # DALI
+    dali_cpu_queue:           int   = 8
+    dali_gpu_queue:           int   = 6
+    dali_num_threads:         int   = 8
+    hw_decoder_load:          float = 0.90
+
+    # Data
+    shuffle_buffer_size:      int   = 512
+
+    # Output precision
+    use_fp8_output:           bool  = False
+    dali_fp8_output:          bool  = False   # [CFG-S5] fuse FP8 into DALI graph
+    fuse_normalization:       bool  = True    # [CFG-S4] fuse per-dataset norm in DALI
+    output_dtype:             str   = "bf16"
+
+    # StatefulDataLoader
+    stateful_dataloader:      bool  = True
+    checkpoint_dir:           str   = "/tmp/dino_loader_ckpt"
+    checkpoint_every_steps:   int   = 500
+
+    # Cluster
+    force_topology:           Optional[str] = None
+    seed:                     int   = 0
+
+    # Debug                                                      [CFG-S3]
+    debug_log_keys:           Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.dali_fp8_output and not self.use_fp8_output:
+            raise ValueError(
+                "LoaderConfig: dali_fp8_output=True requires use_fp8_output=True."
+            )
+        if self.output_dtype not in ("bf16", "fp32"):
+            raise ValueError(
+                f"LoaderConfig: output_dtype must be 'bf16' or 'fp32', "
+                f"got {self.output_dtype!r}."
+            )
 
     def to_dict(self) -> Dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: Dict) -> "LoaderConfig":
-        return cls(**d)
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
 
-# ── Checkpoint ────────────────────────────────────────────────────────────────
+# ── Checkpoint state ──────────────────────────────────────────────────────────
 
 @dataclass
 class CheckpointState:
-    """
-    Serialisable snapshot of dataloader progress for mid-epoch resume.
+    """Persisted dataloader state — JSON-serialisable."""
 
-    Parameters
-    ----------
-    epoch
-        Current training epoch (0-indexed).
-    sample_idx
-        Number of samples consumed within the current epoch.
-    shard_cursors
-        Per-dataset shard cursor (index into the shuffled shard list).
-    global_crop_size
-        Active global crop size (may differ from DINOAugConfig when a
-        resolution schedule is in use).
-    local_crop_size
-        Active local crop size.
-    """
-    epoch:            int              = 0
-    sample_idx:       int              = 0
-    shard_cursors:    Dict[str, int]   = field(default_factory=dict)
-    global_crop_size: Optional[int]    = None
-    local_crop_size:  Optional[int]    = None
-
-    def save(self, path: Path) -> None:
-        path.write_text(json.dumps(asdict(self), indent=2))
-
-    @classmethod
-    def load(cls, path: Path) -> "CheckpointState":
-        return cls(**json.loads(path.read_text()))
+    step:              int   = 0
+    epoch:             int   = 0
+    shard_cursors:     Dict  = field(default_factory=dict)
+    global_crop_size:  int   = 224
+    local_crop_size:   int   = 96
+    dataset_weights:   List[float] = field(default_factory=list)
 
     def to_dict(self) -> Dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: Dict) -> "CheckpointState":
-        return cls(**d)
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in known})
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.to_dict(), indent=2))
+        tmp.rename(path)
+
+    @classmethod
+    def load(cls, path: Path) -> "CheckpointState":
+        return cls.from_dict(json.loads(path.read_text()))

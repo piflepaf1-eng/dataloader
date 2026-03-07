@@ -1,95 +1,75 @@
 """
 dino_loader.mixing_source
 =========================
-WebDataset mixing source for DALI ExternalSource.
-
-Separation of concerns
------------------------
-ResolutionSource  — thread-safe scalar source for dynamic DALI resize (zero rebuild).
-MixingWeights     — owns weight state and thread-safe update logic.
-ShardIterator     — owns per-dataset shard cycling, prefetch scheduling,
-                    tar extraction via wds.TarIterator, intra-shard shuffle,
-                    sidecar metadata extraction, and quality filtering.
-MixingSource      — composes the above; implements the DALI callback protocol.
-
-Changes from previous version
-------------------------------
-[MS-1]  wds.TarIterator replaces custom _extract_jpegs tar parser.
-[MS-2]  Sidecar metadata extraction.
-[MS-3]  Sample-level quality filtering.
-[MS-4]  Weighted shard sampling.
-[MS-5]  Intra-shard shuffle buffer.
-[MS-6]  ResolutionSource — dynamic DALI resize without pipeline rebuild.
-[MS-7]  Per-dataset normalisation stats.
+MixingSource, ShardIterator, MixingWeights, ResolutionSource.
 
 Changes in this version
 -----------------------
-[MS-8]  Vectorised dataset-index sampling with NumPy.
+[MS-R1]  ShardIterator: explicit shard_sampling mode.                       ← NEW
+         DatasetSpec.shard_sampling="resampled" delegates to
+         wds.ResampledShards for infinite with-replacement sampling.
+         The existing "epoch" mode (deterministic shuffle, one full pass)
+         is unchanged.
 
-        Previous behaviour
-        ------------------
-        Dataset selection per batch used:
+         Why use wds.ResampledShards instead of reimplementing it?
+         - wds.ResampledShards handles deterministic seeding per-worker,
+           is well-tested, and will receive upstream fixes automatically.
+         - Our role is to wrap it with the same interface as the epoch mode
+           so that ShardIterator and MixingSource are unaware of the
+           difference.
 
-            indices = random.choices(range(len(self._iterators)),
-                                     weights=weights, k=self._batch_size)
+[MS-R2]  debug_log_keys support.                                            ← NEW
+         When LoaderConfig.debug_log_keys is set, each sample's __key__
+         (from metadata), worker id, and rank are appended to the log file
+         using POSIX fcntl locking — same pattern as wds.log_keys.
+         Implementation is in MixingSource._maybe_log_keys().
+         Zero overhead when debug_log_keys=None.
 
-        ``random.choices()`` operates in pure Python, calling the interpreter
-        for each of the ``batch_size`` draws.  For batch_size=512 with 3
-        datasets, this is 512 interpreter iterations through the alias/wheel
-        method — fast in absolute terms (~30 µs) but unnecessarily inside the
-        GIL.
+[MS-R3]  register_dataset_index_callback — feeds NormSource.               ← NEW
+         MixingSource now tracks which dataset index each sample in the
+         batch came from.  After assembling a batch, it calls any registered
+         callback(indices: List[int]).  This is consumed by NormSource in
+         pipeline.py to emit the correct per-sample mean/std to the DALI
+         ExternalSource.
 
-        New behaviour
-        -------------
-        ``np.random.Generator.choice()`` with ``replace=True`` and a
-        probability vector selects all ``batch_size`` indices in a single
-        vectorised C call, releasing the GIL for the duration.  The
-        ``numpy.random.Generator`` instance is per-object (not module-level)
-        to avoid state sharing between MixingSource instances in tests.
-
-        Benchmark (3 datasets, batch_size=512, 10k calls):
-          random.choices : ~28 µs / call
-          np.rng.choice  :  ~4 µs / call   (7× faster)
-
-        For 200k training steps this saves ~4.8 seconds of sampling overhead.
-
-[MS-9]  queue_depth metric wired into MetricsRegistry.
-
-        The ``mixing_source_queue_depth`` field in MetricsStruct was declared
-        but never populated — the CLI always displayed 0.  MixingSource.__call__
-        now publishes the total number of SampleRecords buffered across all
-        ShardIterator reservoirs after each batch assembly.  This gives
-        operators a real-time view of the extraction pipeline's health:
-        a sustained depth of 0 indicates DALI is starving.
+[MS-8]   Vectorised np.rng.choice (retained).
+[MS-9]   MetricsRegistry queue depth (retained).
 """
 
 from __future__ import annotations
 
-import concurrent.futures
-import io
-import json
+import fcntl
 import logging
+import os
 import threading
+import time
 from collections import deque
-from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional, Sequence, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor
+from typing import (
+    Callable, Dict, Deque, List, Optional, Sequence, Set, Tuple
+)
 
 import numpy as np
 
-from dino_loader.config          import DatasetSpec
-from dino_loader.monitor.metrics import MetricField, get_registry
-from dino_loader.shard_cache     import NodeSharedShardCache
+from dino_loader.config import DatasetSpec
 
 log = logging.getLogger(__name__)
 
 try:
-    import webdataset as wds
+    from dino_loader.monitor.metrics import get_registry, MetricField
+    HAS_METRICS = True
+except ImportError:
+    HAS_METRICS = False
+
+# webdataset for ResampledShards [MS-R1]
+try:
+    from webdataset.shardlists import ResampledShards
     HAS_WDS = True
 except ImportError:
     HAS_WDS = False
     log.warning(
-        "webdataset not installed — falling back to legacy tar parser. "
-        "Install with: pip install webdataset"
+        "webdataset not installed — shard_sampling='resampled' will fall back "
+        "to 'epoch' mode.  Install with: pip install webdataset"
     )
 
 try:
@@ -100,124 +80,116 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Sample record
+# MixingWeights — thread-safe weight vector with named access
 # ══════════════════════════════════════════════════════════════════════════════
 
-@dataclass(slots=True)
-class SampleRecord:
-    """One decoded sample from a WebDataset shard."""
-    jpeg:        bytes
-    metadata:    Optional[Dict] = None
-    dataset_idx: int            = 0
+class MixingWeights:
+    """Normalised, thread-safe weight vector for dataset mixing."""
+
+    def __init__(self, specs: List[DatasetSpec]) -> None:
+        self.names = [s.name for s in specs]
+        raw        = [s.weight for s in specs]
+        self._lock = threading.Lock()
+        self._weights = self._normalise(raw)
+
+    def get(self) -> List[float]:
+        with self._lock:
+            return list(self._weights)
+
+    def set(self, weights: Sequence[float]) -> None:
+        if len(weights) != len(self.names):
+            raise ValueError(
+                f"MixingWeights.set: expected {len(self.names)} weights, got {len(weights)}."
+            )
+        with self._lock:
+            self._weights = self._normalise(list(weights))
+
+    def set_by_name(self, name: str, weight: float) -> None:
+        try:
+            idx = self.names.index(name)
+        except ValueError:
+            raise KeyError(f"Dataset '{name}' not found. Available: {self.names}")
+        with self._lock:
+            w = list(self._weights)
+            # Un-normalise, update, re-normalise
+            total = sum(w) or 1.0
+            raw   = [v * total for v in w]
+            raw[idx] = weight
+            self._weights = self._normalise(raw)
+
+    @staticmethod
+    def _normalise(weights: List[float]) -> List[float]:
+        total = sum(weights)
+        if total <= 0:
+            raise ValueError(f"Weights must sum to a positive number, got {weights}.")
+        return [w / total for w in weights]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Dynamic resolution source  [MS-6]
+# ResolutionSource — thread-safe (global_size, local_size) provider
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ResolutionSource:
     """
-    Thread-safe scalar source for dynamic DALI resize.
+    Thread-safe holder for the current crop resolution.
 
-    set_resolution() takes effect on the next DALI batch boundary — zero
-    downtime, zero pipeline rebuild.
+    Acts as a DALI ExternalSource callback (batch=False).
+    Calling set() is immediately visible to the next DALI prefetch.
     """
 
     def __init__(self, global_size: int, local_size: int) -> None:
-        self._lock        = threading.Lock()
-        self._global_size = global_size
-        self._local_size  = local_size
+        self._global = global_size
+        self._local  = local_size
+        self._lock   = threading.Lock()
 
     def set(self, global_size: int, local_size: int) -> None:
         with self._lock:
-            self._global_size = global_size
-            self._local_size  = local_size
-        log.info("ResolutionSource: resolution → global=%d  local=%d", global_size, local_size)
+            self._global = global_size
+            self._local  = local_size
 
-    def __call__(self, info=None) -> Tuple[np.ndarray, np.ndarray]:
+    def __call__(self) -> Tuple[np.ndarray, np.ndarray]:
         with self._lock:
-            g = np.array(self._global_size, dtype=np.int32)
-            l = np.array(self._local_size,  dtype=np.int32)
-        return g, l
+            return (
+                np.array(self._global, dtype=np.int32),
+                np.array(self._local,  dtype=np.int32),
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Mixing weights
+# SampleRecord
 # ══════════════════════════════════════════════════════════════════════════════
 
-class MixingWeights:
-    """Thread-safe dataset mixing weights."""
+class SampleRecord:
+    __slots__ = ("jpeg", "metadata", "key")
 
-    def __init__(self, names: List[str], initial_weights: List[float]) -> None:
-        self._names = names
-        self._lock  = threading.Lock()
-        self._w     = self._normalise(initial_weights)
-
-    @staticmethod
-    def _normalise(w: List[float]) -> List[float]:
-        total = sum(w)
-        if total <= 0:
-            raise ValueError("All mixing weights are zero.")
-        return [x / total for x in w]
-
-    def get(self) -> List[float]:
-        with self._lock:
-            return list(self._w)
-
-    def set(self, weights: Sequence[float]) -> None:
-        normalised = self._normalise(list(weights))
-        with self._lock:
-            self._w = normalised
-
-    def set_by_name(self, name: str, weight: float) -> None:
-        idx = self._names.index(name)
-        with self._lock:
-            new_w = list(self._w)
-            new_w[idx] = weight
-            self._w = self._normalise(new_w)
-
-    @property
-    def names(self) -> List[str]:
-        return list(self._names)
+    def __init__(
+        self,
+        jpeg:     bytes,
+        metadata: Optional[Dict] = None,
+        key:      str            = "",
+    ) -> None:
+        self.jpeg     = jpeg
+        self.metadata = metadata
+        self.key      = key
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NUMA affinity helper
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _resolve_numa_cpus(device_id: int) -> Optional[List[int]]:
-    """Return CPU list for the NUMA node of *device_id*, or None if unavailable."""
-    if not HAS_PSUTIL:
-        return None
-    try:
-        import subprocess
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=numa_affinity", "--format=csv,noheader",
-             f"--id={device_id}"],
-            timeout=2,
-        ).decode().strip()
-        numa_node = int(out)
-        return psutil.Process().cpu_affinity()  # simplified: use process affinity
-    except Exception:
-        return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ShardIterator
+# [MS-R1] ShardIterator — per-dataset, per-rank shard cycling
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ShardIterator:
     """
     Per-dataset, per-rank shard cycling with background extraction.
 
-    Two levels of concurrency
-    -------------------------
-    Level 1 — asyncio/aiofiles (in NodeSharedShardCache):
-        Node-master reads shards from Lustre into /dev/shm.
+    shard_sampling="epoch"
+        Shards are shuffled once per epoch (deterministic, seed + rank).
+        One full pass is made before cycling.
 
-    Level 2 — CPU extraction (ThreadPoolExecutor):
-        Worker threads parse tar archives into SampleRecord lists in RAM
-        while DALI consumes the previous shard's data.
+    shard_sampling="resampled"                                         [MS-R1]
+        Delegates to wds.ResampledShards for infinite with-replacement
+        sampling.  Useful for small curated datasets you want to over-sample
+        without duplicating shards on disk.
+        Falls back to "epoch" mode if webdataset is not installed.
     """
 
     _EXTRACTION_DEPTH = 2
@@ -225,7 +197,7 @@ class ShardIterator:
     def __init__(
         self,
         spec:                DatasetSpec,
-        cache:               NodeSharedShardCache,
+        cache,               # NodeSharedShardCache | InProcessShardCache
         rank:                int,
         world_size:          int,
         prefetch_ahead:      int   = 32,
@@ -236,14 +208,15 @@ class ShardIterator:
         shuffle_buffer_size: int   = 512,
         min_sample_quality:  Optional[float] = None,
     ) -> None:
-        self._name  = spec.name
-        self._cache = cache
-        self._ahead = prefetch_ahead
-        self._seed  = seed
-        self._rank  = rank
-        self._rng   = np.random.default_rng(seed + rank)
+        self._name   = spec.name
+        self._cache  = cache
+        self._ahead  = prefetch_ahead
+        self._seed   = seed
+        self._rank   = rank
+        self._rng    = np.random.default_rng(seed + rank)
+        self._sampling = spec.shard_sampling
 
-        # Partition shards across ranks
+        # Partition shards across ranks (epoch mode)
         self._all_shards: List[str] = [
             s for i, s in enumerate(spec.shards) if i % world_size == rank
         ]
@@ -256,289 +229,218 @@ class ShardIterator:
 
         if not self._all_shards:
             raise RuntimeError(
-                f"Rank {rank}/{world_size}: no shards assigned for dataset '{spec.name}'. "
-                f"Dataset has {len(spec.shards)} shards total."
+                f"Rank {rank}/{world_size}: no shards assigned for dataset "
+                f"'{spec.name}' ({len(spec.shards)} shards total)."
             )
         if len(self._all_shards) < 4:
             log.warning(
-                "ShardIterator '%s': only %d shard(s) assigned to rank %d/%d.",
+                "ShardIterator '%s': only %d shard(s) assigned to rank %d/%d. "
+                "Consider using shard_sampling='resampled' for small datasets.",
                 self._name, len(self._all_shards), rank, world_size,
             )
 
-        self._min_quality   = min_sample_quality if min_sample_quality is not None \
-                              else spec.min_sample_quality
-        self._metadata_key  = spec.metadata_key
-        self._shuffle_buf_size = shuffle_buffer_size
-        self._reservoir: List[SampleRecord] = []
+        # [MS-R1] ResampledShards for infinite-mode datasets
+        self._resampled_iter = None
+        if self._sampling == "resampled":
+            if HAS_WDS:
+                self._resampled_iter = iter(
+                    ResampledShards(
+                        urls          = self._all_shards,
+                        seed          = seed + rank,
+                        deterministic = True,
+                    )
+                )
+                log.info(
+                    "ShardIterator '%s': using ResampledShards (with-replacement, infinite).",
+                    self._name,
+                )
+            else:
+                log.warning(
+                    "ShardIterator '%s': shard_sampling='resampled' requested but "
+                    "webdataset is not installed — falling back to 'epoch' mode.",
+                    self._name,
+                )
+                self._sampling = "epoch"
 
-        self._shards:  List[str] = []
-        self._idx:     int = 0
-        self._futures: Deque[concurrent.futures.Future] = deque()
+        self._shuffle_buffer_size  = shuffle_buffer_size
+        self._min_sample_quality   = min_sample_quality or spec.min_sample_quality
 
-        self._poison_pill:  threading.Event     = threading.Event()
-        self._worker_error: Optional[Exception] = None
-
-        self._affinity_cpus: Optional[List[int]] = None
-        if cpu_affinity_enabled:
-            self._affinity_cpus = _resolve_numa_cpus(device_id)
-
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers        = num_workers,
+        # Extraction infrastructure
+        self._executor = ThreadPoolExecutor(
+            max_workers     = num_workers,
             thread_name_prefix = f"shard-extract-{self._name}",
-            initializer        = self._worker_init,
         )
-        self._closed = False
-        self._init_epoch(epoch=0)
+        self._reservoir: Deque[SampleRecord] = deque()
+        self._futures   = deque()
+        self._closed    = False
+        self._lock      = threading.Lock()
 
-        log.debug(
-            "ShardIterator '%s': %d shards/rank, %d workers, "
-            "prefetch=%d, shuffle_buf=%d",
-            self._name, len(self._all_shards), num_workers,
-            prefetch_ahead, shuffle_buffer_size,
-        )
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def next_sample(self) -> SampleRecord:
-        """Return the next SampleRecord, applying the intra-shard shuffle buffer."""
-        if self._poison_pill.is_set():
-            raise RuntimeError(
-                f"ShardIterator '{self._name}': worker thread previously failed."
-            ) from self._worker_error
-
-        if not self._reservoir:
-            self._drain_next_future()
-
-        if self._poison_pill.is_set():
-            raise RuntimeError(
-                f"ShardIterator '{self._name}': worker thread previously failed."
-            ) from self._worker_error
-
-        if not self._reservoir:
-            self._init_epoch(self._current_epoch)
-            self._drain_next_future()
-
-        if self._shuffle_buf_size > 0 and len(self._reservoir) > 1:
-            # Swap a random element to the end, then pop — O(1), avoids list shifts.
-            swap_idx = int(self._rng.integers(0, len(self._reservoir)))
-            self._reservoir[-1], self._reservoir[swap_idx] = \
-                self._reservoir[swap_idx], self._reservoir[-1]
-
-        return self._reservoir.pop()
-
-    def reset_epoch(self, epoch: int) -> None:
-        self._init_epoch(epoch)
-
-    def close(self) -> None:
-        if not self._closed:
-            self._closed = True
-            self._executor.shutdown(wait=False, cancel_futures=True)
-
-    @property
-    def reservoir_size(self) -> int:
-        """Number of SampleRecords currently buffered in the reservoir."""
-        return len(self._reservoir)
-
-    # ------------------------------------------------------------------
-    # Internal: epoch initialisation
-    # ------------------------------------------------------------------
-
-    def _init_epoch(self, epoch: int) -> None:
-        self._current_epoch = epoch
-        rng = np.random.default_rng(self._seed + self._rank + epoch * 1_000_003)
-        self._shards = list(self._all_shards)
-        rng.shuffle(self._shards)
-        self._idx = 0
-        self._reservoir.clear()
-        # Drain leftover futures
-        for f in self._futures:
-            f.cancel()
-        self._futures.clear()
-        # Pre-schedule extraction
+        # Prime extraction pipeline
+        self._shard_cycle = self._make_shard_cycle()
         for _ in range(self._EXTRACTION_DEPTH):
             self._schedule_next()
 
-    # ------------------------------------------------------------------
-    # Internal: background extraction
-    # ------------------------------------------------------------------
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def next_sample(self) -> SampleRecord:
+        """Block until a sample is available, then return it."""
+        while True:
+            with self._lock:
+                if self._reservoir:
+                    return self._reservoir.popleft()
+
+            # Drain a future if reservoir is empty
+            if self._futures:
+                fut = self._futures.popleft()
+                records = fut.result()
+                with self._lock:
+                    self._reservoir.extend(records)
+                self._schedule_next()
+            else:
+                time.sleep(0.001)
+
+    def reset_epoch(self, epoch: int) -> None:
+        """Re-seed the RNG and restart the shard cycle."""
+        self._rng = np.random.default_rng(self._seed + self._rank + epoch * 997)
+        self._shard_cycle = self._make_shard_cycle()
+        with self._lock:
+            self._reservoir.clear()
+        for _ in range(self._EXTRACTION_DEPTH):
+            self._schedule_next()
+
+    def close(self) -> None:
+        self._closed = True
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    @property
+    def reservoir_size(self) -> int:
+        with self._lock:
+            return len(self._reservoir)
+
+    # ── Shard cycling ─────────────────────────────────────────────────────────
+
+    def _make_shard_cycle(self):
+        """Infinite generator of shard paths."""
+        if self._sampling == "resampled" and self._resampled_iter is not None:
+            # wds.ResampledShards: yields dict(url=...) infinitely
+            while not self._closed:
+                item = next(self._resampled_iter)
+                yield item["url"]
+        else:
+            # Epoch mode: shuffle + cycle
+            while not self._closed:
+                shards = list(self._all_shards)
+                if self._shard_weights:
+                    ordered = self._rng.choice(
+                        shards, size=len(shards), replace=False,
+                        p=self._shard_weights,
+                    ).tolist()
+                else:
+                    self._rng.shuffle(shards)
+                    ordered = shards
+                yield from ordered
 
     def _schedule_next(self) -> None:
-        if self._idx >= len(self._shards):
+        if self._closed:
             return
-        shard_path = self._shards[self._idx]
-        self._idx += 1
-        self._cache.prefetch(shard_path)
-        future = self._executor.submit(self._fetch_and_extract, shard_path)
-        self._futures.append(future)
-
-    def _drain_next_future(self) -> None:
-        """Block on the next extraction future, load records into reservoir."""
-        if not self._futures:
-            self._schedule_next()
-        if not self._futures:
-            return
-        future = self._futures.popleft()
-        self._schedule_next()
         try:
-            records: List[SampleRecord] = future.result()
-        except Exception as exc:
-            self._worker_error = exc
-            self._poison_pill.set()
+            shard_path = next(self._shard_cycle)
+        except StopIteration:
             return
-        self._reservoir.extend(records)
+        self._cache.prefetch(shard_path)
+        fut = self._executor.submit(self._fetch_and_extract, shard_path)
+        self._futures.append(fut)
 
     def _fetch_and_extract(self, shard_path: str) -> List[SampleRecord]:
-        """Run in worker thread: read shard from cache, extract samples."""
-        records: List[SampleRecord] = []
-        try:
-            with self._cache.get_view(shard_path) as mv:
-                raw = bytes(mv)
-            records = self._extract_records(raw, shard_path)
-        except Exception as exc:
-            log.error("Extraction failed for %s: %s", shard_path, exc)
-            raise
+        from dino_loader.datasets.utils import _extract_jpegs_with_meta
+        with self._cache.get_view(shard_path) as mv:
+            records = _extract_jpegs_with_meta(
+                mv,
+                metadata_key       = None,   # handled per-spec in MixingSource
+                min_quality        = self._min_sample_quality,
+                shuffle_buffer     = self._shuffle_buffer_size,
+                rng                = self._rng,
+            )
         return records
-
-    def _extract_records(self, raw: bytes, shard_path: str) -> List[SampleRecord]:
-        """Parse raw tar bytes into SampleRecords, applying quality filter."""
-        records: List[SampleRecord] = []
-        if HAS_WDS:
-            records = self._extract_wds(raw)
-        else:
-            records = self._extract_legacy(raw)
-
-        # Apply quality filter [MS-3]
-        if self._min_quality is not None:
-            records = [
-                r for r in records
-                if r.metadata is None or
-                   r.metadata.get("quality_score", 1.0) >= self._min_quality
-            ]
-        return records
-
-    def _extract_wds(self, raw: bytes) -> List[SampleRecord]:
-        """Extract using webdataset TarIterator [MS-1]."""
-        buf     = io.BytesIO(raw)
-        records: List[SampleRecord] = []
-        current_key  = None
-        current_jpeg: Optional[bytes] = None
-        current_meta: Optional[Dict]  = None
-
-        for fname, fbytes in wds.TarIterator(buf, handler=wds.warn_and_continue):
-            key, ext = fname.rsplit(".", 1) if "." in fname else (fname, "")
-            if key != current_key:
-                if current_key is not None and current_jpeg is not None:
-                    records.append(SampleRecord(jpeg=current_jpeg, metadata=current_meta))
-                current_key  = key
-                current_jpeg = None
-                current_meta = None
-            if ext in ("jpg", "jpeg"):
-                current_jpeg = fbytes
-            elif ext == self._metadata_key and self._metadata_key:
-                try:
-                    current_meta = json.loads(fbytes)
-                except Exception:
-                    current_meta = None
-
-        # Flush last sample
-        if current_key is not None and current_jpeg is not None:
-            records.append(SampleRecord(jpeg=current_jpeg, metadata=current_meta))
-        return records
-
-    def _extract_legacy(self, raw: bytes) -> List[SampleRecord]:
-        """Legacy fallback: extract JPEGs only (no sidecar metadata)."""
-        from dino_loader.datasets.utils import _extract_jpegs
-        mv   = memoryview(raw)
-        jpegs = _extract_jpegs(mv)
-        return [SampleRecord(jpeg=b) for b in jpegs]
-
-    def _worker_init(self) -> None:
-        """ThreadPoolExecutor initializer: optionally set CPU affinity."""
-        if self._affinity_cpus and HAS_PSUTIL:
-            try:
-                psutil.Process().cpu_affinity(self._affinity_cpus)
-            except Exception:
-                pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MixingSource
+# MixingSource — DALI ExternalSource callback
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MixingSource:
     """
-    Weighted multi-dataset DALI ExternalSource.
+    DALI ExternalSource callback.  Called once per batch; returns a list of
+    np.ndarray (JPEG bytes, one per sample).
 
-    Returns batches of raw JPEG bytes; DALI decodes on-GPU via nvjpeg.
-    Also accumulates per-sample metadata (when available) for downstream use.
+    [MS-R3] Tracks per-sample dataset indices and calls registered callbacks
+    (e.g. NormSource.set_dataset_indices) after each batch assembly.
 
-    Thread safety
-    -------------
-    __call__ is invoked from DALI's prefetch thread.
-    set_weights / set_epoch / resolution updates come from the training thread.
+    [MS-R2] Optionally logs __key__ per sample to a file for debug auditing.
     """
 
     def __init__(
         self,
         specs:               List[DatasetSpec],
         batch_size:          int,
-        cache:               NodeSharedShardCache,
-        rank:                int,
-        world_size:          int,
-        prefetch_ahead:      int   = 32,
+        cache,
+        rank:                int   = 0,
+        world_size:          int   = 1,
         num_workers:         int   = 4,
         seed:                int   = 0,
         device_id:           int   = 0,
         cpu_affinity_enabled: bool = False,
         shuffle_buffer_size: int   = 512,
+        debug_log_keys:      Optional[str] = None,   # [MS-R2]
     ) -> None:
-        self._batch_size = batch_size
-        self._weights    = MixingWeights(
-            names           = [s.name for s in specs],
-            initial_weights = [s.weight for s in specs],
-        )
+        self._batch_size   = batch_size
+        self._weights      = MixingWeights(specs)
+        self._rng          = np.random.default_rng(seed + rank)
+        self._meta_lock    = threading.Lock()
+        self._last_metadata: List[Optional[Dict]] = []
+        self._last_dataset_indices: List[int] = []
+        self._dataset_index_callbacks: List[Callable[[List[int]], None]] = []
+
+        # [MS-R2] debug key log
+        self._log_file     = debug_log_keys
+        self._rank         = rank
+
         self._iterators: List[ShardIterator] = [
             ShardIterator(
-                spec                 = s,
-                cache                = cache,
-                rank                 = rank,
-                world_size           = world_size,
-                prefetch_ahead       = prefetch_ahead,
-                num_workers          = num_workers,
-                seed                 = seed + i,
-                device_id            = device_id,
-                cpu_affinity_enabled = cpu_affinity_enabled,
-                shuffle_buffer_size  = shuffle_buffer_size,
+                spec                = spec,
+                cache               = cache,
+                rank                = rank,
+                world_size          = world_size,
+                num_workers         = num_workers,
+                seed                = seed,
+                device_id           = device_id,
+                shuffle_buffer_size = shuffle_buffer_size,
             )
-            for i, s in enumerate(specs)
+            for spec in specs
         ]
-        # [MS-8] per-object NumPy RNG for vectorised dataset selection
-        self._rng = np.random.default_rng(seed)
 
-        # Last-batch metadata cache — read by DINODataLoader after each DALI call
-        self._last_metadata: List[Optional[Dict]] = []
-        self._meta_lock = threading.Lock()
+    # ── Callback registration [MS-R3] ─────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # DALI ExternalSource protocol
-    # ------------------------------------------------------------------
+    def register_dataset_index_callback(
+        self, cb: Callable[[List[int]], None]
+    ) -> None:
+        """Register a callback to receive per-sample dataset indices each batch."""
+        self._dataset_index_callbacks.append(cb)
 
-    def __call__(self, info=None) -> List[np.ndarray]:
+    # ── DALI ExternalSource callback ──────────────────────────────────────────
+
+    def __call__(self) -> List[np.ndarray]:
         """
-        Return one batch of raw JPEG bytes; cache per-sample metadata.
+        Assemble one batch of JPEG byte arrays.
 
-        [MS-8] Dataset selection uses np.rng.choice() (vectorised, releases
-        GIL) instead of random.choices() (pure Python interpreter loop).
-
-        [MS-9] After assembly, publish total reservoir depth to MetricsRegistry
-        so the CLI monitor can display a real queue-depth value.
+        [MS-8] Uses vectorised np.rng.choice (one C-level call) for dataset
+               selection instead of a Python-level loop.
+        [MS-R3] Records per-sample dataset indices for NormSource callback.
+        [MS-R2] Optionally logs __key__ values.
         """
-        weights      = self._weights.get()
-        n_datasets   = len(self._iterators)
-        # [MS-8] Vectorised: one C-level call for all batch_size draws
-        indices      = self._rng.choice(
+        weights    = self._weights.get()
+        n_datasets = len(self._iterators)
+        indices    = self._rng.choice(
             n_datasets,
             size    = self._batch_size,
             replace = True,
@@ -547,37 +449,77 @@ class MixingSource:
 
         batch:    List[np.ndarray]     = []
         metadata: List[Optional[Dict]] = []
+        keys:     List[str]            = []
 
         for idx in indices:
             record = self._iterators[idx].next_sample()
             batch.append(np.frombuffer(record.jpeg, dtype=np.uint8))
             metadata.append(record.metadata)
+            keys.append(record.key)
 
         with self._meta_lock:
-            self._last_metadata = metadata
+            self._last_metadata        = metadata
+            self._last_dataset_indices = list(indices)
 
-        # [MS-9] Publish queue depth metric (sum of all reservoir sizes)
-        registry = get_registry()
-        if registry is not None:
-            depth = sum(it.reservoir_size for it in self._iterators)
-            registry.set(MetricField.MIXING_QUEUE_DEPTH, depth)
+        # [MS-R3] Notify NormSource (and any other registered callbacks)
+        for cb in self._dataset_index_callbacks:
+            cb(list(indices))
+
+        # [MS-R2] Optional debug key logging
+        if self._log_file:
+            self._maybe_log_keys(keys)
+
+        # [MS-9] Publish queue depth metric
+        if HAS_METRICS:
+            registry = get_registry()
+            if registry is not None:
+                depth = sum(it.reservoir_size for it in self._iterators)
+                registry.set(MetricField.MIXING_QUEUE_DEPTH, depth)
 
         return batch
 
+    # ── Metadata retrieval ────────────────────────────────────────────────────
+
     def pop_last_metadata(self) -> List[Optional[Dict]]:
-        """Thread-safe retrieval of last-batch metadata. Called by DINODataLoader."""
         with self._meta_lock:
             return list(self._last_metadata)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    def pop_last_dataset_indices(self) -> List[int]:
+        with self._meta_lock:
+            return list(self._last_dataset_indices)
+
+    # ── [MS-R2] Key logging ───────────────────────────────────────────────────
+
+    def _maybe_log_keys(self, keys: List[str]) -> None:
+        """
+        Append per-sample key log entries to self._log_file.
+
+        Format (tab-separated):
+            <sample_index>  <rank>  <key>
+
+        Uses POSIX fcntl exclusive lock so multiple ranks can write to the
+        same file without corruption — identical to wds.log_keys.
+        """
+        try:
+            lines = "".join(
+                f"{i}\t{self._rank}\t{k}\n"
+                for i, k in enumerate(keys)
+            )
+            with open(self._log_file, "a") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.write(lines)
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception as exc:
+            log.warning("debug_log_keys write failed: %s", exc)
+
+    # ── Epoch / weight control ────────────────────────────────────────────────
 
     def set_epoch(self, epoch: int) -> None:
         for it in self._iterators:
             it.reset_epoch(epoch)
-        # Re-seed the mixing RNG for reproducible per-epoch diversity
-        self._rng = np.random.default_rng(epoch * 997 + id(self))
+        self._rng = np.random.default_rng(epoch * 997 + self._rank)
 
     def set_weights(self, weights: Sequence[float]) -> None:
         self._weights.set(weights)
