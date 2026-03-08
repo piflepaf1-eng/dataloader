@@ -1,47 +1,48 @@
 """
-dino_loader.tools.shard_writer
-==============================
+dino_loader.datasets.shard_writer
+==================================
 CLI and Python API for creating WebDataset shards conforming to dino_loader
-conventions (directory layout, .idx sidecar, naming, catalogue registration).
+conventions (directory layout, ``.idx`` sidecar, naming, catalogue
+registration).
 
-Why this module
----------------
-webdataset's ShardWriter is excellent but generic.  Every team reimplements
-the same boilerplate:
-  - directory layout matching Dataset.to_spec() discovery
-  - .idx sidecar generation (byte offsets for random access)
-  - post-shard callback to register shards in the dataset catalogue
-  - progress reporting
+Why this module lives in ``datasets/``
+--------------------------------------
+``ShardWriter`` is an integral part of the dataset pipeline: it understands
+the ``<conf>/<modality>/<name>/outputs/<strategy>/<split>/`` directory
+convention, generates the ``.idx`` sidecar required by
+:func:`~dino_loader.datasets.utils.validate_webdataset_shard`, and acts as
+the write-path counterpart to :meth:`~dino_loader.datasets.dataset.Dataset.to_spec`.
 
-This module wraps wds.ShardWriter with those conventions so creating a new
-dataset is one command instead of a custom script.
+It has no dependency on the loader, DALI, or CUDA — making it safe to import
+in data-engineering pipelines that run without GPU.
+
 
 Python API
 ----------
 ::
 
-    from dino_loader.tools.shard_writer import ShardWriter
+    from dino_loader.datasets.shard_writer import ShardWriter
 
     with ShardWriter(
-        output_dir   = "/lustre/datasets/public/rgb/my_dataset/train",
+        output_dir        = "/lustre/datasets/public/rgb/my_dataset/outputs/default/train",
         samples_per_shard = 10_000,
-        max_shard_bytes   = 3 * 1024**3,  # 3 GB
+        max_shard_bytes   = 3 * 1024**3,   # 3 GB
     ) as writer:
-        for image_path, caption in my_dataset:
+        for image_path, caption in my_raw_dataset:
             writer.write({
                 "__key__": image_path.stem,
                 "jpg":     image_path.read_bytes(),
-                "json":    json.dumps({"caption": caption, "quality_score": 0.8}),
+                "json":    json.dumps({"caption": caption, "quality_score": 0.82}),
             })
-    # → shard-000000.tar, shard-000000.idx, shard-000001.tar, ...
+    # → shard-000000.tar, shard-000000.idx, shard-000001.tar, …
 
 CLI
 ---
 ::
 
-    python -m dino_loader.tools.shard_writer \\
+    python -m dino_loader.datasets.shard_writer \\
         --input  /data/raw/images \\
-        --output /lustre/datasets/public/rgb/my_dataset/train \\
+        --output /lustre/datasets/public/rgb/my_dataset/outputs/default/train \\
         --samples-per-shard 10000 \\
         --pattern "shard-{:06d}.tar" \\
         --workers 8
@@ -49,29 +50,26 @@ CLI
 Notes
 -----
 - Requires webdataset: ``pip install webdataset``
-- .idx files use little-endian int64 byte offsets (8 bytes per sample).
-  These are compatible with wids and dino_loader's validate_webdataset_shard.
-- The ``post`` callback (called after each shard is finalised) generates the
-  .idx file and optionally logs the shard path for catalogue ingestion.
-- Lustre striping: if the output directory is on Lustre, the writer sets
-  ``lfs setstripe -c 4`` on the directory for optimal write throughput.
-  Requires the ``lfs`` CLI to be in PATH; silently skipped otherwise.
+- ``.idx`` files use little-endian int64 byte offsets (8 bytes per sample).
+  Compatible with wids and
+  :func:`~dino_loader.datasets.utils.validate_webdataset_shard`.
+- Lustre striping: if the output directory is on Lustre, the writer attempts
+  ``lfs setstripe -c 4`` for optimal write throughput.  Silently skipped if
+  ``lfs`` is not in PATH.
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import logging
-import os
 import struct
 import subprocess
 import sys
 import tarfile
 import time
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Optional
 
 log = logging.getLogger(__name__)
 
@@ -81,27 +79,22 @@ try:
 except ImportError:
     HAS_WDS = False
 
-try:
-    from PIL import Image
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-# .idx generation helpers
+# .idx generation
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _generate_idx(tar_path: Path) -> Path:
+def generate_idx(tar_path: Path) -> Path:
     """
-    Generate a .idx sidecar for *tar_path*.
+    Generate a ``.idx`` sidecar for *tar_path*.
 
-    The .idx format is a flat sequence of little-endian int64 values:
+    The ``.idx`` format is a flat sequence of little-endian ``int64`` values:
     one byte offset per sample (pointing to the first file of each sample
     group within the tar archive).  This matches the format expected by
-    dino_loader's validate_webdataset_shard and wids.
+    :func:`~dino_loader.datasets.utils.validate_webdataset_shard` and
+    ``wids``.
 
-    Returns the path to the written .idx file.
+    Returns the path to the written ``.idx`` file.
     """
     idx_path = tar_path.with_suffix(".idx")
     offsets: List[int] = []
@@ -109,7 +102,6 @@ def _generate_idx(tar_path: Path) -> Path:
     with tarfile.open(tar_path, "r|") as tf:
         prev_key: Optional[str] = None
         for member in tf:
-            # Each sample group is identified by its stem (base without ext)
             stem = member.name.rsplit(".", 1)[0] if "." in member.name else member.name
             if stem != prev_key:
                 offsets.append(member.offset)
@@ -121,12 +113,19 @@ def _generate_idx(tar_path: Path) -> Path:
     return idx_path
 
 
+# ── Private alias kept for internal callers ───────────────────────────────────
+_generate_idx = generate_idx
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Lustre striping
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _try_set_lustre_striping(directory: Path, stripe_count: int = 4) -> None:
-    """Set Lustre stripe count on *directory* for write throughput.  No-op if lfs absent."""
+    """Set Lustre stripe count on *directory* for write throughput.
+
+    No-op if ``lfs`` is not in PATH or the directory is not on Lustre.
+    """
     try:
         subprocess.run(
             ["lfs", "setstripe", "-c", str(stripe_count), str(directory)],
@@ -136,11 +135,11 @@ def _try_set_lustre_striping(directory: Path, stripe_count: int = 4) -> None:
         )
         log.info("Lustre striping set to %d on %s", stripe_count, directory)
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        pass  # Not on Lustre or lfs not available — silently skip
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ShardWriter — dino_loader-aware wrapper around wds.ShardWriter
+# ShardWriter
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ShardWriter:
@@ -151,25 +150,29 @@ class ShardWriter:
     ----------
     output_dir
         Target directory.  Created if it does not exist.
-        For Dataset.to_spec() auto-discovery, structure as:
-        ``$ROOT/<conf>/<modality>/<name>/outputs/<strategy>/<split>/``
+        For :meth:`~dino_loader.datasets.dataset.Dataset.to_spec`
+        auto-discovery, structure as::
+
+            $ROOT/<conf>/<modality>/<name>/outputs/<strategy>/<split>/
+
     samples_per_shard
         Maximum number of samples per shard (default: 10 000).
     max_shard_bytes
-        Maximum shard size in bytes (default: 3 GB).  whichever limit is hit
+        Maximum shard size in bytes (default: 3 GB).  Whichever limit is hit
         first triggers a new shard.
     pattern
-        Shard filename pattern with one format placeholder (default:
-        ``"shard-{:06d}.tar"``).
+        Shard filename pattern with one ``{:06d}`` placeholder
+        (default: ``"shard-{:06d}.tar"``).
     generate_idx
-        Generate .idx sidecar files after each shard (default: True).
+        Generate ``.idx`` sidecar files after each shard (default: ``True``).
     post
-        Optional callable called after each shard is written, in addition
-        to .idx generation.  Receives the shard path as a string.
+        Optional callable invoked after each shard is written (in addition
+        to ``.idx`` generation).  Receives the shard path as a ``str``.
     lustre_stripe_count
-        If > 0, attempt to set Lustre stripe count on output_dir.
+        If > 0, attempt to set Lustre stripe count on *output_dir*.
+        Default: 4.  Set to 0 to disable.
     verbose
-        Print progress to stderr (default: True).
+        Print progress to stderr (default: ``True``).
     """
 
     def __init__(
@@ -185,11 +188,11 @@ class ShardWriter:
     ) -> None:
         if not HAS_WDS:
             raise ImportError(
-                "dino_loader.tools.shard_writer requires webdataset. "
+                "dino_loader.datasets.shard_writer requires webdataset. "
                 "Install with: pip install webdataset"
             )
 
-        self._output_dir = Path(output_dir)
+        self._output_dir  = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._pattern     = pattern
         self._gen_idx     = generate_idx
@@ -200,7 +203,7 @@ class ShardWriter:
         if lustre_stripe_count > 0:
             _try_set_lustre_striping(self._output_dir, lustre_stripe_count)
 
-        # Build the full file pattern string expected by wds.ShardWriter
+        # wds.ShardWriter uses %-style formatting internally
         full_pattern = str(self._output_dir / pattern.replace("{:06d}", "%06d"))
 
         self._writer = wds.ShardWriter(
@@ -208,7 +211,7 @@ class ShardWriter:
             maxcount = samples_per_shard,
             maxsize  = max_shard_bytes,
             post     = self._on_shard_complete,
-            verbose  = 0,  # we handle our own progress
+            verbose  = 0,   # we handle progress ourselves
         )
 
         self._total_samples = 0
@@ -229,14 +232,16 @@ class ShardWriter:
         Write one sample dict.
 
         The dict must contain:
-        - ``"__key__"``  : unique string identifier (no spaces or slashes)
-        - At least one extension key (e.g. ``"jpg"``, ``"json"``, ``"txt"``)
 
-        Values must be ``bytes``.  Strings are auto-encoded as UTF-8.
+        ``"__key__"``
+            Unique string identifier (no spaces or slashes).
+        At least one extension key
+            e.g. ``"jpg"``, ``"json"``, ``"txt"``.
+
+        Values must be ``bytes``.  ``str`` values are auto-encoded as UTF-8.
         """
         if "__key__" not in sample:
             raise ValueError("Sample must contain '__key__'.")
-        # Encode string values
         encoded = {
             k: v.encode("utf-8") if isinstance(v, str) else v
             for k, v in sample.items()
@@ -244,7 +249,7 @@ class ShardWriter:
         self._writer.write(encoded)
         self._total_samples += 1
 
-        if self._verbose and self._total_samples % 1000 == 0:
+        if self._verbose and self._total_samples % 1_000 == 0:
             elapsed = time.monotonic() - self._t0
             rate    = self._total_samples / max(elapsed, 1e-6)
             print(
@@ -256,7 +261,7 @@ class ShardWriter:
             )
 
     def close(self) -> None:
-        """Finalise the last shard and flush."""
+        """Finalise the last shard and flush all pending writes."""
         self._writer.close()
         if self._verbose:
             elapsed = time.monotonic() - self._t0
@@ -269,7 +274,7 @@ class ShardWriter:
 
     @property
     def shard_paths(self) -> List[Path]:
-        """Paths of all completed shards."""
+        """Paths of all completed shards (in write order)."""
         return list(self._shard_paths)
 
     # ── Internal ──────────────────────────────────────────────────────────────
@@ -291,12 +296,12 @@ class ShardWriter:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CLI — python -m dino_loader.tools.shard_writer
+# CLI — python -m dino_loader.datasets.shard_writer
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog        = "python -m dino_loader.tools.shard_writer",
+        prog        = "python -m dino_loader.datasets.shard_writer",
         description = (
             "Convert a directory of images (+ optional JSON metadata) "
             "into WebDataset shards for use with dino_loader."
@@ -361,10 +366,9 @@ def _iter_samples(
     for img_path in sorted(input_dir.rglob(f"*.{ext}")):
         key = img_path.stem.replace("/", "_").replace(" ", "_")
 
-        # Load image bytes
         img_bytes = img_path.read_bytes()
 
-        # Build metadata: prefer a sidecar <stem>.json
+        # Prefer a sidecar <stem>.json when present
         meta_path = img_path.with_suffix(".json")
         if meta_path.exists():
             meta = json.loads(meta_path.read_text())
@@ -389,18 +393,18 @@ def main(argv: Optional[List[str]] = None) -> None:
         parser.error(f"--input is not a directory: {input_dir}")
 
     with ShardWriter(
-        output_dir        = args.output,
-        samples_per_shard = args.samples_per_shard,
-        max_shard_bytes   = args.max_shard_gb * 1024**3,
-        pattern           = args.pattern,
-        generate_idx      = not args.no_idx,
+        output_dir          = args.output,
+        samples_per_shard   = args.samples_per_shard,
+        max_shard_bytes     = args.max_shard_gb * 1024**3,
+        pattern             = args.pattern,
+        generate_idx        = not args.no_idx,
         lustre_stripe_count = args.lustre_stripe,
-        verbose           = not args.quiet,
+        verbose             = not args.quiet,
     ) as writer:
         for sample in _iter_samples(input_dir, args.ext, args.quality_score):
             writer.write(sample)
 
-    print(f"Shard paths:", file=sys.stderr)
+    print("Shard paths:", file=sys.stderr)
     for p in writer.shard_paths:
         print(f"  {p}", file=sys.stderr)
 

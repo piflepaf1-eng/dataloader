@@ -40,10 +40,10 @@ Key design decisions
 Discovery metadata
 ------------------
 :meth:`Dataset.to_spec` performs a **single** filesystem pass and populates
-:attr:`~dino_loader.config.DatasetSpec.confidentialities`,
-:attr:`~dino_loader.config.DatasetSpec.modalities`,
-:attr:`~dino_loader.config.DatasetSpec.splits`, and
-:attr:`~dino_loader.config.DatasetSpec.strategies` on the returned spec.
+:attr:`~dino_loader.datasets.spec.DatasetSpec.confidentialities`,
+:attr:`~dino_loader.datasets.spec.DatasetSpec.modalities`,
+:attr:`~dino_loader.datasets.spec.DatasetSpec.splits`, and
+:attr:`~dino_loader.datasets.spec.DatasetSpec.strategies` on the returned spec.
 The stub generator reads these fields to emit ``Literal``-typed
 ``TypedDatasetSpec`` subclasses in ``hub/`` for IDE autocomplete.
 
@@ -68,7 +68,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-from dino_loader.config import DatasetSpec
+# [REFACTOR] DatasetSpec now lives here in the datasets sub-package.
+# No upward dependency on dino_loader.config.
+from dino_loader.datasets.spec import DatasetSpec  # noqa: F401
 from dino_loader.datasets.settings import (
     ConfidentialityMount,
     get_confidentiality_mounts,
@@ -369,59 +371,65 @@ class Dataset:
         # The caller's filter wins per field, allowing further restriction.
         effective_filter = _merge_filters(self._default_filter, global_filter)
 
+        allowed_confs  = self._effective_set(effective_filter, config, "allowed_confidentialities")
+        allowed_mods   = self._effective_set(effective_filter, config, "allowed_modalities")
+        allowed_splits = self._effective_set(effective_filter, config, "allowed_splits")
+        strategy       = self._effective_strategy(effective_filter, config)
+
         shards: List[str] = []
         meta: Dict[str, Set[str]] = {
             "confidentialities": set(),
-            "modalities": set(),
-            "splits": set(),
-            "strategies": set(),
+            "modalities":        set(),
+            "splits":            set(),
+            "strategies":        set(),
         }
 
-        allowed_confs = self._effective_set(effective_filter, config, "allowed_confidentialities")
-        allowed_mods  = self._effective_set(effective_filter, config, "allowed_modalities")
-        allowed_splits = self._effective_set(effective_filter, config, "allowed_splits")
-        strategy = self._effective_strategy(effective_filter, config)
-
         for mount in get_confidentiality_mounts():
-            if allowed_confs is not None and mount.name not in allowed_confs:
+            if allowed_confs and mount.name not in allowed_confs:
                 continue
-            conf_root = str(mount.path)
-            if not os.path.isdir(conf_root):
+            if not mount.path.is_dir():
                 continue
 
-            for mod in _listdirs(conf_root):
-                if allowed_mods is not None and mod not in allowed_mods:
+            for mod in _listdirs(str(mount.path)):
+                if mod in DATASET_RESERVED_DIRS:
+                    continue
+                if allowed_mods and mod not in allowed_mods:
                     continue
 
-                dataset_path = os.path.join(conf_root, mod, self.name)
-                outputs_path = os.path.join(dataset_path, "outputs", strategy)
+                dataset_path  = mount.path / mod / self.name
+                outputs_path  = dataset_path / "outputs" / strategy
 
-                if not os.path.isdir(outputs_path):
+                if not outputs_path.is_dir():
                     continue
 
-                for split in _listdirs(outputs_path):
-                    if allowed_splits is not None and split not in allowed_splits:
+                contributed = False
+                for split in _listdirs(str(outputs_path)):
+                    if allowed_splits and split not in allowed_splits:
                         continue
 
-                    split_path = os.path.join(outputs_path, split)
-                    contributed = False
+                    split_path = str(outputs_path / split)
+                    try:
+                        entries = os.listdir(split_path)
+                    except OSError:
+                        continue
 
-                    for fname in sorted(os.listdir(split_path)):
+                    for fname in sorted(entries):
                         if not fname.endswith(".tar"):
                             continue
                         tar_path = os.path.join(split_path, fname)
-                        idx_path = os.path.join(split_path, fname[:-4] + ".idx")
-                        if not os.path.isfile(idx_path):
-                            log.debug("Missing .idx for %s — skipping.", tar_path)
+                        if not validate_webdataset_shard(tar_path):
+                            log.debug("Skipping invalid shard: %s", tar_path)
                             continue
                         shards.append(tar_path)
                         contributed = True
 
                     if contributed:
-                        meta["confidentialities"].add(mount.name)
-                        meta["modalities"].add(mod)
                         meta["splits"].add(split)
-                        meta["strategies"].add(strategy)
+
+                if contributed:
+                    meta["confidentialities"].add(mount.name)
+                    meta["modalities"].add(mod)
+                    meta["strategies"].add(strategy)
 
         return sorted(shards), meta
 
@@ -483,7 +491,7 @@ class Dataset:
         config: Optional[DatasetConfig] = None,
     ) -> Optional[DatasetSpec]:
         """
-        Build a :class:`~dino_loader.config.DatasetSpec` from resolved shards.
+        Build a :class:`~dino_loader.datasets.spec.DatasetSpec` from resolved shards.
 
         Unlike a raw :meth:`resolve` call, this method populates the four
         *discovery metadata* fields on the returned spec:

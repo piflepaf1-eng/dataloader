@@ -1,7 +1,7 @@
 """
 dino_loader.config
 ==================
-All configuration lives here.  No logic — pure dataclasses.
+All loader-level configuration lives here.  No logic — pure dataclasses.
 Serialised to / from JSON for checkpointing (no pickle fragility).
 
 Changes in this version
@@ -42,100 +42,26 @@ Changes in this version
           Previously hardcoded as _STALL_TIMEOUT_S = 120.0 in loader.py.
           Raised default to 600s (10 min) to survive Lustre MDS thundering-herd
           at job start on large clusters.  Set to 0 to disable the watchdog.
+
+[CFG-REFACTOR]  DatasetSpec moved to dino_loader.datasets.spec.
+          DatasetSpec is now the canonical property of the ``datasets`` sub-system
+          (it is produced by Dataset.to_spec() and has no dependency on loader
+          internals).  It is re-exported here for full backward compatibility —
+          all existing imports from ``dino_loader.config`` continue to work.
 """
 
 from __future__ import annotations
 
 import json
-import warnings
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
-
-# ── Dataset ───────────────────────────────────────────────────────────────────
-
-@dataclass
-class DatasetSpec:
-    """
-    One WebDataset source with mixing weight, optional quality metadata,
-    and discovery metadata populated by :meth:`Dataset.to_spec`.
-
-    Parameters
-    ----------
-    name
-        Human-readable identifier, used in logs and checkpoint state.
-    shards
-        List of absolute shard paths (.tar files on Lustre).
-    weight
-        Initial mixing weight (re-normalised automatically; need not sum to 1).
-    prob
-        Alias for weight= to align with the wds.RandomMix API.  If both are
-        provided, weight= takes precedence and a DeprecationWarning is emitted.
-    shard_sampling
-        How shards are sampled within this dataset:
-        - ``"epoch"``     : one full, deterministic-shuffled pass per epoch.
-        - ``"resampled"`` : infinite with-replacement sampling via
-          wds.ResampledShards — use for small curated sets you want to
-          over-sample, or for streaming datasets without epoch boundaries.
-    shard_quality_scores
-        Optional per-shard quality score in [0, 1].  When provided,
-        ShardIterator samples shards proportionally to these scores rather
-        than uniformly.  Scores are re-normalised internally.
-        Length must match ``len(shards)`` if provided.
-    min_sample_quality
-        Hard filter: samples whose .json sidecar ``quality_score`` field is
-        below this threshold are discarded before entering the DALI pipeline.
-        Set to None to disable (default, no filtering).
-    metadata_key
-        WebDataset sidecar extension to extract alongside .jpg files.
-        Set to None to skip sidecar extraction (legacy behaviour, faster).
-    mean
-        Per-channel normalisation mean for this dataset.  When None, the
-        global DINOAugConfig.mean is used (ImageNet stats).
-    std
-        Per-channel normalisation std for this dataset.  When None, the
-        global DINOAugConfig.std is used (ImageNet stats).
-    confidentialities / modalities / splits / strategies
-        Discovery metadata populated by Dataset.to_spec().  Informational only.
-    """
-
-    name:   str
-    shards: List[str]
-    weight: float = 1.0
-    prob:   Optional[float] = None   # [CFG-S2] alias
-
-    shard_sampling:       Literal["epoch", "resampled"] = "epoch"
-    shard_quality_scores: Optional[List[float]]         = None
-    min_sample_quality:   Optional[float]               = None
-    metadata_key:         Optional[str]                 = "json"
-    mean:                 Optional[Tuple[float, float, float]] = None
-    std:                  Optional[Tuple[float, float, float]] = None
-
-    # Discovery metadata (populated by Dataset.to_spec)
-    confidentialities: List[str] = field(default_factory=list)
-    modalities:        List[str] = field(default_factory=list)
-    splits:            List[str] = field(default_factory=list)
-    strategies:        List[str] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        # [CFG-S2] prob= alias handling
-        if self.prob is not None and self.weight == 1.0:
-            self.weight = self.prob
-        elif self.prob is not None:
-            warnings.warn(
-                "DatasetSpec: both 'weight' and 'prob' provided; "
-                "'weight' takes precedence.  'prob' is deprecated.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        if self.shard_quality_scores is not None:
-            if len(self.shard_quality_scores) != len(self.shards):
-                raise ValueError(
-                    f"DatasetSpec '{self.name}': shard_quality_scores length "
-                    f"({len(self.shard_quality_scores)}) must match shards "
-                    f"length ({len(self.shards)})."
-                )
+# ── [CFG-REFACTOR] DatasetSpec re-exported for backward compatibility ─────────
+# Canonical location: dino_loader.datasets.spec
+# All existing code using ``from dino_loader.config import DatasetSpec``
+# continues to work without any modification.
+from dino_loader.datasets.spec import DatasetSpec  # noqa: F401
 
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
@@ -209,6 +135,17 @@ class DINOAugConfig:
             self.max_global_crop_size = self.global_crop_size
         if self.max_local_crop_size is None:
             self.max_local_crop_size = self.local_crop_size
+        if self.resolution_schedule:
+            for epoch, size in self.resolution_schedule:
+                if epoch < 0:
+                    raise ValueError(
+                        f"DINOAugConfig: resolution_schedule epoch must be ≥ 0, "
+                        f"got {epoch}."
+                    )
+            # Ensure schedule is sorted by epoch for crop_size_at_epoch()
+            self.resolution_schedule = sorted(
+                self.resolution_schedule, key=lambda t: t[0]
+            )
 
     @property
     def n_views(self) -> int:
@@ -281,6 +218,8 @@ class LoaderConfig:
         at job start with thousands of concurrent nodes).
         Default: 600.0 (10 minutes).  Set to 0 to disable the watchdog
         entirely (equivalent to the legacy DINO_DISABLE_EMPTY_CHECK=1).
+    shm_warn_threshold
+        Fraction of node_shm_gb at which a utilisation warning is logged.
     """
 
     # I/O
@@ -319,6 +258,9 @@ class LoaderConfig:
     # Watchdog                                                    [CFG-S6]
     stall_timeout_s:          float = 600.0
 
+    # SHM monitoring
+    shm_warn_threshold:       float = 0.90
+
     def __post_init__(self) -> None:
         if self.dali_fp8_output and not self.use_fp8_output:
             raise ValueError(
@@ -338,6 +280,11 @@ class LoaderConfig:
             raise ValueError(
                 f"LoaderConfig: stall_timeout_s must be ≥ 0 "
                 f"(0 = disabled), got {self.stall_timeout_s}."
+            )
+        if not (0.0 <= self.shm_warn_threshold <= 1.0):
+            raise ValueError(
+                f"LoaderConfig: shm_warn_threshold must be in [0.0, 1.0], "
+                f"got {self.shm_warn_threshold}."
             )
 
     def to_dict(self) -> Dict:
@@ -367,6 +314,14 @@ class CheckpointState:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(asdict(self), indent=2))
         tmp.rename(path)
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "CheckpointState":
+        known = {f.name for f in cls.__dataclass_fields__.values()}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
     @classmethod
     def load(cls, path: Path) -> "CheckpointState":

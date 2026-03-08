@@ -42,6 +42,13 @@ Changes in this version
         When LoaderConfig.fuse_normalization=True (default), a NormSource
         instance is built from (aug_cfg, specs) and passed to build_pipeline.
 
+        [REFACTOR] NormSource construction is now fully encapsulated in
+        DALIBackend.build_pipeline().  loader.py no longer imports from
+        dino_loader.pipeline and has no knowledge of NormSource.
+        The loader passes ``specs``, ``fuse_normalization``, and
+        ``dali_fp8_output`` as plain config values — the backend decides what
+        to do with them.  CPUBackend silently ignores all three.
+
 [LD-10] empty_check watchdog → now [LD-STALL] configurable stall timeout.
         Previously hardcoded as _STALL_TIMEOUT_S = 120.0.
         Now reads from LoaderConfig.stall_timeout_s (default 600s).
@@ -65,29 +72,24 @@ from __future__ import annotations
 import fcntl
 import logging
 import os
-import threading
 import time
-from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Sequence
+from typing import Any, Callable, Iterator, List, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 
-from dino_loader.backends          import get_backend, BackendName
+from dino_loader.backends          import get_backend
 from dino_loader.backends.protocol import BackendProtocol
 from dino_loader.checkpoint        import DataLoaderCheckpointer
 from dino_loader.config            import CheckpointState, DatasetSpec, DINOAugConfig, LoaderConfig
-from dino_loader.distributed       import ClusterTopology, detect_topology
 from dino_loader.memory            import Batch
 from dino_loader.mixing_source     import MixingSource, ResolutionSource
 from dino_loader.monitor.metrics   import get_registry, init_registry
-from dino_loader.pipeline          import NormSource
 
 log = logging.getLogger(__name__)
 
 # [LD-STALL] Module-level constant removed.
 # Timeout is now read from LoaderConfig.stall_timeout_s at runtime.
-# This eliminates the footgun of changing the constant in one place while
-# the config default silently remains at its old value.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -130,7 +132,7 @@ class PostProcessPipeline:
     def __init__(
         self,
         source:     Iterator[Batch],
-        transforms: List[Callable[[Batch], Optional[Batch]]],
+        transforms: List[Callable],
         loader:     "DINODataLoader",
         max_steps:  Optional[int] = None,
     ) -> None:
@@ -139,63 +141,38 @@ class PostProcessPipeline:
         self._loader     = loader
         self._max_steps  = max_steps
 
-    # ── Fluid API ─────────────────────────────────────────────────────────────
+    # ── Fluent chaining ───────────────────────────────────────────────────────
 
     def map(self, fn: Callable[[Batch], Batch]) -> "PostProcessPipeline":
-        """Apply *fn* to every Batch.  fn must return a Batch."""
         return PostProcessPipeline(
-            self._source,
-            self._transforms + [fn],
-            self._loader,
-            self._max_steps,
+            source     = self._source,
+            transforms = self._transforms + [fn],
+            loader     = self._loader,
+            max_steps  = self._max_steps,
         )
 
     def select(self, predicate: Callable[[Batch], bool]) -> "PostProcessPipeline":
-        """Skip batches for which *predicate* returns False."""
-        def _filter(batch: Batch) -> Optional[Batch]:
-            return batch if predicate(batch) else None
+        def _filter(b: Batch) -> Optional[Batch]:
+            return b if predicate(b) else None
         return PostProcessPipeline(
-            self._source,
-            self._transforms + [_filter],
-            self._loader,
-            self._max_steps,
+            source     = self._source,
+            transforms = self._transforms + [_filter],
+            loader     = self._loader,
+            max_steps  = self._max_steps,
         )
 
     def with_epoch(self, n_steps: int) -> "PostProcessPipeline":
-        """Limit iteration to *n_steps* batches per epoch."""
         return PostProcessPipeline(
-            self._source,
-            self._transforms,
-            self._loader,
-            n_steps,
+            source     = self._source,
+            transforms = self._transforms,
+            loader     = self._loader,
+            max_steps  = n_steps,
         )
-
-    # ── Iteration ─────────────────────────────────────────────────────────────
-
-    def __iter__(self) -> Iterator[Batch]:
-        step = 0
-        for batch in self._source:
-            if self._max_steps is not None and step >= self._max_steps:
-                break
-            result: Optional[Batch] = batch
-            for t in self._transforms:
-                if result is None:
-                    break
-                result = t(result)
-            if result is not None:
-                step += 1
-                yield result
-
-    def __len__(self) -> int:
-        if self._max_steps is not None:
-            return self._max_steps
-        return len(self._loader)
 
     # ── Delegation to underlying DINODataLoader ───────────────────────────────
 
     def set_epoch(self, epoch: int) -> None:
         self._loader.set_epoch(epoch)
-        self._source = iter(self._loader._raw_iter())
 
     def checkpoint(self, step: int) -> None:
         self._loader.checkpoint(step)
@@ -209,17 +186,32 @@ class PostProcessPipeline:
     def set_resolution(self, global_size: int, local_size: int) -> None:
         self._loader.set_resolution(global_size, local_size)
 
-    @property
-    def current_weights(self) -> List[float]:
-        return self._loader.current_weights
-
-    # ── StatefulDataLoader interface ──────────────────────────────────────────
-
-    def state_dict(self) -> Dict:
+    def state_dict(self) -> dict:
         return self._loader.state_dict()
 
-    def load_state_dict(self, sd: Dict) -> None:
+    def load_state_dict(self, sd: dict) -> None:
         self._loader.load_state_dict(sd)
+
+    # ── Iteration ─────────────────────────────────────────────────────────────
+
+    def __iter__(self) -> Iterator[Batch]:
+        step = 0
+        for batch in self._source:
+            if self._max_steps is not None and step >= self._max_steps:
+                break
+            result = batch
+            for fn in self._transforms:
+                if result is None:
+                    break
+                result = fn(result)
+            if result is not None:
+                yield result
+                step += 1
+
+    def __len__(self) -> int:
+        if self._max_steps is not None:
+            return self._max_steps
+        return len(self._loader)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -228,10 +220,10 @@ class PostProcessPipeline:
 
 class DINODataLoader:
     """
-    HPC-grade DINOv3 data loader for B200 / GB200 NVL72 clusters.
+    HPC-grade DINOv3 data loader.
 
-    Returns a PostProcessPipeline from __iter__ — use the fluid API to add
-    post-DALI transforms without modifying this class.
+    Returns a :class:`PostProcessPipeline` from ``__iter__`` — use the fluid
+    API to add post-DALI transforms without modifying this class.
 
     Parameters
     ----------
@@ -254,6 +246,13 @@ class DINODataLoader:
     pixels, so it cannot be fused into the DALI augmentation graph (which
     only processes pixel-level image tensors).  The CPU overhead is negligible
     (~0.3 ms for a 37×37 grid) compared to a DALI batch decode (~40 ms).
+
+    Note on backend symmetry
+    ------------------------
+    loader.py is fully backend-agnostic.  All DALI-specific logic
+    (NormSource construction, FP8 in-graph casting) is encapsulated in
+    DALIBackend.build_pipeline().  CPUBackend silently ignores the
+    ``specs``, ``fuse_normalization``, and ``dali_fp8_output`` kwargs.
     """
 
     def __init__(
@@ -319,11 +318,12 @@ class DINODataLoader:
         job_id      = os.environ.get("SLURM_JOB_ID", "dino_local")
 
         shard_cache = self._backend.build_shard_cache(
-            node_master     = node_master,
             job_id          = job_id,
-            max_shm_gb      = self._cfg.node_shm_gb,
+            node_master     = node_master,
+            max_gb          = self._cfg.node_shm_gb,
             prefetch_window = self._cfg.shard_prefetch_window,
             timeout_s       = self._cfg.shard_timeout_s,
+            warn_threshold  = self._cfg.shm_warn_threshold,
         )
 
         self._source = MixingSource(
@@ -339,16 +339,12 @@ class DINODataLoader:
             debug_log_keys      = self._cfg.debug_log_keys,
         )
 
-        # ── [LD-9] NormSource for fused per-dataset normalisation ─────────────
-        self._norm_source: Optional[NormSource] = None
-        if self._cfg.fuse_normalization and self._backend.supports_gpu:
-            self._norm_source = NormSource(aug_cfg=self._aug_cfg, specs=specs)
-            self._source.register_dataset_index_callback(
-                self._norm_source.set_dataset_indices
-            )
-
-        # ── Stage 3: DALI pipeline ────────────────────────────────────────────
-        # [LD-12] Skip FP8Formatter construction when DALI handles FP8 in-graph
+        # ── Stage 3: augmentation pipeline ───────────────────────────────────
+        # [LD-9 / REFACTOR] NormSource is now constructed inside
+        # DALIBackend.build_pipeline() — loader.py has no knowledge of it.
+        # CPUBackend silently ignores specs, fuse_normalization, dali_fp8_output.
+        #
+        # [LD-12] dali_fp8 controls whether FP8Formatter is built post-DALI.
         dali_fp8 = self._cfg.use_fp8_output and self._cfg.dali_fp8_output
 
         pipeline = self._backend.build_pipeline(
@@ -362,12 +358,13 @@ class DINODataLoader:
             cpu_queue          = self._cfg.dali_cpu_queue,
             gpu_queue          = self._cfg.dali_gpu_queue,
             seed               = self._cfg.seed + self._rank,
-            norm_source        = self._norm_source,
+            # Backend-specific kwargs — ignored by CPUBackend:
+            specs              = specs,
             fuse_normalization = self._cfg.fuse_normalization and self._backend.supports_gpu,
             dali_fp8_output    = dali_fp8,
         )
 
-        output_map  = [f"view_{i}" for i in range(self._aug_cfg.n_views)]
+        output_map      = [f"view_{i}" for i in range(self._aug_cfg.n_views)]
         self._dali_iter = self._backend.build_pipeline_iterator(
             pipeline   = pipeline,
             output_map = output_map,
@@ -381,7 +378,7 @@ class DINODataLoader:
             else torch.device("cpu")
         )
         self._h2d = self._backend.build_h2d_stream(device=device, topo=self._topo)
-        # [LD-12] Only build FP8Formatter when DALI is NOT handling FP8
+        # [LD-12] FP8Formatter only when DALI is NOT handling FP8 in-graph
         self._fp8 = (
             self._backend.build_fp8_formatter()
             if self._cfg.use_fp8_output and not dali_fp8
@@ -465,12 +462,10 @@ class DINODataLoader:
         metrics         = get_registry()
         stall_timeout   = self._cfg.stall_timeout_s
         watchdog_active = stall_timeout > 0   # stall_timeout_s=0 → disabled
-        deadline        = time.monotonic() + stall_timeout
         got_first       = False
 
         for dali_out in self._dali_iter:
             got_first = True
-            deadline  = time.monotonic() + stall_timeout   # reset on each batch
             t0        = time.perf_counter()
 
             views        = [dali_out[0][f"view_{i}"] for i in range(self._aug_cfg.n_views)]
@@ -514,9 +509,8 @@ class DINODataLoader:
             yield batch
 
         # [LD-STALL] Stall watchdog — fires only if zero batches were produced.
-        # The watchdog is intentionally checked *after* the loop so that a
-        # clean empty-dataset condition produces a clear RuntimeError rather
-        # than silently returning.
+        # Checked *after* the loop so that a clean empty-dataset condition
+        # produces a clear RuntimeError rather than silently returning.
         if not got_first and watchdog_active:
             if os.environ.get("DINO_DISABLE_EMPTY_CHECK"):
                 log.warning(
@@ -609,7 +603,7 @@ class DINODataLoader:
         )
         self._ckpt.maybe_save(step, state)
 
-    def state_dict(self) -> Dict:
+    def state_dict(self) -> dict:
         if not self._cfg.stateful_dataloader:
             raise RuntimeError(
                 "state_dict() requires LoaderConfig.stateful_dataloader=True."
@@ -624,7 +618,7 @@ class DINODataLoader:
         )
         return state.to_dict()
 
-    def load_state_dict(self, sd: Dict) -> None:
+    def load_state_dict(self, sd: dict) -> None:
         if not self._cfg.stateful_dataloader:
             raise RuntimeError(
                 "load_state_dict() requires LoaderConfig.stateful_dataloader=True."

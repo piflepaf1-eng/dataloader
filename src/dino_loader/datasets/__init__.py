@@ -3,6 +3,11 @@ dino_loader.datasets
 ====================
 Dataset discovery, hub and CLI for the dino_loader petascale dataloader.
 
+This sub-package is **self-contained** — it can be imported without any
+dependency on DALI, CUDA, or the loader itself.  It is safe to use in
+cataloguing tools, CI pipelines, and data-engineering scripts that have no
+interest in GPU training.
+
 Importing this package triggers two side-effects:
 
 1. **Registry bootstrap** — the global
@@ -24,12 +29,21 @@ Public re-exports
 ::
 
     from dino_loader.datasets import (
+        # Dataset spec — canonical location (was dino_loader.config)
+        DatasetSpec,
+
+        # Dataset discovery
         Dataset,
         GlobalDatasetFilter,
         DatasetConfig,
+
+        # Confidentiality registry
         register_confidentiality,
         get_confidentiality_mounts,
         resolve_path_for_confidentiality,
+
+        # Shard writing
+        ShardWriter,
     )
 """
 
@@ -49,7 +63,10 @@ from dino_loader.datasets.settings import (  # noqa: E402
     resolve_path_for_confidentiality,
 )
 
-# ── 2. Core dataset types ─────────────────────────────────────────────────────
+# ── 2. DatasetSpec — canonical home is here (re-exported by dino_loader.config)
+from dino_loader.datasets.spec import DatasetSpec  # noqa: F401
+
+# ── 3. Core dataset types ─────────────────────────────────────────────────────
 from dino_loader.datasets.dataset import (
     DatasetConfig,
     GlobalDatasetFilter,
@@ -58,8 +75,11 @@ from dino_loader.datasets.dataset import (
     DEFAULT_STRATEGY,
 )
 
+# ── 4. Shard writer — canonical home is here (shim in dino_loader.tools) ──────
+from dino_loader.datasets.shard_writer import ShardWriter  # noqa: F401
 
-# ── 3. Hub refresh ─────────────────────────────────────────────────────────────
+
+# ── 5. Hub refresh ─────────────────────────────────────────────────────────────
 
 def _hub_dir() -> str:
     """Canonical path to the hub/ package directory."""
@@ -128,6 +148,8 @@ _maybe_refresh_hub()
 
 # ── Public API surface ─────────────────────────────────────────────────────────
 __all__ = [
+    # Spec
+    "DatasetSpec",
     # Settings
     "ConfidentialityMount",
     "ConfidentialityRegistry",
@@ -141,4 +163,6 @@ __all__ = [
     "DEFAULT_STRATEGY",
     "GlobalDatasetFilter",
     "_merge_filters",
+    # Shard writing
+    "ShardWriter",
 ]
