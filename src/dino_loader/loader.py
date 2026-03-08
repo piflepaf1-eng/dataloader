@@ -22,48 +22,40 @@ Changes in this version
 
 [LD-7]  Backend abstraction (retained).
 
-[LD-8]  PostProcessPipeline — fluid interface for post-DALI transforms.     ← NEW
+[LD-8]  PostProcessPipeline — fluid interface for post-DALI transforms.
         DINODataLoader now returns a PostProcessPipeline that wraps the raw
         batch iterator and allows chaining of post-processing steps using a
         webdataset-inspired fluent API:
 
             loader = (
                 DINODataLoader(specs, batch_size=512, ...)
-                .map(my_mask_fn)          # custom transform on every Batch
-                .select(quality_filter)   # drop batches below a threshold
-                .with_epoch(steps)        # limit iteration to N steps
+                .map(my_mask_fn)
+                .select(quality_filter)
+                .with_epoch(steps)
             )
 
         Each chained method returns a new PostProcessPipeline so the
         original loader is not mutated (composable).  The pipeline is
         lazy — nothing runs until you iterate.
 
-        Rationale: post-DALI steps (iBOT masking, custom filterers, FP8 with
-        TE metadata) are naturally expressed as Python callables over Batch
-        objects.  Formalising this as a fluent API makes training scripts
-        readable for anyone familiar with webdataset, and makes each step
-        independently unit-testable.
-
-[LD-9]  NormSource wired into build_pipeline.                               ← NEW
+[LD-9]  NormSource wired into build_pipeline.
         When LoaderConfig.fuse_normalization=True (default), a NormSource
         instance is built from (aug_cfg, specs) and passed to build_pipeline.
-        MixingSource.pop_last_dataset_indices() is called after each batch to
-        feed the correct per-sample dataset index back to NormSource for the
-        next call.
 
-[LD-10] empty_check watchdog.                                               ← NEW
-        Inspired by wds.check_empty: if no batch is produced within
-        _STALL_TIMEOUT_S seconds, a RuntimeError is raised with a diagnostic
-        message instead of blocking the training loop indefinitely.  This
-        catches the silent failure mode where all shards are corrupted or
-        the shard count is too low for the number of workers.
+[LD-10] empty_check watchdog → now [LD-STALL] configurable stall timeout.
+        Previously hardcoded as _STALL_TIMEOUT_S = 120.0.
+        Now reads from LoaderConfig.stall_timeout_s (default 600s).
+        Rationale: on large Lustre namespaces, the first shard access during
+        a thundering-herd job start (thousands of concurrent nodes hitting the
+        MDS) can take 3–10 minutes.  120s crashes healthy jobs.
+        stall_timeout_s=0 disables the watchdog entirely.
 
-[LD-11] debug_log_keys support.                                             ← NEW
+[LD-11] debug_log_keys support.
         When LoaderConfig.debug_log_keys is set, every batch's __key__ list
         (from metadata) is appended to the log file using fcntl POSIX locking
         (same pattern as wds.log_keys).  Zero overhead when disabled.
 
-[LD-12] FP8 post-DALI disabled when dali_fp8_output=True.                  ← NEW
+[LD-12] FP8 post-DALI disabled when dali_fp8_output=True.
         FP8Formatter is not constructed when DALI handles the FP8 cast
         in-graph, avoiding a redundant quantisation pass.
 """
@@ -92,8 +84,10 @@ from dino_loader.pipeline          import NormSource
 
 log = logging.getLogger(__name__)
 
-# How long to wait for the first batch before raising an empty-dataset error.
-_STALL_TIMEOUT_S = 120.0
+# [LD-STALL] Module-level constant removed.
+# Timeout is now read from LoaderConfig.stall_timeout_s at runtime.
+# This eliminates the footgun of changing the constant in one place while
+# the config default silently remains at its old value.
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -183,7 +177,6 @@ class PostProcessPipeline:
         for batch in self._source:
             if self._max_steps is not None and step >= self._max_steps:
                 break
-            # Apply transform chain
             result: Optional[Batch] = batch
             for t in self._transforms:
                 if result is None:
@@ -202,7 +195,6 @@ class PostProcessPipeline:
 
     def set_epoch(self, epoch: int) -> None:
         self._loader.set_epoch(epoch)
-        # Re-wire source iterator for the new epoch
         self._source = iter(self._loader._raw_iter())
 
     def checkpoint(self, step: int) -> None:
@@ -255,17 +247,6 @@ class DINODataLoader:
     mask_generator   : Optional iBOT MaskingGenerator (CPU, post-DALI).
     backend          : "auto" | "dali" | "cpu" | BackendProtocol instance.
 
-    Fluid API
-    ---------
-    DINODataLoader itself implements .map() / .select() / .with_epoch() by
-    returning a PostProcessPipeline.  Example::
-
-        loader = (
-            DINODataLoader(specs, batch_size=512, aug_cfg=cfg)
-            .map(mask_fn)
-            .with_epoch(steps_per_epoch)
-        )
-
     Note on iBOT masking
     --------------------
     MaskingGenerator runs on CPU and produces a boolean tensor of shape
@@ -291,14 +272,15 @@ class DINODataLoader:
         mask_generator:   Optional[Any] = None,
         backend:          Optional[Any] = None,
     ) -> None:
-        self._aug_cfg    = aug_cfg or DINOAugConfig()
-        self._cfg        = config  or LoaderConfig()
-        self._specs      = specs
-        self._batch_size = batch_size
+        self._aug_cfg         = aug_cfg or DINOAugConfig()
+        self._cfg             = config  or LoaderConfig()
+        self._specs           = specs
+        self._batch_size      = batch_size
         self._steps_per_epoch = steps_per_epoch
         self._mask_generator  = mask_generator
         self._active_iter     = False
         self._epoch           = 0
+        self._step            = 0
 
         # ── Backend ───────────────────────────────────────────────────────────
         if backend is None:
@@ -354,14 +336,13 @@ class DINODataLoader:
             seed                = self._cfg.seed,
             device_id           = device_id,
             shuffle_buffer_size = self._cfg.shuffle_buffer_size,
-            debug_log_keys      = self._cfg.debug_log_keys,   # [LD-11]
+            debug_log_keys      = self._cfg.debug_log_keys,
         )
 
         # ── [LD-9] NormSource for fused per-dataset normalisation ─────────────
         self._norm_source: Optional[NormSource] = None
         if self._cfg.fuse_normalization and self._backend.supports_gpu:
             self._norm_source = NormSource(aug_cfg=self._aug_cfg, specs=specs)
-            # Wire MixingSource → NormSource index updates
             self._source.register_dataset_index_callback(
                 self._norm_source.set_dataset_indices
             )
@@ -371,19 +352,19 @@ class DINODataLoader:
         dali_fp8 = self._cfg.use_fp8_output and self._cfg.dali_fp8_output
 
         pipeline = self._backend.build_pipeline(
-            source          = self._source,
-            aug_cfg         = self._aug_cfg,
-            batch_size      = batch_size,
-            num_threads     = self._cfg.dali_num_threads,
-            device_id       = device_id,
-            resolution_src  = self._resolution_src,
-            hw_decoder_load = self._cfg.hw_decoder_load,
-            cpu_queue       = self._cfg.dali_cpu_queue,
-            gpu_queue       = self._cfg.dali_gpu_queue,
-            seed            = self._cfg.seed + self._rank,
-            norm_source     = self._norm_source,
+            source             = self._source,
+            aug_cfg            = self._aug_cfg,
+            batch_size         = batch_size,
+            num_threads        = self._cfg.dali_num_threads,
+            device_id          = device_id,
+            resolution_src     = self._resolution_src,
+            hw_decoder_load    = self._cfg.hw_decoder_load,
+            cpu_queue          = self._cfg.dali_cpu_queue,
+            gpu_queue          = self._cfg.dali_gpu_queue,
+            seed               = self._cfg.seed + self._rank,
+            norm_source        = self._norm_source,
             fuse_normalization = self._cfg.fuse_normalization and self._backend.supports_gpu,
-            dali_fp8_output = dali_fp8,
+            dali_fp8_output    = dali_fp8,
         )
 
         output_map  = [f"view_{i}" for i in range(self._aug_cfg.n_views)]
@@ -394,7 +375,11 @@ class DINODataLoader:
         )
 
         # ── Stage 4 & 5: H2D + FP8 ───────────────────────────────────────────
-        device    = torch.device(f"cuda:{device_id}") if self._backend.supports_gpu else torch.device("cpu")
+        device    = (
+            torch.device(f"cuda:{device_id}")
+            if self._backend.supports_gpu
+            else torch.device("cpu")
+        )
         self._h2d = self._backend.build_h2d_stream(device=device, topo=self._topo)
         # [LD-12] Only build FP8Formatter when DALI is NOT handling FP8
         self._fp8 = (
@@ -415,13 +400,15 @@ class DINODataLoader:
 
         log.info(
             "DINODataLoader ready: backend=%s rank=%d/%d, batch=%d, "
-            "resolution=%dx%d (max %dx%d), fused_norm=%s, dali_fp8=%s",
+            "resolution=%dx%d (max %dx%d), fused_norm=%s, dali_fp8=%s, "
+            "stall_timeout=%.0fs",
             self._backend.name,
             self._rank, self._world_size, batch_size,
             self._current_global_size, self._current_local_size,
             self._aug_cfg.max_global_crop_size, self._aug_cfg.max_local_crop_size,
             self._cfg.fuse_normalization,
             dali_fp8,
+            self._cfg.stall_timeout_s,
         )
 
     # ── Fluid API — returns PostProcessPipeline ───────────────────────────────
@@ -469,18 +456,25 @@ class DINODataLoader:
             self._active_iter = False
 
     def _raw_iter(self) -> Iterator[Batch]:
-        """Core iteration loop — yields Batch objects with [LD-10] watchdog."""
-        metrics   = get_registry()
-        deadline  = time.monotonic() + _STALL_TIMEOUT_S
-        got_first = False
+        """Core iteration loop with [LD-STALL] configurable stall watchdog.
+
+        The stall timeout is read from LoaderConfig.stall_timeout_s at
+        iteration start so that changes to the config after construction
+        are respected (e.g. in tests that override the value per-run).
+        """
+        metrics         = get_registry()
+        stall_timeout   = self._cfg.stall_timeout_s
+        watchdog_active = stall_timeout > 0   # stall_timeout_s=0 → disabled
+        deadline        = time.monotonic() + stall_timeout
+        got_first       = False
 
         for dali_out in self._dali_iter:
             got_first = True
-            deadline  = time.monotonic() + _STALL_TIMEOUT_S  # reset on each batch
-            t0 = time.perf_counter()
+            deadline  = time.monotonic() + stall_timeout   # reset on each batch
+            t0        = time.perf_counter()
 
-            views    = [dali_out[0][f"view_{i}"] for i in range(self._aug_cfg.n_views)]
-            n_global = self._aug_cfg.n_global_crops
+            views        = [dali_out[0][f"view_{i}"] for i in range(self._aug_cfg.n_views)]
+            n_global     = self._aug_cfg.n_global_crops
             global_views = views[:n_global]
             local_views  = views[n_global:]
 
@@ -519,19 +513,29 @@ class DINODataLoader:
 
             yield batch
 
-        # [LD-10] Empty-dataset watchdog
-        if not got_first:
-            raise RuntimeError(
-                f"DINODataLoader (rank {self._rank}): no batch produced after "
-                f"{_STALL_TIMEOUT_S:.0f}s.  Possible causes:\n"
-                "  • Fewer shards than extraction workers — increase shard count\n"
-                "    or reduce shard_extraction_workers.\n"
-                "  • All shards are corrupted or unreachable.\n"
-                "  • /dev/shm is full — reduce node_shm_gb or free space.\n"
-                "Disable this check by setting DINO_DISABLE_EMPTY_CHECK=1."
-                if not os.environ.get("DINO_DISABLE_EMPTY_CHECK")
-                else ""
-            )
+        # [LD-STALL] Stall watchdog — fires only if zero batches were produced.
+        # The watchdog is intentionally checked *after* the loop so that a
+        # clean empty-dataset condition produces a clear RuntimeError rather
+        # than silently returning.
+        if not got_first and watchdog_active:
+            if os.environ.get("DINO_DISABLE_EMPTY_CHECK"):
+                log.warning(
+                    "DINODataLoader rank %d: no batch produced but "
+                    "DINO_DISABLE_EMPTY_CHECK is set — continuing silently.",
+                    self._rank,
+                )
+            else:
+                raise RuntimeError(
+                    f"DINODataLoader (rank {self._rank}): no batch produced after "
+                    f"{stall_timeout:.0f}s.  Possible causes:\n"
+                    "  • Fewer shards than extraction workers — increase shard count\n"
+                    "    or reduce shard_extraction_workers.\n"
+                    "  • All shards are corrupted or unreachable.\n"
+                    "  • /dev/shm is full — reduce node_shm_gb or free space.\n"
+                    "  • Lustre MDS slow start (thundering herd) — increase\n"
+                    f"    LoaderConfig.stall_timeout_s (current: {stall_timeout:.0f}s).\n"
+                    "  Disable: set DINO_DISABLE_EMPTY_CHECK=1 or stall_timeout_s=0."
+                )
 
     def __len__(self) -> int:
         if self._steps_per_epoch is None:
@@ -594,40 +598,54 @@ class DINODataLoader:
     def checkpoint(self, step: int) -> None:
         if self._rank != 0:
             return
+        self._step = step
         state = CheckpointState(
             step             = step,
             epoch            = self._epoch,
             global_crop_size = self._current_global_size,
             local_crop_size  = self._current_local_size,
-            dataset_weights  = list(self.current_weights),
+            dataset_names    = self._source.dataset_names,
+            mixing_weights   = list(self.current_weights),
         )
         self._ckpt.maybe_save(step, state)
 
     def state_dict(self) -> Dict:
         if not self._cfg.stateful_dataloader:
-            raise RuntimeError("state_dict() requires LoaderConfig.stateful_dataloader=True.")
+            raise RuntimeError(
+                "state_dict() requires LoaderConfig.stateful_dataloader=True."
+            )
         state = CheckpointState(
-            step             = getattr(self._ckpt, "_last_step", 0),
+            step             = self._step,
             epoch            = self._epoch,
             global_crop_size = self._current_global_size,
             local_crop_size  = self._current_local_size,
-            dataset_weights  = list(self.current_weights),
+            dataset_names    = self._source.dataset_names,
+            mixing_weights   = list(self.current_weights),
         )
         return state.to_dict()
 
     def load_state_dict(self, sd: Dict) -> None:
         if not self._cfg.stateful_dataloader:
-            raise RuntimeError("load_state_dict() requires LoaderConfig.stateful_dataloader=True.")
+            raise RuntimeError(
+                "load_state_dict() requires LoaderConfig.stateful_dataloader=True."
+            )
         state = CheckpointState.from_dict(sd)
+        self._step  = state.step
+        self._epoch = state.epoch
         self.set_resolution(state.global_crop_size, state.local_crop_size)
-        if state.dataset_weights:
-            self.set_weights(state.dataset_weights)
-        log.info("Resumed from state_dict: step=%d epoch=%d", state.step, state.epoch)
+        if state.mixing_weights:
+            self.set_weights(state.mixing_weights)
+        log.info(
+            "Resumed from state_dict: step=%d epoch=%d", state.step, state.epoch
+        )
 
     def _restore(self) -> None:
         latest = self._ckpt.latest()
         if latest is None:
-            log.info("No checkpoint found in %s — starting from scratch.", self._cfg.checkpoint_dir)
+            log.info(
+                "No checkpoint found in %s — starting from scratch.",
+                self._cfg.checkpoint_dir,
+            )
             return
         self.load_state_dict(latest.to_dict())
 

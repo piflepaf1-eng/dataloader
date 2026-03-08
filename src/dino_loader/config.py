@@ -37,6 +37,11 @@ Changes in this version
           one BF16 intermediate buffer per batch.
           Trade-off: loses Transformer Engine FP8TensorMeta (rolling amax window).
           Set to False (default) to retain TE metadata for use with te.fp8_autocast.
+
+[CFG-S6]  LoaderConfig.stall_timeout_s — configurable watchdog timeout.    [LD-STALL]
+          Previously hardcoded as _STALL_TIMEOUT_S = 120.0 in loader.py.
+          Raised default to 600s (10 min) to survive Lustre MDS thundering-herd
+          at job start on large clusters.  Set to 0 to disable the watchdog.
 """
 
 from __future__ import annotations
@@ -98,81 +103,39 @@ class DatasetSpec:
     name:   str
     shards: List[str]
     weight: float = 1.0
+    prob:   Optional[float] = None   # [CFG-S2] alias
 
-    # [CFG-S2] wds.RandomMix-compatible alias
-    prob:   Optional[float] = None
+    shard_sampling:       Literal["epoch", "resampled"] = "epoch"
+    shard_quality_scores: Optional[List[float]]         = None
+    min_sample_quality:   Optional[float]               = None
+    metadata_key:         Optional[str]                 = "json"
+    mean:                 Optional[Tuple[float, float, float]] = None
+    std:                  Optional[Tuple[float, float, float]] = None
 
-    # [CFG-S1] Shard sampling mode
-    shard_sampling: Literal["epoch", "resampled"] = "epoch"
-
-    # Quality gating
-    shard_quality_scores: Optional[List[float]] = None
-    min_sample_quality:   Optional[float]       = None
-    metadata_key:         Optional[str]         = "json"
-
-    # Per-dataset normalisation stats (override DINOAugConfig.mean/std)
-    mean: Optional[Tuple[float, float, float]] = None
-    std:  Optional[Tuple[float, float, float]] = None
-
-    # Discovery metadata (populated by Dataset.to_spec, ignored by dataloader)
+    # Discovery metadata (populated by Dataset.to_spec)
     confidentialities: List[str] = field(default_factory=list)
     modalities:        List[str] = field(default_factory=list)
     splits:            List[str] = field(default_factory=list)
     strategies:        List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        # [CFG-S2] Resolve weight / prob alias
-        if self.prob is not None:
-            if self.weight != 1.0:
-                warnings.warn(
-                    f"DatasetSpec '{self.name}': both weight= and prob= provided. "
-                    "weight= takes precedence.  prob= is deprecated; use weight= only.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            else:
-                self.weight = self.prob
-        self.prob = None  # normalise: always use weight internally
-
-        # Validate shard_sampling
-        if self.shard_sampling not in ("epoch", "resampled"):
-            raise ValueError(
-                f"DatasetSpec '{self.name}': shard_sampling must be 'epoch' or "
-                f"'resampled', got {self.shard_sampling!r}."
+        # [CFG-S2] prob= alias handling
+        if self.prob is not None and self.weight == 1.0:
+            self.weight = self.prob
+        elif self.prob is not None:
+            warnings.warn(
+                "DatasetSpec: both 'weight' and 'prob' provided; "
+                "'weight' takes precedence.  'prob' is deprecated.",
+                DeprecationWarning,
+                stacklevel=2,
             )
-
-        # Validate shard_quality_scores
         if self.shard_quality_scores is not None:
             if len(self.shard_quality_scores) != len(self.shards):
                 raise ValueError(
                     f"DatasetSpec '{self.name}': shard_quality_scores length "
                     f"({len(self.shard_quality_scores)}) must match shards "
-                    f"({len(self.shards)})."
+                    f"length ({len(self.shards)})."
                 )
-            if any(s < 0 for s in self.shard_quality_scores):
-                raise ValueError(
-                    f"DatasetSpec '{self.name}': shard_quality_scores must all be ≥ 0."
-                )
-
-        # Validate min_sample_quality
-        if self.min_sample_quality is not None and not (
-            0.0 <= self.min_sample_quality <= 1.0
-        ):
-            raise ValueError(
-                f"DatasetSpec '{self.name}': min_sample_quality must be in [0, 1], "
-                f"got {self.min_sample_quality}."
-            )
-
-    # ── Serialisation ─────────────────────────────────────────────────────────
-
-    def to_dict(self) -> Dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: Dict) -> "DatasetSpec":
-        # Strip unknown keys for forward-compat
-        known = {f.name for f in cls.__dataclass_fields__.values()}
-        return cls(**{k: v for k, v in d.items() if k in known})
 
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
@@ -180,33 +143,17 @@ class DatasetSpec:
 @dataclass
 class DINOAugConfig:
     """
-    Augmentation hyper-parameters for the DINOv3 multi-crop pipeline.
+    DINOv2/v3 multi-crop augmentation configuration.
 
     Parameters
     ----------
     global_crop_size / local_crop_size
-        Starting output resolution for global / local crops.
+        Initial crop resolutions in pixels.  Can be changed at runtime via
+        DINODataLoader.set_resolution() without rebuilding the DALI pipeline.
     n_global_crops / n_local_crops
-        Number of crops per image (DINOv2 paper: 2 global, 8 local).
+        Number of global (large) and local (small) crops per image.
     global_crops_scale / local_crops_scale
-        Area fraction ranges for random-resized crops.
-    flip_prob
-        Horizontal-flip probability.
-    color_jitter_prob
-        Probability of applying colour jitter.
-    brightness / contrast / saturation / hue
-        Colour jitter magnitudes (strength = 1.0 → DINOv2 paper defaults).
-    grayscale_prob
-        Probability of converting to grayscale.
-    blur_prob_global1 / blur_prob_global2 / blur_prob_local
-        Gaussian-blur probabilities per view type.
-    blur_sigma_min / blur_sigma_max
-        Sigma range for Gaussian blur.
-    solarize_prob
-        Solarisation probability (second global crop only in DINOv2).
-    mean / std
-        Global normalisation statistics (ImageNet defaults).
-        Per-dataset overrides live in DatasetSpec.mean / DatasetSpec.std.
+        RandomResizedCrop scale ranges for global/local views.
     preserve_aspect_ratio
         True → resize shorter side then centre-crop (avoids distortion).
         False → direct square resize (legacy, faster by one DALI op).
@@ -328,6 +275,12 @@ class LoaderConfig:
         When set to a file path, every sample's __key__, worker id, and rank
         are appended using POSIX fcntl locking (wds.log_keys pattern).
         Set to None (default) to disable — zero overhead in production.
+    stall_timeout_s                                              [CFG-S6]
+        Seconds to wait for the first batch before raising a stall error.
+        Increase on clusters with slow Lustre MDS warm-up ("thundering herd"
+        at job start with thousands of concurrent nodes).
+        Default: 600.0 (10 minutes).  Set to 0 to disable the watchdog
+        entirely (equivalent to the legacy DINO_DISABLE_EMPTY_CHECK=1).
     """
 
     # I/O
@@ -363,6 +316,9 @@ class LoaderConfig:
     # Debug                                                      [CFG-S3]
     debug_log_keys:           Optional[str] = None
 
+    # Watchdog                                                    [CFG-S6]
+    stall_timeout_s:          float = 600.0
+
     def __post_init__(self) -> None:
         if self.dali_fp8_output and not self.use_fp8_output:
             raise ValueError(
@@ -372,6 +328,16 @@ class LoaderConfig:
             raise ValueError(
                 f"LoaderConfig: output_dtype must be 'bf16' or 'fp32', "
                 f"got {self.output_dtype!r}."
+            )
+        if not (0.0 <= self.hw_decoder_load <= 1.0):
+            raise ValueError(
+                f"LoaderConfig: hw_decoder_load must be in [0.0, 1.0], "
+                f"got {self.hw_decoder_load}."
+            )
+        if self.stall_timeout_s < 0:
+            raise ValueError(
+                f"LoaderConfig: stall_timeout_s must be ≥ 0 "
+                f"(0 = disabled), got {self.stall_timeout_s}."
             )
 
     def to_dict(self) -> Dict:
@@ -389,27 +355,26 @@ class LoaderConfig:
 class CheckpointState:
     """Persisted dataloader state — JSON-serialisable."""
 
-    step:              int   = 0
-    epoch:             int   = 0
-    shard_cursors:     Dict  = field(default_factory=dict)
-    global_crop_size:  int   = 224
-    local_crop_size:   int   = 96
-    dataset_weights:   List[float] = field(default_factory=list)
-
-    def to_dict(self) -> Dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: Dict) -> "CheckpointState":
-        known = {f.name for f in cls.__dataclass_fields__.values()}
-        return cls(**{k: v for k, v in d.items() if k in known})
+    step:             int
+    epoch:            int
+    dataset_names:    List[str]
+    mixing_weights:   List[float]
+    global_crop_size: int = 224
+    local_crop_size:  int = 96
 
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        """Write atomically via a .tmp file."""
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.to_dict(), indent=2))
+        tmp.write_text(json.dumps(asdict(self), indent=2))
         tmp.rename(path)
 
     @classmethod
     def load(cls, path: Path) -> "CheckpointState":
-        return cls.from_dict(json.loads(path.read_text()))
+        data = json.loads(path.read_text())
+        # Backward compat: older checkpoints may lack crop size fields.
+        data.setdefault("global_crop_size", 224)
+        data.setdefault("local_crop_size",  96)
+        return cls(**{
+            k: v for k, v in data.items()
+            if k in cls.__dataclass_fields__
+        })

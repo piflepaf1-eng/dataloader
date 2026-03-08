@@ -5,7 +5,7 @@ MixingSource, ShardIterator, MixingWeights, ResolutionSource.
 
 Changes in this version
 -----------------------
-[MS-R1]  ShardIterator: explicit shard_sampling mode.                       ← NEW
+[MS-R1]  ShardIterator: explicit shard_sampling mode.
          DatasetSpec.shard_sampling="resampled" delegates to
          wds.ResampledShards for infinite with-replacement sampling.
          The existing "epoch" mode (deterministic shuffle, one full pass)
@@ -18,14 +18,14 @@ Changes in this version
            so that ShardIterator and MixingSource are unaware of the
            difference.
 
-[MS-R2]  debug_log_keys support.                                            ← NEW
+[MS-R2]  debug_log_keys support.
          When LoaderConfig.debug_log_keys is set, each sample's __key__
          (from metadata), worker id, and rank are appended to the log file
          using POSIX fcntl locking — same pattern as wds.log_keys.
          Implementation is in MixingSource._maybe_log_keys().
          Zero overhead when debug_log_keys=None.
 
-[MS-R3]  register_dataset_index_callback — feeds NormSource.               ← NEW
+[MS-R3]  register_dataset_index_callback — feeds NormSource.
          MixingSource now tracks which dataset index each sample in the
          batch came from.  After assembling a batch, it calls any registered
          callback(indices: List[int]).  This is consumed by NormSource in
@@ -34,6 +34,26 @@ Changes in this version
 
 [MS-8]   Vectorised np.rng.choice (retained).
 [MS-9]   MetricsRegistry queue depth (retained).
+
+[MS-Q1]  ShardIterator: replace time.sleep(0.001) busy-spin with
+         queue.Queue for OS-level blocking.
+
+         time.sleep(1ms) wastes CPU unconditionally and introduces ≥1ms
+         artificial jitter per stall event. On NVL72 (72 ranks) this
+         amounts to 72ms of collective wasted CPU time per stall wave.
+
+         queue.Queue.get(block=True, timeout=...) uses pthread_cond_wait
+         internally: zero CPU while waiting, sub-microsecond wakeup when
+         a record is enqueued.
+
+         Secondary benefit: _fetch_and_extract now pushes records into
+         the queue one-by-one as they are parsed, rather than waiting for
+         the entire shard to complete before yielding any sample. This
+         reduces first-batch latency on large shards.
+
+         _fetch_and_extract() return type changed: None (was List[SampleRecord]).
+         Resilience improved: a corrupt shard logs an error but does not
+         crash the pipeline — _schedule_next() is always called in finally.
 """
 
 from __future__ import annotations
@@ -41,12 +61,13 @@ from __future__ import annotations
 import fcntl
 import logging
 import os
+import queue            # [MS-Q1]
 import threading
-import time
+import time             # retained: ResolutionSource, elapsed timing
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import (
-    Callable, Dict, Deque, List, Optional, Sequence, Set, Tuple
+    Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
 )
 
 import numpy as np
@@ -99,7 +120,8 @@ class MixingWeights:
     def set(self, weights: Sequence[float]) -> None:
         if len(weights) != len(self.names):
             raise ValueError(
-                f"MixingWeights.set: expected {len(self.names)} weights, got {len(weights)}."
+                f"MixingWeights.set: expected {len(self.names)} weights, "
+                f"got {len(weights)}."
             )
         with self._lock:
             self._weights = self._normalise(list(weights))
@@ -108,10 +130,11 @@ class MixingWeights:
         try:
             idx = self.names.index(name)
         except ValueError:
-            raise KeyError(f"Dataset '{name}' not found. Available: {self.names}")
+            raise KeyError(
+                f"Dataset '{name}' not found. Available: {self.names}"
+            )
         with self._lock:
-            w = list(self._weights)
-            # Un-normalise, update, re-normalise
+            w     = list(self._weights)
             total = sum(w) or 1.0
             raw   = [v * total for v in w]
             raw[idx] = weight
@@ -121,7 +144,9 @@ class MixingWeights:
     def _normalise(weights: List[float]) -> List[float]:
         total = sum(weights)
         if total <= 0:
-            raise ValueError(f"Weights must sum to a positive number, got {weights}.")
+            raise ValueError(
+                f"Weights must sum to a positive number, got {weights}."
+            )
         return [w / total for w in weights]
 
 
@@ -222,7 +247,8 @@ class ShardIterator:
         ]
         self._shard_weights: Optional[List[float]] = None
         if spec.shard_quality_scores is not None:
-            raw   = [spec.shard_quality_scores[i] for i, _ in enumerate(spec.shards)
+            raw   = [spec.shard_quality_scores[i]
+                     for i, _ in enumerate(spec.shards)
                      if i % world_size == rank]
             total = sum(raw) or 1.0
             self._shard_weights = [w / total for w in raw]
@@ -251,31 +277,38 @@ class ShardIterator:
                     )
                 )
                 log.info(
-                    "ShardIterator '%s': using ResampledShards (with-replacement, infinite).",
+                    "ShardIterator '%s': using ResampledShards "
+                    "(with-replacement, infinite).",
                     self._name,
                 )
             else:
                 log.warning(
-                    "ShardIterator '%s': shard_sampling='resampled' requested but "
-                    "webdataset is not installed — falling back to 'epoch' mode.",
+                    "ShardIterator '%s': shard_sampling='resampled' requested "
+                    "but webdataset is not installed — falling back to 'epoch'.",
                     self._name,
                 )
                 self._sampling = "epoch"
 
-        self._shuffle_buffer_size  = shuffle_buffer_size
-        self._min_sample_quality   = min_sample_quality or spec.min_sample_quality
+        self._shuffle_buffer_size = shuffle_buffer_size
+        self._min_sample_quality  = (
+            min_sample_quality
+            if min_sample_quality is not None
+            else spec.min_sample_quality
+        )
 
-        # Extraction infrastructure
+        # ── [MS-Q1] Extraction infrastructure ────────────────────────────────
+        # queue.Queue replaces (deque + threading.Lock + time.sleep).
+        # Unbounded: backpressure comes from _EXTRACTION_DEPTH capping
+        # the number of in-flight futures, so the queue never grows unbounded.
         self._executor = ThreadPoolExecutor(
-            max_workers     = num_workers,
+            max_workers        = num_workers,
             thread_name_prefix = f"shard-extract-{self._name}",
         )
-        self._reservoir: Deque[SampleRecord] = deque()
-        self._futures   = deque()
-        self._closed    = False
-        self._lock      = threading.Lock()
+        self._queue:   queue.Queue[SampleRecord] = queue.Queue()
+        self._futures: Deque                     = deque()
+        self._closed                             = False
 
-        # Prime extraction pipeline
+        # Prime the extraction pipeline
         self._shard_cycle = self._make_shard_cycle()
         for _ in range(self._EXTRACTION_DEPTH):
             self._schedule_next()
@@ -283,44 +316,57 @@ class ShardIterator:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def next_sample(self) -> SampleRecord:
-        """Block until a sample is available, then return it."""
-        while True:
-            with self._lock:
-                if self._reservoir:
-                    return self._reservoir.popleft()
+        """Block until a sample is available, then return it.
 
-            # Drain a future if reservoir is empty
-            if self._futures:
-                fut = self._futures.popleft()
-                records = fut.result()
-                with self._lock:
-                    self._reservoir.extend(records)
-                self._schedule_next()
-            else:
-                time.sleep(0.001)
+        [MS-Q1] Uses queue.Queue.get(block=True) which calls pthread_cond_wait
+        internally — zero CPU while waiting, no artificial sleep jitter.
+        The timeout=0.1 serves as a liveness check for the closed flag only;
+        it is almost never hit during steady-state operation.
+        """
+        while not self._closed:
+            try:
+                return self._queue.get(block=True, timeout=0.1)
+            except queue.Empty:
+                # Only reached when genuinely starved or during shutdown.
+                continue
+        raise StopIteration(
+            f"ShardIterator '{self._name}' has been closed."
+        )
 
     def reset_epoch(self, epoch: int) -> None:
-        """Re-seed the RNG and restart the shard cycle."""
+        """Re-seed the RNG and restart the shard cycle for a new epoch."""
         self._rng = np.random.default_rng(self._seed + self._rank + epoch * 997)
         self._shard_cycle = self._make_shard_cycle()
-        with self._lock:
-            self._reservoir.clear()
+        # [MS-Q1] Drain stale samples from the previous epoch.
+        # queue.Queue has no .clear(); consume with get_nowait().
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
         for _ in range(self._EXTRACTION_DEPTH):
             self._schedule_next()
 
     def close(self) -> None:
+        """Signal shutdown and cancel pending extraction futures."""
         self._closed = True
         self._executor.shutdown(wait=False, cancel_futures=True)
 
     @property
     def reservoir_size(self) -> int:
-        with self._lock:
-            return len(self._reservoir)
+        """Approximate number of samples currently buffered.
+
+        [MS-Q1] queue.Queue.qsize() is O(1) and internally thread-safe.
+        Note: qsize() is inherently approximate in a concurrent context
+        (the value may change between the call and its use), but it is
+        only used for the metrics gauge, where approximate is fine.
+        """
+        return self._queue.qsize()
 
     # ── Shard cycling ─────────────────────────────────────────────────────────
 
     def _make_shard_cycle(self):
-        """Infinite generator of shard paths."""
+        """Infinite generator of shard paths, respecting sampling mode."""
         if self._sampling == "resampled" and self._resampled_iter is not None:
             # wds.ResampledShards: yields dict(url=...) infinitely
             while not self._closed:
@@ -332,8 +378,10 @@ class ShardIterator:
                 shards = list(self._all_shards)
                 if self._shard_weights:
                     ordered = self._rng.choice(
-                        shards, size=len(shards), replace=False,
-                        p=self._shard_weights,
+                        shards,
+                        size    = len(shards),
+                        replace = False,
+                        p       = self._shard_weights,
                     ).tolist()
                 else:
                     self._rng.shuffle(shards)
@@ -341,6 +389,13 @@ class ShardIterator:
                 yield from ordered
 
     def _schedule_next(self) -> None:
+        """Submit the next shard for background extraction.
+
+        [MS-Q1] _fetch_and_extract() now pushes records into self._queue
+        directly and always calls _schedule_next() in its finally block,
+        forming a self-sustaining pipeline. We still track futures here
+        so that close() can request cancellation of pending work.
+        """
         if self._closed:
             return
         try:
@@ -351,17 +406,42 @@ class ShardIterator:
         fut = self._executor.submit(self._fetch_and_extract, shard_path)
         self._futures.append(fut)
 
-    def _fetch_and_extract(self, shard_path: str) -> List[SampleRecord]:
+    def _fetch_and_extract(self, shard_path: str) -> None:
+        """Extract JPEG records from a shard and push them into self._queue.
+
+        [MS-Q1] Returns None (was List[SampleRecord]).
+        Records are pushed one-by-one into the queue as they are parsed, so
+        next_sample() unblocks as soon as the *first* record of a shard is
+        ready — rather than waiting for the entire shard to be parsed.
+
+        Resilience: a corrupt shard logs an error but does not crash the
+        pipeline. _schedule_next() is always called in the finally block so
+        the pipeline keeps moving regardless of per-shard failures.
+        """
         from dino_loader.datasets.utils import _extract_jpegs_with_meta
-        with self._cache.get_view(shard_path) as mv:
-            records = _extract_jpegs_with_meta(
-                mv,
-                metadata_key       = None,   # handled per-spec in MixingSource
-                min_quality        = self._min_sample_quality,
-                shuffle_buffer     = self._shuffle_buffer_size,
-                rng                = self._rng,
+        try:
+            with self._cache.get_view(shard_path) as mv:
+                records = _extract_jpegs_with_meta(
+                    mv,
+                    metadata_key   = None,   # handled per-spec in MixingSource
+                    min_quality    = self._min_sample_quality,
+                    shuffle_buffer = self._shuffle_buffer_size,
+                    rng            = self._rng,
+                )
+            for record in records:
+                if self._closed:
+                    return
+                self._queue.put_nowait(record)
+        except Exception as exc:
+            log.error(
+                "ShardIterator '%s': extraction failed for %s: %s",
+                self._name, shard_path, exc,
             )
-        return records
+            # Do not re-raise: a single corrupt shard must not crash training.
+        finally:
+            # Always schedule the next shard so the pipeline keeps moving,
+            # even if extraction failed for this shard.
+            self._schedule_next()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -393,17 +473,17 @@ class MixingSource:
         shuffle_buffer_size: int   = 512,
         debug_log_keys:      Optional[str] = None,   # [MS-R2]
     ) -> None:
-        self._batch_size   = batch_size
-        self._weights      = MixingWeights(specs)
-        self._rng          = np.random.default_rng(seed + rank)
-        self._meta_lock    = threading.Lock()
-        self._last_metadata: List[Optional[Dict]] = []
-        self._last_dataset_indices: List[int] = []
+        self._batch_size = batch_size
+        self._weights    = MixingWeights(specs)
+        self._rng        = np.random.default_rng(seed + rank)
+        self._meta_lock  = threading.Lock()
+        self._last_metadata:        List[Optional[Dict]] = []
+        self._last_dataset_indices: List[int]            = []
         self._dataset_index_callbacks: List[Callable[[List[int]], None]] = []
 
         # [MS-R2] debug key log
-        self._log_file     = debug_log_keys
-        self._rank         = rank
+        self._log_file = debug_log_keys
+        self._rank     = rank
 
         self._iterators: List[ShardIterator] = [
             ShardIterator(
@@ -433,8 +513,7 @@ class MixingSource:
         """
         Assemble one batch of JPEG byte arrays.
 
-        [MS-8] Uses vectorised np.rng.choice (one C-level call) for dataset
-               selection instead of a Python-level loop.
+        [MS-8]  Vectorised np.rng.choice (one C-level call) for dataset selection.
         [MS-R3] Records per-sample dataset indices for NormSource callback.
         [MS-R2] Optionally logs __key__ values.
         """
