@@ -10,57 +10,36 @@ Design choices (unchanged)
 - Rank 0 writes; all ranks can read.
 - Retains only the 3 most recent checkpoints to bound Lustre usage.
 
-Changes vs previous version
-----------------------------
-[CK-1]  Supports new CheckpointState fields: global_crop_size, local_crop_size.
-        Fully backward-compatible: missing fields default to 224 / 96.
+Changes in this version
+-----------------------
+[CK-1]  Supports CheckpointState fields: global_crop_size, local_crop_size (retained).
+[CK-2]  load() returns None gracefully; warns on corrupt files (retained).
+[CK-3]  LATEST pointer file for robust checkpoint discovery (retained).
 
-[CK-2]  load() returns None gracefully when no checkpoint exists, and logs
-        a WARNING (not ERROR) when a checkpoint file is corrupt.
+[M3-FIX] SHA-256 integrity envelope.                                   ← FIX M3
+         Previously a checkpoint file truncated by a node crash (SIGKILL
+         during the .tmp write, or Lustre write-back timeout) would produce
+         a JSONDecodeError at resume time with no actionable message.
 
-[CK-3]  LATEST pointer file for robust checkpoint discovery.
+         New format: CheckpointState.save() wraps the payload in a JSON
+         envelope:
 
-        Problem with glob-sort
-        ----------------------
-        The previous implementation discovered checkpoints with:
+             {"payload": { ... state fields ... }, "sha256": "<hex>"}
 
-            candidates = sorted(self._dir.glob("dl_state_*.json"))
-            state = CheckpointState.load(candidates[-1])
+         The sha256 field is the SHA-256 hex digest of
+         ``json.dumps(payload, indent=2)``.  CheckpointState.load() verifies
+         the checksum before deserialising.  A mismatch raises ValueError with
+         the stored and computed hashes so operators can identify corruption.
 
-        If a training job crashes between writing a new checkpoint and pruning
-        old ones (e.g. SIGKILL mid-prune, or Lustre metadata latency makes the
-        new file visible before the old ones are unlinked), ``sorted()`` may
-        return a stale or partially-written file as the latest.
+         Backward compatibility: CheckpointState.load() detects the legacy
+         flat format (no "payload" key) and reads it without checksum
+         verification — existing checkpoints continue to work.  A WARNING
+         is logged so operators know they're on the old format.
 
-        Over a 3-week run with ``checkpoint_every_steps=500``, up to
-        ``(run_steps / 500)`` orphaned files can accumulate on Lustre.
-
-        Solution
-        --------
-        ``save()`` now writes a ``LATEST`` pointer file (plain text containing
-        the filename of the most recent checkpoint) *after* the checkpoint JSON
-        is fully written and renamed.  The pointer write is itself atomic
-        (write-to-tmp + rename).
-
-        ``load()`` reads ``LATEST`` first; falls back to glob-sort if
-        ``LATEST`` does not exist (backward compatibility with existing
-        checkpoint directories written by earlier versions).
-
-        ``_prune()`` still uses glob-sort for rotation — it is called after
-        ``LATEST`` is updated, so even if prune crashes partway, ``LATEST``
-        already points to the correct (newest) checkpoint.
-
-        Race-freedom
-        ------------
-        The sequence on rank 0:
-          1. Write ``dl_state_{step}.json.tmp`` → rename to ``dl_state_{step}.json``
-          2. Write ``LATEST.tmp`` (containing ``dl_state_{step}.json``)
-             → rename to ``LATEST``
-          3. _prune() unlinks old checkpoints
-
-        Readers always see either the previous LATEST (if they race with step 2)
-        or the new one (if they see step 2's rename).  They never see a
-        partially-written LATEST because the rename in step 2 is POSIX-atomic.
+         Note: the checksum lives in config.py alongside CheckpointState
+         (the class that owns save/load).  This file (checkpoint.py) only
+         manages the checkpointer lifecycle and does not need to change for
+         the integrity feature itself.  This comment is here for traceability.
 """
 
 from __future__ import annotations
@@ -83,6 +62,24 @@ class DataLoaderCheckpointer:
 
     Writes are rank-0-only and throttled to every N steps.
     Reads are available to all ranks for resume.
+
+    File format (new — envelope with SHA-256)
+    -----------------------------------------
+    ::
+
+        {
+          "payload": {
+            "step": 1000,
+            "epoch": 5,
+            "dataset_names": ["laion2b", "imagenet22k"],
+            "mixing_weights": [0.7, 0.3],
+            "global_crop_size": 224,
+            "local_crop_size": 96
+          },
+          "sha256": "a3f2..."
+        }
+
+    Legacy format (flat, no checksum): still supported for backward compat.
     """
 
     def __init__(self, ckpt_dir: str, every_n_steps: int = 500, rank: int = 0) -> None:
@@ -92,31 +89,25 @@ class DataLoaderCheckpointer:
         if rank == 0:
             self._dir.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def save(self, state: CheckpointState) -> None:
         """
         Save state to disk (rank 0 only, every N steps).
 
-        [CK-3] Write order:
-          1. Atomic JSON write (tmp → rename)
-          2. Atomic LATEST pointer update (tmp → rename)
-          3. Prune old checkpoints
+        Write order (race-free):
+          1. Atomic JSON write with SHA-256 envelope (tmp → rename).
+          2. Atomic LATEST pointer update (tmp → rename).
+          3. Prune old checkpoints (best-effort; does not affect LATEST).
         """
         if self._rank != 0 or state.step % self._every != 0:
             return
 
-        # Step 1: write the checkpoint JSON atomically.
         filename = f"dl_state_{state.step:012d}.json"
         path     = self._dir / filename
-        state.save(path)   # CheckpointState.save() handles its own tmp→rename
+        state.save(path)   # CheckpointState.save() handles tmp→rename + checksum
 
-        # Step 2: update the LATEST pointer atomically.
         self._write_latest(filename)
-
-        # Step 3: prune old checkpoints.
         self._prune()
 
         log.info("DataLoader checkpoint saved: %s", filename)
@@ -125,8 +116,11 @@ class DataLoaderCheckpointer:
         """
         Load the most recent checkpoint, or return None if none exists.
 
-        [CK-3] Reads the LATEST pointer first; falls back to glob-sort for
-        backward compatibility with checkpoint dirs written by older versions.
+        Reads the LATEST pointer first; falls back to glob-sort for backward
+        compatibility with checkpoint dirs written by older versions.
+
+        Returns None (with a WARNING) if the checkpoint file is corrupt or
+        fails the SHA-256 integrity check.
         """
         path = self._resolve_latest()
         if path is None:
@@ -139,6 +133,13 @@ class DataLoaderCheckpointer:
                 state.global_crop_size, state.local_crop_size,
             )
             return state
+        except ValueError as exc:
+            # Includes SHA-256 mismatch (M3) and other validation errors.
+            log.warning(
+                "Checkpoint %s failed integrity check: %s — starting from scratch.",
+                path, exc,
+            )
+            return None
         except Exception as exc:
             log.warning(
                 "Could not load checkpoint %s: %s — starting from scratch.",
@@ -146,35 +147,30 @@ class DataLoaderCheckpointer:
             )
             return None
 
-    # ------------------------------------------------------------------
-    # state_dict / load_state_dict  (torchdata StatefulDataLoader compat)
-    # ------------------------------------------------------------------
+    # ── state_dict / load_state_dict (torchdata StatefulDataLoader compat) ────
 
     def state_dict(self) -> dict:
-        """Return checkpoint state as a plain dict (framework-agnostic)."""
+        """Return checkpoint state as a plain dict."""
         state = self.load()
         if state is None:
             return {}
         return {
-            "step":            state.step,
-            "epoch":           state.epoch,
-            "dataset_names":   state.dataset_names,
-            "mixing_weights":  state.mixing_weights,
+            "step":             state.step,
+            "epoch":            state.epoch,
+            "dataset_names":    state.dataset_names,
+            "mixing_weights":   state.mixing_weights,
             "global_crop_size": state.global_crop_size,
             "local_crop_size":  state.local_crop_size,
         }
 
     def load_state_dict(self, d: dict) -> None:
-        """Restore from a dict produced by state_dict() (no-op on non-rank-0)."""
-        # Downstream: caller applies d fields to DINODataLoader directly.
+        """Restore from a dict produced by state_dict(). Caller applies fields."""
         pass
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _write_latest(self, filename: str) -> None:
-        """Atomically update the LATEST pointer file. [CK-3]"""
+        """Atomically update the LATEST pointer file."""
         latest_tmp = self._dir / f"{_LATEST_FILE}.tmp"
         latest     = self._dir / _LATEST_FILE
         try:
@@ -188,15 +184,11 @@ class DataLoaderCheckpointer:
                 pass
 
     def _resolve_latest(self) -> Optional[Path]:
-        """
-        Return the Path of the most recent checkpoint, or None.
-
-        [CK-3] Reads LATEST first; falls back to glob-sort.
-        """
+        """Return the Path of the most recent checkpoint, or None."""
         latest_ptr = self._dir / _LATEST_FILE
         if latest_ptr.exists():
             try:
-                filename = latest_ptr.read_text(encoding="utf-8").strip()
+                filename  = latest_ptr.read_text(encoding="utf-8").strip()
                 candidate = self._dir / filename
                 if candidate.exists():
                     return candidate
@@ -206,9 +198,12 @@ class DataLoaderCheckpointer:
                     filename,
                 )
             except Exception as exc:
-                log.warning("Could not read LATEST pointer: %s; falling back to glob-sort.", exc)
+                log.warning(
+                    "Could not read LATEST pointer: %s; falling back to glob-sort.",
+                    exc,
+                )
 
-        # Backward-compatible fallback.
+        # Backward-compatible fallback
         candidates = sorted(self._dir.glob("dl_state_*.json"))
         return candidates[-1] if candidates else None
 

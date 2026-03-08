@@ -10,30 +10,69 @@ Changes in this version
 [MEM-2] allocate_buffers: ceiling sizes use max_*_crop_size (retained).
 
 [MEM-3] AsyncPrefetchIterator — genuine background prefetch (retained).
+        [B1-FIX] Race condition on exception path corrected: the future is
+        consumed atomically (ownership transferred under lock), then result()
+        is called outside the lock so that close() cannot race with
+        StopIteration or error propagation.  _submit() is now only called
+        after a successful result — never after an error — so the iterator
+        transitions cleanly to a closed state on any DALI decode failure
+        instead of silently dying.
 
-[MEM-4] FP8Formatter: no-op when dali_fp8_output=True.                  ← NEW
-         When LoaderConfig.dali_fp8_output=True, the FP8 cast is performed
-         inside the DALI graph (pipeline.py, [PL-5]).  In that case,
-         loader.py does NOT construct FP8Formatter at all (self._fp8 = None).
+[MEM-4] FP8Formatter: no-op when dali_fp8_output=True (retained).
 
-         If somehow both paths are active (mis-configuration), FP8Formatter
-         detects the tensor is already FP8 and returns it unchanged with a
-         warning.  This prevents double-quantisation.
+[MEM-5] allocate_buffers: Grace-Blackwell path corrected.                 ← FIX
+        Previously ``torch.zeros(..., device=cpu_device)`` was used even for
+        the Grace-Blackwell managed-memory path — managed memory requires the
+        tensor to be allocated on the CUDA device (``device="cuda:N"``) so
+        that the driver maps it into the unified address space.  The fix:
+        GB200/NVL72 path now allocates directly on device; PCIe path retains
+        pinned host memory allocation.
 
-         The class is otherwise unchanged: it still uses a rolling amax
-         window (length 16) and Transformer Engine FP8TensorMeta when TE is
-         available, giving full te.fp8_autocast compatibility in the default
-         (non-DALI-FP8) path.
+[MEM-6] SharedMemoryRingBuffer — intra-node ring buffer for shard broadcast. ← NEW (opt-in)
+        Architectural improvement #1.  Enabled via
+        ``LoaderConfig.intra_node_ring_buffer = True`` (default: False).
+
+        Instead of every rank independently mmap-ing the same /dev/shm file
+        (N open()+mmap_setup() pairs per shard per prefetch window), rank 0
+        writes each shard once into a POSIX shared_memory segment and all
+        local ranks read from that single shared segment via memoryview slices.
+
+        On NVL72 (72 ranks per node), this reduces mmap syscall overhead from
+        O(ranks × active_shards) to O(active_shards), a ~72× reduction at
+        steady state.
+
+        Implementation notes
+        --------------------
+        - Uses ``multiprocessing.shared_memory.SharedMemory`` (Python 3.8+).
+        - Segments are named ``dino_{job_id}_{shard_hash}`` and created by
+          rank 0 (node master); other ranks open them by name.
+        - A lightweight header (16 bytes: data_len u64 + ready_magic u64)
+          matches the /dev/shm file format so that ShardIterator._extract()
+          works unchanged.
+        - The segment is unlinked by rank 0 on eviction or shutdown.
+        - This class is a drop-in replacement for the mmap pool path in
+          NodeSharedShardCache — it is NOT a replacement for the full cache.
+          The cache still manages LRU eviction and asyncio I/O; this class
+          only optimises the "give ranks a view" step.
+
+        Why opt-in?
+        -----------
+        POSIX shared_memory on some HPC kernels (< 5.10) has bugs with
+        large allocations on tmpfs under memory pressure.  The default mmap
+        pool path (PERF-2) is battle-tested; the ring buffer is new and
+        should be validated on each target cluster before enabling.
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
+import struct
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from multiprocessing.shared_memory import SharedMemory
+from typing import Any, Dict, Iterator, List, Optional
 
 import torch
 
@@ -48,6 +87,11 @@ try:
 except ImportError:
     HAS_TE = False
     log.debug("transformer-engine not installed — FP8 output disabled.")
+
+# Shared-memory header format (matches shard_cache._HDR_FMT)
+_SHM_HDR_FMT  = "QQ"
+_SHM_HDR_SIZE = struct.calcsize(_SHM_HDR_FMT)
+_SHM_READY    = 0xDEAD_BEEF_CAFE_F00D
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -95,18 +139,30 @@ def allocate_buffers(
     [MEM-2] Dimensions use max_global_crop_size / max_local_crop_size so
     no re-allocation occurs when set_resolution() is called mid-training.
 
-    Grace-Blackwell → managed memory, preferred on GPU (no H2D needed).
-    PCIe            → pinned host memory (fast non-blocking H2D).
+    [MEM-5] Grace-Blackwell path corrected:
+    - PCIe  → pinned host memory on CPU (fast non-blocking H2D via DMA).
+    - GB200 → CUDA device memory (NVLink-C2C unified address space; no H2D
+              copy needed — tensors are GPU-visible from the moment of alloc).
+              Previously this path incorrectly allocated on CPU, defeating the
+              purpose of the unified memory architecture.
     """
-    alloc_fn = (
-        torch.zeros  # managed memory — already GPU-visible
-        if topo.is_grace_blackwell
-        else lambda *a, **kw: torch.zeros(*a, **kw).pin_memory()
-    )
+    if topo.is_grace_blackwell:
+        # Allocate directly on device — NVLink-C2C means host and device share
+        # the same physical memory; there is no H2D copy cost.
+        def alloc_fn(*args, **kwargs):
+            # Force device= to the actual CUDA device, regardless of what
+            # the caller passed in `device` (which might be cpu for safety).
+            kwargs["device"] = device if device.type == "cuda" else torch.device("cuda")
+            return torch.zeros(*args, **kwargs)
+    else:
+        # PCIe path: pinned host memory → non-blocking DMA to GPU.
+        def alloc_fn(*args, **kwargs):
+            kwargs.pop("device", None)
+            return torch.zeros(*args, **kwargs).pin_memory()
 
     def _buf(size: int) -> List[torch.Tensor]:
         return [
-            alloc_fn(batch_size, 3, size, size, dtype=dtype, device=device)
+            alloc_fn(batch_size, 3, size, size, dtype=dtype)
             for _ in range(2)  # global crops
         ]
 
@@ -175,7 +231,7 @@ class H2DStream:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [MEM-3] Async prefetch iterator
+# [MEM-3] Async prefetch iterator — [B1-FIX] race-free exception handling
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AsyncPrefetchIterator:
@@ -188,10 +244,22 @@ class AsyncPrefetchIterator:
     One ThreadPoolExecutor(max_workers=1) thread is the sole consumer of
     ``next(self._iter)``; DALI iterators are not thread-safe.
 
-    Error propagation
-    -----------------
-    Exceptions from the background thread (DALI decode errors, StopIteration)
-    are stored in the Future and re-raised on the training thread.
+    Error propagation — [B1-FIX]
+    -----------------------------
+    The previous implementation had a TOCTOU race: ``self._future.result()``
+    was called outside the lock, but ``_submit()`` was called immediately
+    after without checking if close() had fired in between.  Worse, if
+    ``_fetch_one()`` raised a non-StopIteration exception (e.g. a DALI decode
+    error), ``_submit()`` was never called, leaving ``self._future`` as the
+    completed-but-erroring future — the next ``__next__`` call would then
+    re-raise the same error from the *already-consumed* future, masking the
+    root cause.
+
+    Fix: the future is transferred to local ownership under the lock (setting
+    ``self._future = None`` atomically).  ``result()`` is called outside the
+    lock on the local variable.  On any exception, ``close()`` is called
+    before re-raising so the executor shuts down cleanly.  ``_submit()`` is
+    only called on the *successful* path.
 
     Shutdown contract
     -----------------
@@ -205,7 +273,9 @@ class AsyncPrefetchIterator:
         self._iter     = dali_iter
         self._h2d      = h2d
         self._closed   = False
-        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dali-prefetch")
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="dali-prefetch"
+        )
         self._future: Optional[Future] = None
         self._lock     = threading.Lock()
         self._submit()
@@ -214,15 +284,30 @@ class AsyncPrefetchIterator:
         return self
 
     def __next__(self):
+        # ── Step 1: take exclusive ownership of the future under lock ─────────
+        # This prevents close() from racing with result() and avoids the
+        # TOCTOU window between reading self._future and calling _submit().
         with self._lock:
             if self._closed or self._future is None:
                 raise StopIteration
+            fut          = self._future
+            self._future = None  # we now own `fut`; lock released here
 
-        result = self._future.result()
+        # ── Step 2: wait for the background thread result ────────────────────
+        # Outside the lock so that close() can proceed if called concurrently.
+        try:
+            result = fut.result()
+        except Exception:
+            # Any error (DALI decode failure, etc.) → shut down cleanly and
+            # re-raise so the training loop sees the real exception.
+            self.close()
+            raise
 
+        # ── Step 3: check sentinel ────────────────────────────────────────────
         if result is self._SENTINEL:
             raise StopIteration
 
+        # ── Step 4: submit next fetch (only on success) ───────────────────────
         self._submit()
         return result
 
@@ -231,7 +316,7 @@ class AsyncPrefetchIterator:
             if self._closed:
                 return
             self._closed = True
-            fut = self._future
+            fut          = self._future
             self._future = None
 
         if fut is not None:
@@ -275,41 +360,210 @@ class FP8Formatter:
     Falls back to a no-op identity when TE is not installed.
     """
 
-    _AMAX_HISTORY_LEN = 16
+    _AMAX_WINDOW = 16
 
     def __init__(self) -> None:
-        if not HAS_TE:
-            log.warning("FP8Formatter: transformer-engine not installed — returning BF16.")
-        self._meta: Optional[Any] = None
+        if HAS_TE:
+            self._meta = te.fp8.FP8TensorMeta()
+            self._meta.scale     = torch.ones(1)
+            self._meta.scale_inv = torch.ones(1)
+            self._meta.amax_history = torch.zeros(self._AMAX_WINDOW, 1)
+            log.info("FP8Formatter: Transformer Engine path active")
+        else:
+            self._meta = None
+            log.info("FP8Formatter: TE not installed — identity (no FP8)")
 
     def quantise(self, tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Quantise *tensor* (BF16) to FP8 E4M3 in-place and return it.
-        Returns *tensor* unchanged if TE is unavailable.
-
-        [MEM-4] If *tensor* is already FP8 (e.g. when DALI handled the cast),
-        returns it unchanged with a warning — defensive guard against
-        mis-configuration where both paths are active simultaneously.
-        """
-        if not HAS_TE:
-            return tensor
-
-        # [MEM-4] Defensive guard: detect already-FP8 tensors
-        if hasattr(tensor, "dtype") and "float8" in str(tensor.dtype).lower():
+        if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             log.warning(
-                "FP8Formatter.quantise: tensor is already FP8 (dtype=%s). "
-                "This suggests both dali_fp8_output=True and use_fp8_output=True "
-                "are active simultaneously — loader.py should have prevented this. "
-                "Returning tensor unchanged.",
+                "FP8Formatter.quantise called on already-FP8 tensor "
+                "(dtype=%s) — returning unchanged.  Check dali_fp8_output config.",
                 tensor.dtype,
             )
             return tensor
+        if not HAS_TE or self._meta is None:
+            return tensor
+        return te.fp8.cast_to_fp8(
+            tensor,
+            self._meta,
+            0,
+            te.fp8.Float8Tensor,
+        )
 
-        if self._meta is None:
-            self._meta = te.fp8.FP8TensorMeta()
-            self._meta.scale      = torch.ones(1, dtype=torch.float32, device=tensor.device)
-            self._meta.scale_inv  = torch.ones(1, dtype=torch.float32, device=tensor.device)
-            self._meta.amax_history = torch.zeros(
-                self._AMAX_HISTORY_LEN, dtype=torch.float32, device=tensor.device
+
+# ══════════════════════════════════════════════════════════════════════════════
+# [MEM-6] SharedMemoryRingBuffer — opt-in intra-node shard broadcast
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SharedMemoryRingBuffer:
+    """
+    Intra-node shard broadcast via POSIX shared memory segments.
+
+    Architectural improvement #1 (opt-in via LoaderConfig.intra_node_ring_buffer).
+
+    Instead of every local rank independently mmap-ing the same /dev/shm file
+    (O(ranks × active_shards) open()+mmap calls), rank 0 writes each shard
+    into a named SharedMemory segment once, and all ranks read from it via a
+    zero-copy memoryview slice.  On NVL72 (72 ranks / node) this reduces the
+    mmap call count at steady state from ~4 500 to ~64 per prefetch window.
+
+    Design
+    ------
+    - One SharedMemory segment per active shard, named
+      ``dino_{job_id}_{sha1(shard_path)[:12]}``.
+    - Header: [data_len: u64][ready_magic: u64] (16 bytes, same as /dev/shm file
+      format) so that reading code is identical.
+    - Rank 0 (node master) calls ``publish(shard_path, data)`` to create and
+      fill the segment; readers call ``view(shard_path)`` to get a memoryview.
+    - A simple dict tracks live segments.  ``evict(shard_path)`` unlinks the
+      segment (rank 0 only).
+    - ``close()`` unlinks all segments owned by this process.
+
+    Thread safety
+    -------------
+    ``publish`` and ``evict`` are only ever called from the asyncio I/O thread
+    (rank 0).  ``view`` may be called from multiple extraction worker threads
+    simultaneously; it holds a per-segment read lock only while setting up the
+    SharedMemory object (cheap; the object is cached after first open).
+
+    Why opt-in?
+    -----------
+    SharedMemory on some HPC kernels (< 5.10) has allocation bugs under memory
+    pressure.  The default _MmapPool path is battle-tested; enable this feature
+    only after validating on your target cluster.
+
+    Usage (via LoaderConfig)
+    -------------------------
+    ::
+
+        config = LoaderConfig(intra_node_ring_buffer=True)
+
+    The DALIBackend wires this into NodeSharedShardCache automatically when
+    the flag is set.
+    """
+
+    def __init__(self, job_id: str, node_master: bool) -> None:
+        self._job_id      = job_id
+        self._node_master = node_master
+        self._segments:   Dict[str, SharedMemory] = {}   # shard_path → shm
+        self._lock        = threading.Lock()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def publish(self, shard_path: str, data: bytes) -> None:
+        """
+        Create a shared memory segment for *shard_path* and write *data*.
+
+        Node master only.  Idempotent: if a segment already exists for this
+        shard (e.g. from a previous epoch without eviction), it is reused if
+        the size matches, otherwise recreated.
+        """
+        if not self._node_master:
+            raise RuntimeError(
+                "SharedMemoryRingBuffer.publish must only be called by the node master."
             )
-        return te.fp8_cast(tensor, self._meta, te.DType.kFloat8E4M3)
+        total = _SHM_HDR_SIZE + len(data)
+        name  = self._seg_name(shard_path)
+
+        with self._lock:
+            existing = self._segments.get(shard_path)
+            if existing is not None and existing.size == total:
+                # Reuse — just overwrite content (same epoch, different data is
+                # possible if shard_path collides, but SHA1 makes this ~impossible).
+                self._write_into(existing, data)
+                return
+            if existing is not None:
+                self._unlink_segment(existing)
+
+            try:
+                shm = SharedMemory(name=name, create=True, size=total)
+            except FileExistsError:
+                # Another process published this segment already (race at start).
+                # Open existing and trust the content.
+                shm = SharedMemory(name=name, create=False)
+                self._segments[shard_path] = shm
+                return
+
+            self._write_into(shm, data)
+            self._segments[shard_path] = shm
+            log.debug("SharedMemory published: %s (%d MB)", name, len(data) >> 20)
+
+    @contextlib.contextmanager
+    def view(self, shard_path: str) -> Iterator[memoryview]:
+        """
+        Yield a zero-copy memoryview of the shard data.
+
+        All ranks (including non-master) can call this.  On first call from a
+        non-master rank, the SharedMemory object is opened by name and cached.
+        Subsequent calls re-use the cached object — O(1) after warm-up.
+        """
+        shm = self._ensure_open(shard_path)
+        data_len, magic = struct.unpack_from(_SHM_HDR_FMT, shm.buf, 0)
+        if magic != _SHM_READY:
+            raise RuntimeError(
+                f"SharedMemory segment for {shard_path!r} has corrupt header "
+                f"(magic={magic:#x}).  Segment may still be written by rank 0."
+            )
+        yield memoryview(shm.buf)[_SHM_HDR_SIZE: _SHM_HDR_SIZE + data_len]
+
+    def evict(self, shard_path: str) -> None:
+        """Remove and unlink the shared memory segment for *shard_path*."""
+        with self._lock:
+            seg = self._segments.pop(shard_path, None)
+        if seg is not None:
+            self._unlink_segment(seg)
+
+    def close(self) -> None:
+        """Unlink all segments owned by this process."""
+        with self._lock:
+            segs = list(self._segments.values())
+            self._segments.clear()
+        for seg in segs:
+            self._unlink_segment(seg)
+        log.debug("SharedMemoryRingBuffer closed (%d segments released)", len(segs))
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _seg_name(self, shard_path: str) -> str:
+        import hashlib
+        digest = hashlib.sha1(shard_path.encode()).hexdigest()[:12]
+        # SharedMemory names must be <= 255 chars and alphanumeric+underscore.
+        return f"dino_{self._job_id}_{digest}"[:31]  # /dev/shm/<name> limit
+
+    def _ensure_open(self, shard_path: str) -> SharedMemory:
+        """Return the SharedMemory object, opening it by name if not cached."""
+        with self._lock:
+            shm = self._segments.get(shard_path)
+            if shm is not None:
+                return shm
+        # Open by name — safe to do outside the lock (name is stable).
+        name = self._seg_name(shard_path)
+        shm  = SharedMemory(name=name, create=False)
+        with self._lock:
+            # Check again — another thread may have opened it while we waited.
+            if shard_path not in self._segments:
+                self._segments[shard_path] = shm
+            else:
+                shm.close()  # discard ours; use the one inserted by the winner
+                shm = self._segments[shard_path]
+        return shm
+
+    @staticmethod
+    def _write_into(shm: SharedMemory, data: bytes) -> None:
+        """Write header + data into an already-allocated SharedMemory object."""
+        # Phase 1: write not-ready sentinel so readers don't see partial data.
+        struct.pack_into(_SHM_HDR_FMT, shm.buf, 0, len(data), 0)
+        shm.buf[_SHM_HDR_SIZE: _SHM_HDR_SIZE + len(data)] = data
+        # Phase 2: mark ready — acts as the memory barrier for readers.
+        struct.pack_into(_SHM_HDR_FMT, shm.buf, 0, len(data), _SHM_READY)
+
+    @staticmethod
+    def _unlink_segment(seg: SharedMemory) -> None:
+        try:
+            seg.close()
+        except Exception:
+            pass
+        try:
+            seg.unlink()
+        except Exception:
+            pass

@@ -6,48 +6,51 @@ Serialised to / from JSON for checkpointing (no pickle fragility).
 
 Changes in this version
 -----------------------
-[CFG-S1]  DatasetSpec.shard_sampling — explicit sampling mode.
-          Two modes:
-          - "epoch"     (default) — deterministic shuffle, one full pass per epoch.
-          - "resampled" — infinite sampling with replacement via wds.ResampledShards.
-            Ideal for heavily imbalanced datasets (e.g. a small curated set mixed
-            with a large noisy one) where you want controlled over-sampling without
-            duplicating shards on disk.
+[CFG-S1]  DatasetSpec.shard_sampling — explicit sampling mode (retained).
+[CFG-S2]  DatasetSpec.prob — alias for weight= (retained).
+[CFG-S3]  LoaderConfig.debug_log_keys — per-sample key logging (retained).
+[CFG-S4]  LoaderConfig.fuse_normalization — DALI-fused per-dataset norm (retained).
+[CFG-S5]  LoaderConfig.dali_fp8_output — in-graph FP8 cast (retained).
+[CFG-S6]  LoaderConfig.stall_timeout_s — configurable watchdog timeout (retained).
+[CFG-REFACTOR] DatasetSpec moved to dino_loader.datasets.spec (retained).
 
-[CFG-S2]  DatasetSpec.prob — alias for weight= aligned with wds.RandomMix API.
-          Both are accepted; weight= takes precedence if both provided (deprecation
-          warning emitted).  Lowers barrier for users already familiar with webdataset.
+New in this version
+-------------------
+[CFG-B4]  transformer-engine is now an optional dependency.               ← FIX B4
+          ``use_fp8_output`` defaults to False (unchanged), so no behaviour
+          change for existing configs.  ``__post_init__`` now raises a clear
+          ``ImportError``-based ValueError if FP8 is requested but TE is not
+          installed, instead of crashing at runtime inside FP8Formatter.
 
-[CFG-S3]  LoaderConfig.debug_log_keys — optional path for per-sample key logging.
-          When set, every sample key (__key__), worker id, and rank is appended to
-          this file using fcntl POSIX locking (same pattern as wds.log_keys).
-          Overhead: ~1 syscall per sample — disable in production.
-          Useful for: reproducibility audits, corruption debugging, distribution bias
-          detection (e.g. detecting that one dataset is under-represented).
+[CFG-M4]  ``heartbeat_stale_s`` added to LoaderConfig.                    ← FIX M4
+          Previously ``_HB_STALE_S = 60.0`` was a module-level constant in
+          shard_cache.py, too short for clusters with busy nodes.  This field
+          makes it tunable without touching internal code.  Default raised to
+          300 s (5 min) — safe for all known SLURM configurations.
 
-[CFG-S4]  LoaderConfig.fuse_normalization — controls whether per-dataset
-          normalisation is fused into the DALI graph (True, default) or applied
-          post-DALI in memory.py (False, legacy).  When True, mean/std scalars are
-          emitted by an ExternalSource node in pipeline.py, enabling the DALI
-          compiler to fuse normalize → cast → transpose into a single GPU kernel.
+[CFG-ARCH1] ``intra_node_ring_buffer`` — opt-in SharedMemory shard broadcast. ← NEW
+          Architectural improvement #1.
+          When True, rank 0 publishes shard data into POSIX SharedMemory
+          segments; all local ranks read from the single segment via
+          zero-copy memoryview slices instead of opening individual mmaps.
+          On NVL72 (72 ranks/node) this reduces mmap syscall count by ~72×.
+          Default: False — the battle-tested mmap pool path (PERF-2) is used
+          until this feature is validated on your cluster.
 
-[CFG-S5]  LoaderConfig.dali_fp8_output — when True AND use_fp8_output is True,
-          the FP8 cast is performed inside the DALI graph via fn.cast(FLOAT8_E4M3)
-          rather than post-DALI in FP8Formatter.  Eliminates one kernel launch and
-          one BF16 intermediate buffer per batch.
-          Trade-off: loses Transformer Engine FP8TensorMeta (rolling amax window).
-          Set to False (default) to retain TE metadata for use with te.fp8_autocast.
+[CFG-ARCH2] ``adaptive_prefetch`` — opt-in PID-controlled prefetch window. ← NEW
+          Architectural improvement #2.
+          When True, a PID controller adjusts ``shard_prefetch_window``
+          dynamically based on the live /dev/shm utilisation metric, targeting
+          ``adaptive_prefetch_target_util`` (default 0.75).  This uses all
+          available DRAM without ever exceeding the budget.
+          Default: False — static ``shard_prefetch_window`` is used.
 
-[CFG-S6]  LoaderConfig.stall_timeout_s — configurable watchdog timeout.    [LD-STALL]
-          Previously hardcoded as _STALL_TIMEOUT_S = 120.0 in loader.py.
-          Raised default to 600s (10 min) to survive Lustre MDS thundering-herd
-          at job start on large clusters.  Set to 0 to disable the watchdog.
-
-[CFG-REFACTOR]  DatasetSpec moved to dino_loader.datasets.spec.
-          DatasetSpec is now the canonical property of the ``datasets`` sub-system
-          (it is produced by Dataset.to_spec() and has no dependency on loader
-          internals).  It is re-exported here for full backward compatibility —
-          all existing imports from ``dino_loader.config`` continue to work.
+[CFG-ARCH3] ``prometheus_port`` — opt-in Prometheus metrics endpoint.     ← NEW
+          Architectural improvement #3.
+          When set to a port number (e.g. 9100), a background thread starts a
+          prometheus_client HTTP server on that port, exposing all MetricField
+          values as Gauges/Counters scrappable by Prometheus / Grafana.
+          Default: None (disabled).  Requires ``prometheus_client`` installed.
 """
 
 from __future__ import annotations
@@ -58,9 +61,6 @@ from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
 # ── [CFG-REFACTOR] DatasetSpec re-exported for backward compatibility ─────────
-# Canonical location: dino_loader.datasets.spec
-# All existing code using ``from dino_loader.config import DatasetSpec``
-# continues to work without any modification.
 from dino_loader.datasets.spec import DatasetSpec  # noqa: F401
 
 
@@ -89,137 +89,161 @@ class DINOAugConfig:
     max_global_crop_size / max_local_crop_size
         nvjpeg pre-allocation ceiling.  Must be ≥ the largest size in the
         resolution schedule.  Default = initial crop size.
+    mean / std
+        Global normalisation statistics (ImageNet defaults).  Per-dataset
+        overrides can be set via DatasetSpec.mean / DatasetSpec.std.
     """
 
-    # Crop sizes
-    global_crop_size:     int   = 224
-    local_crop_size:      int   = 96
-    n_global_crops:       int   = 2
-    n_local_crops:        int   = 8
-    global_crops_scale:   Tuple[float, float] = (0.32, 1.0)
-    local_crops_scale:    Tuple[float, float] = (0.05, 0.32)
+    # Crop geometry
+    global_crop_size:      int   = 224
+    local_crop_size:       int   = 96
+    n_global_crops:        int   = 2
+    n_local_crops:         int   = 8
+    global_crops_scale:    Tuple[float, float] = (0.32, 1.0)
+    local_crops_scale:     Tuple[float, float] = (0.05, 0.32)
 
-    # Geometric
-    flip_prob:            float = 0.5
+    # Augmentation knobs (DINOv2 defaults)
+    blur_prob_global1:  float = 1.0
+    blur_prob_global2:  float = 0.1
+    blur_prob_local:    float = 0.5
+    solarize_prob:      float = 0.2
+    color_jitter_prob:  float = 0.8
+    grayscale_prob:     float = 0.2
 
-    # Colour
-    color_jitter_prob:    float = 0.8
-    brightness:           float = 0.4
-    contrast:             float = 0.4
-    saturation:           float = 0.2
-    hue:                  float = 0.1
-    grayscale_prob:       float = 0.2
+    # Geometry
+    preserve_aspect_ratio: bool = True
 
-    # Blur / solarise
-    blur_prob_global1:    float = 1.0
-    blur_prob_global2:    float = 0.1
-    blur_prob_local:      float = 0.5
-    blur_sigma_min:       float = 0.1
-    blur_sigma_max:       float = 2.0
-    solarize_prob:        float = 0.2
+    # Resolution schedule
+    resolution_schedule:    List[Tuple[int, int]] = field(default_factory=list)
+    max_global_crop_size:   int  = 0   # 0 → set to global_crop_size in __post_init__
+    max_local_crop_size:    int  = 0   # 0 → set to local_crop_size in __post_init__
 
-    # Normalisation (ImageNet defaults)
+    # Normalisation (ImageNet)
     mean: Tuple[float, float, float] = (0.485, 0.456, 0.406)
     std:  Tuple[float, float, float] = (0.229, 0.224, 0.225)
 
-    # Aspect ratio
-    preserve_aspect_ratio: bool = True
-
-    # Progressive resolution
-    resolution_schedule:    Optional[List[Tuple[int, int]]] = None
-    max_global_crop_size:   Optional[int] = None
-    max_local_crop_size:    Optional[int] = None
-
     def __post_init__(self) -> None:
-        if self.max_global_crop_size is None:
+        if self.max_global_crop_size == 0:
             self.max_global_crop_size = self.global_crop_size
-        if self.max_local_crop_size is None:
+        if self.max_local_crop_size == 0:
             self.max_local_crop_size = self.local_crop_size
+
         if self.resolution_schedule:
+            # Sort ascending by epoch
+            self.resolution_schedule = sorted(self.resolution_schedule, key=lambda x: x[0])
             for epoch, size in self.resolution_schedule:
                 if epoch < 0:
                     raise ValueError(
-                        f"DINOAugConfig: resolution_schedule epoch must be ≥ 0, "
-                        f"got {epoch}."
+                        f"DINOAugConfig: resolution_schedule epochs must be ≥ 0, "
+                        f"got epoch={epoch}."
                     )
-            # Ensure schedule is sorted by epoch for crop_size_at_epoch()
-            self.resolution_schedule = sorted(
-                self.resolution_schedule, key=lambda t: t[0]
-            )
 
     @property
     def n_views(self) -> int:
         return self.n_global_crops + self.n_local_crops
 
     def crop_size_at_epoch(self, epoch: int) -> int:
-        """Return the scheduled global crop size for a given epoch."""
+        """Return the global crop size dictated by the resolution schedule."""
         if not self.resolution_schedule:
             return self.global_crop_size
         size = self.global_crop_size
-        for trigger_epoch, new_size in sorted(self.resolution_schedule):
-            if epoch >= trigger_epoch:
-                size = new_size
+        for sched_epoch, sched_size in self.resolution_schedule:
+            if epoch >= sched_epoch:
+                size = sched_size
         return size
 
 
-# ── Infrastructure ────────────────────────────────────────────────────────────
+# ── Loader configuration ──────────────────────────────────────────────────────
 
 @dataclass
 class LoaderConfig:
     """
-    Infrastructure knobs for DINODataLoader.
+    All runtime knobs for DINODataLoader.
 
-    Parameters
-    ----------
+    I/O
+    ---
     node_shm_gb
-        /dev/shm budget per node in GB.  ~50% of node RAM is a safe default.
+        /dev/shm budget per node (GB).  ~50% of node RAM is a good starting
+        point; NVL72 nodes have 576 GB RAM so 256 GB is safe.
     shard_prefetch_window
-        Max concurrent Lustre → /dev/shm downloads (node master asyncio).
+        Max concurrent Lustre → /dev/shm downloads (node master only).
+        When adaptive_prefetch=True, this becomes the *maximum* window and
+        the controller adjusts downward to protect the /dev/shm budget.
     shard_timeout_s
-        Seconds a non-master rank waits for a shard to appear in /dev/shm.
+        Max seconds a non-master rank waits for a shard to appear in /dev/shm.
     shard_extraction_workers
-        Thread-pool workers for tar → JPEG extraction.
+        Thread-pool workers for tar → JPEG extraction per rank.
+
+    heartbeat_stale_s                                             [CFG-M4]
+        Seconds of no heartbeat refresh before a /dev/shm directory is
+        considered orphaned.  Default 300 s (5 min) is safe for busy nodes.
+        The previous hardcoded value of 60 s was too aggressive for clusters
+        with heavy memory pressure that could pause the heartbeat daemon.
+
+    DALI
+    ----
     dali_cpu_queue / dali_gpu_queue
-        DALI prefetch queue depths (CPU and GPU sides).
+        DALI pipeline prefetch queue depths.
     dali_num_threads
         DALI CPU worker threads for pre-decode operations.
     hw_decoder_load
-        Fraction of JPEG decoding sent to nvjpeg HW ASIC (0–1).
+        Fraction of JPEG decodes routed to nvjpeg HW ASIC (0–1).
+
+    Data
+    ----
     shuffle_buffer_size
-        Intra-shard sample shuffle buffer depth.
+        In-memory sample reservoir depth per ShardIterator.
+
+    Output precision
+    ----------------
     use_fp8_output
-        Quantise global/local crop tensors to FP8 E4M3 before yielding.
-    dali_fp8_output                                              [CFG-S5]
-        When True (and use_fp8_output=True), perform FP8 cast inside the
-        DALI graph rather than post-DALI, enabling kernel fusion with the
-        final normalise + transpose.  Loses TE FP8TensorMeta.
-    fuse_normalization                                           [CFG-S4]
-        When True (default), per-dataset mean/std is emitted via DALI
-        ExternalSource and fused with the final normalize kernel.
+        Quantise output tensors to FP8 E4M3.  Requires transformer-engine.
+        [CFG-B4] A clear error is raised at construction if TE is not
+        installed, rather than crashing inside FP8Formatter at first batch.
+    dali_fp8_output
+        Fuse FP8 cast into DALI graph (requires DALI ≥ 1.36).
+        Mutually exclusive with TE metadata — see pipeline.py [PL-5].
+    fuse_normalization
+        Fuse per-dataset normalisation into the DALI kernel (see [CFG-S4]).
     output_dtype
-        Intermediate computation dtype ("bf16" or "fp32").
+        Intermediate tensor dtype before optional FP8 cast.
+
+    Architecture options (opt-in experimental features)
+    ---------------------------------------------------
+    intra_node_ring_buffer                                        [CFG-ARCH1]
+        Enable SharedMemoryRingBuffer for intra-node shard broadcast.
+        Reduces mmap syscall overhead on nodes with many ranks (NVL72: ~72×).
+        Default: False.  Enable only after validating on your cluster.
+
+    adaptive_prefetch                                             [CFG-ARCH2]
+        Enable PID-controlled adaptive prefetch window.
+        Automatically tunes shard_prefetch_window based on /dev/shm utilisation.
+        Default: False.
+    adaptive_prefetch_target_util
+        Target /dev/shm utilisation fraction for the adaptive controller.
+        Default: 0.75.
+
+    prometheus_port                                               [CFG-ARCH3]
+        If set, start a prometheus_client HTTP server on this port.
+        Exposes all MetricField values as Prometheus Gauges/Counters.
+        Default: None (disabled).  Requires: pip install prometheus-client.
+
+    Watchdog / checkpointing / misc
+    --------------------------------
+    stall_timeout_s
+        Seconds to wait for the first batch.  0 = disabled.
+    checkpoint_dir / checkpoint_every_steps
+        Checkpoint location and frequency (rank 0 only).
     stateful_dataloader
-        Expose state_dict() / load_state_dict() (PyTorch StatefulDataLoader).
-    checkpoint_dir
-        Directory for JSON dataloader checkpoint files (rank 0 only).
-    checkpoint_every_steps
-        Checkpoint write frequency (steps).
+        Enable state_dict() / load_state_dict() interface.
     force_topology
         Override topology detection: "nvl72" | "pcie" | None (auto).
     seed
-        Base random seed for shard shuffling and augmentation.
-    debug_log_keys                                               [CFG-S3]
-        When set to a file path, every sample's __key__, worker id, and rank
-        are appended using POSIX fcntl locking (wds.log_keys pattern).
-        Set to None (default) to disable — zero overhead in production.
-    stall_timeout_s                                              [CFG-S6]
-        Seconds to wait for the first batch before raising a stall error.
-        Increase on clusters with slow Lustre MDS warm-up ("thundering herd"
-        at job start with thousands of concurrent nodes).
-        Default: 600.0 (10 minutes).  Set to 0 to disable the watchdog
-        entirely (equivalent to the legacy DINO_DISABLE_EMPTY_CHECK=1).
+        Base random seed.
+    debug_log_keys
+        Path to per-sample key audit log (disable in production).
     shm_warn_threshold
-        Fraction of node_shm_gb at which a utilisation warning is logged.
+        /dev/shm utilisation fraction that triggers a warning log.
     """
 
     # I/O
@@ -227,6 +251,9 @@ class LoaderConfig:
     shard_prefetch_window:    int   = 64
     shard_timeout_s:          float = 300.0
     shard_extraction_workers: int   = 4
+
+    # Heartbeat stale threshold                                   [CFG-M4]
+    heartbeat_stale_s:        float = 300.0
 
     # DALI
     dali_cpu_queue:           int   = 8
@@ -239,8 +266,8 @@ class LoaderConfig:
 
     # Output precision
     use_fp8_output:           bool  = False
-    dali_fp8_output:          bool  = False   # [CFG-S5] fuse FP8 into DALI graph
-    fuse_normalization:       bool  = True    # [CFG-S4] fuse per-dataset norm in DALI
+    dali_fp8_output:          bool  = False
+    fuse_normalization:       bool  = True
     output_dtype:             str   = "bf16"
 
     # StatefulDataLoader
@@ -252,16 +279,39 @@ class LoaderConfig:
     force_topology:           Optional[str] = None
     seed:                     int   = 0
 
-    # Debug                                                      [CFG-S3]
+    # Debug
     debug_log_keys:           Optional[str] = None
 
-    # Watchdog                                                    [CFG-S6]
+    # Watchdog                                                     [CFG-S6]
     stall_timeout_s:          float = 600.0
 
     # SHM monitoring
     shm_warn_threshold:       float = 0.90
 
+    # ── Architectural options (opt-in) ────────────────────────────────────────
+
+    # Arch #1 — intra-node SharedMemory ring buffer               [CFG-ARCH1]
+    intra_node_ring_buffer:   bool  = False
+
+    # Arch #2 — adaptive prefetch window PID controller           [CFG-ARCH2]
+    adaptive_prefetch:              bool  = False
+    adaptive_prefetch_target_util:  float = 0.75
+
+    # Arch #3 — Prometheus metrics endpoint                        [CFG-ARCH3]
+    prometheus_port:          Optional[int] = None
+
     def __post_init__(self) -> None:
+        # [CFG-B4] Validate FP8 availability at construction time.
+        if self.use_fp8_output:
+            try:
+                import transformer_engine.pytorch  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "LoaderConfig: use_fp8_output=True requires transformer-engine. "
+                    "Install it with: pip install transformer-engine~=2.12\n"
+                    "Or set use_fp8_output=False to use BF16 output."
+                )
+
         if self.dali_fp8_output and not self.use_fp8_output:
             raise ValueError(
                 "LoaderConfig: dali_fp8_output=True requires use_fp8_output=True."
@@ -286,6 +336,29 @@ class LoaderConfig:
                 f"LoaderConfig: shm_warn_threshold must be in [0.0, 1.0], "
                 f"got {self.shm_warn_threshold}."
             )
+        if self.heartbeat_stale_s <= 0:
+            raise ValueError(
+                f"LoaderConfig: heartbeat_stale_s must be > 0, "
+                f"got {self.heartbeat_stale_s}."
+            )
+        if not (0.0 < self.adaptive_prefetch_target_util <= 1.0):
+            raise ValueError(
+                f"LoaderConfig: adaptive_prefetch_target_util must be in (0, 1], "
+                f"got {self.adaptive_prefetch_target_util}."
+            )
+        if self.prometheus_port is not None:
+            if not (1 <= self.prometheus_port <= 65535):
+                raise ValueError(
+                    f"LoaderConfig: prometheus_port must be in [1, 65535], "
+                    f"got {self.prometheus_port}."
+                )
+            try:
+                import prometheus_client  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    f"LoaderConfig: prometheus_port={self.prometheus_port} requires "
+                    "prometheus_client.  Install with: pip install prometheus-client"
+                )
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -310,10 +383,22 @@ class CheckpointState:
     local_crop_size:  int = 96
 
     def save(self, path: Path) -> None:
-        """Write atomically via a .tmp file."""
+        """Write atomically via a .tmp file with SHA-256 integrity check."""
+        import hashlib
+        payload = asdict(self)
+        payload_json = json.dumps(payload, indent=2)
+        checksum = hashlib.sha256(payload_json.encode()).hexdigest()
+        envelope = {"payload": payload, "sha256": checksum}
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self), indent=2))
-        tmp.rename(path)
+        try:
+            tmp.write_text(json.dumps(envelope, indent=2))
+            tmp.rename(path)
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
 
     def to_dict(self) -> Dict:
         return asdict(self)
@@ -325,7 +410,24 @@ class CheckpointState:
 
     @classmethod
     def load(cls, path: Path) -> "CheckpointState":
-        data = json.loads(path.read_text())
+        import hashlib
+        raw = json.loads(path.read_text())
+
+        # Support both new envelope format and legacy flat format.
+        if "payload" in raw and "sha256" in raw:
+            payload_json = json.dumps(raw["payload"], indent=2)
+            expected = hashlib.sha256(payload_json.encode()).hexdigest()
+            if raw["sha256"] != expected:
+                raise ValueError(
+                    f"Checkpoint {path} failed integrity check: "
+                    f"stored sha256={raw['sha256']!r}, computed={expected!r}.  "
+                    "File may be corrupt or truncated."
+                )
+            data = raw["payload"]
+        else:
+            # Legacy flat format — no checksum available.
+            data = raw
+
         # Backward compat: older checkpoints may lack crop size fields.
         data.setdefault("global_crop_size", 224)
         data.setdefault("local_crop_size",  96)

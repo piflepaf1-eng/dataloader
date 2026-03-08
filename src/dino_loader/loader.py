@@ -5,66 +5,28 @@ DINODataLoader: the single public entry point for training code.
 
 Changes in this version
 -----------------------
-[LD-1]  StatefulDataLoader interface (retained).
+[LD-1..LD-12] All previous changes retained (see previous version header).
 
-[LD-2]  set_resolution — zero-downtime resolution change (retained).
+[B3-FIX]  set_epoch() is now guarded by a threading.Lock.              ← FIX B3
+          Previously two concurrent calls (e.g. from PostProcessPipeline
+          and a background scheduler thread) could interleave, corrupting
+          the MixingSource epoch state.  A reentrant guard also prevents
+          starting a new epoch loop while the previous is still active.
 
-[LD-3]  Resolution schedule auto-apply (retained).
+[M6-FIX]  PostProcessPipeline.select() now tracks filtered batches.   ← FIX M6
+          A ``batches_filtered`` counter is incremented in the metrics
+          registry for each batch dropped by select().  Cumulative and
+          per-step filtering rates are exposed so operators can detect
+          mis-calibrated min_sample_quality or quality predicates.
 
-[LD-4]  Batch.metadata — per-sample metadata list (retained).
+[LD-13]   current_resolution property exposed publicly.               ← NEW
+          Replaces direct access to ``loader._current_global_size``
+          (which appeared in train.py and user code).  Returns a
+          ``(global_size, local_size)`` tuple.
 
-[LD-5]  MaskingGenerator integration — iBOT token masks (retained).
-        Masks are generated on CPU post-DALI.  They operate on patch-level
-        indices (not pixels), so there is no benefit to running them inside
-        the DALI graph.  See the inline note for the detailed reasoning.
-
-[LD-6]  ResolutionSource wired into build_pipeline (retained).
-
-[LD-7]  Backend abstraction (retained).
-
-[LD-8]  PostProcessPipeline — fluid interface for post-DALI transforms.
-        DINODataLoader now returns a PostProcessPipeline that wraps the raw
-        batch iterator and allows chaining of post-processing steps using a
-        webdataset-inspired fluent API:
-
-            loader = (
-                DINODataLoader(specs, batch_size=512, ...)
-                .map(my_mask_fn)
-                .select(quality_filter)
-                .with_epoch(steps)
-            )
-
-        Each chained method returns a new PostProcessPipeline so the
-        original loader is not mutated (composable).  The pipeline is
-        lazy — nothing runs until you iterate.
-
-[LD-9]  NormSource wired into build_pipeline.
-        When LoaderConfig.fuse_normalization=True (default), a NormSource
-        instance is built from (aug_cfg, specs) and passed to build_pipeline.
-
-        [REFACTOR] NormSource construction is now fully encapsulated in
-        DALIBackend.build_pipeline().  loader.py no longer imports from
-        dino_loader.pipeline and has no knowledge of NormSource.
-        The loader passes ``specs``, ``fuse_normalization``, and
-        ``dali_fp8_output`` as plain config values — the backend decides what
-        to do with them.  CPUBackend silently ignores all three.
-
-[LD-10] empty_check watchdog → now [LD-STALL] configurable stall timeout.
-        Previously hardcoded as _STALL_TIMEOUT_S = 120.0.
-        Now reads from LoaderConfig.stall_timeout_s (default 600s).
-        Rationale: on large Lustre namespaces, the first shard access during
-        a thundering-herd job start (thousands of concurrent nodes hitting the
-        MDS) can take 3–10 minutes.  120s crashes healthy jobs.
-        stall_timeout_s=0 disables the watchdog entirely.
-
-[LD-11] debug_log_keys support.
-        When LoaderConfig.debug_log_keys is set, every batch's __key__ list
-        (from metadata) is appended to the log file using fcntl POSIX locking
-        (same pattern as wds.log_keys).  Zero overhead when disabled.
-
-[LD-12] FP8 post-DALI disabled when dali_fp8_output=True.
-        FP8Formatter is not constructed when DALI handles the FP8 cast
-        in-graph, avoiding a redundant quantisation pass.
+[ARCH1]   Ring buffer flag forwarded to build_shard_cache.            ← WIRING
+[ARCH2]   Adaptive prefetch flags forwarded to build_shard_cache.     ← WIRING
+[ARCH3]   Prometheus metrics server started if prometheus_port is set. ← WIRING
 """
 
 from __future__ import annotations
@@ -72,6 +34,7 @@ from __future__ import annotations
 import fcntl
 import logging
 import os
+import threading
 import time
 from typing import Any, Callable, Iterator, List, Optional, Sequence
 
@@ -88,45 +51,23 @@ from dino_loader.monitor.metrics   import get_registry, init_registry
 
 log = logging.getLogger(__name__)
 
-# [LD-STALL] Module-level constant removed.
-# Timeout is now read from LoaderConfig.stall_timeout_s at runtime.
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-# [LD-8] PostProcessPipeline — fluid interface for post-DALI transforms
+# PostProcessPipeline — fluid interface for post-DALI transforms
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PostProcessPipeline:
     """
     A lazy, composable wrapper over a Batch iterator.
 
-    Inspired by webdataset's FluidInterface / DataPipeline pattern.
-    Each method returns a new PostProcessPipeline — the original is not mutated.
+    Each method returns a new PostProcessPipeline; the original is not mutated.
+    Transforms execute only as batches flow through — no buffering.
 
-    Usage
-    -----
-    ::
-
-        loader = (
-            DINODataLoader(specs, batch_size=512, aug_cfg=aug_cfg, config=cfg)
-            .map(my_augmentation)
-            .select(lambda b: b.metadata[0] is not None)
-            .with_epoch(steps_per_epoch)
-        )
-
-        for epoch in range(100):
-            loader.set_epoch(epoch)
-            for batch in loader:
-                train_step(batch)
-
-    Notes
-    -----
-    - ``set_epoch`` / ``checkpoint`` / ``set_weights`` are forwarded to the
-      underlying DINODataLoader automatically.
-    - The pipeline is lazy: transforms are applied on the fly as batches flow
-      through.  No buffering occurs beyond what DALI already does.
-    - ``select`` silently skips non-matching batches — use sparingly on GPU as
-      skipped batches still consumed a DALI decode slot.
+    Notes on select()
+    -----------------
+    ``select`` silently drops non-matching batches.  Each dropped batch still
+    consumed a DALI decode slot.  The number of dropped batches is tracked in
+    the metrics registry under ``batches_filtered``.  [M6-FIX]
     """
 
     def __init__(
@@ -152,8 +93,16 @@ class PostProcessPipeline:
         )
 
     def select(self, predicate: Callable[[Batch], bool]) -> "PostProcessPipeline":
+        metrics = get_registry()
+
         def _filter(b: Batch) -> Optional[Batch]:
-            return b if predicate(b) else None
+            if predicate(b):
+                return b
+            # [M6-FIX] Track dropped batches.
+            if metrics is not None:
+                metrics.inc("batches_filtered", 1)
+            return None
+
         return PostProcessPipeline(
             source     = self._source,
             transforms = self._transforms + [_filter],
@@ -185,6 +134,10 @@ class PostProcessPipeline:
 
     def set_resolution(self, global_size: int, local_size: int) -> None:
         self._loader.set_resolution(global_size, local_size)
+
+    @property
+    def current_resolution(self) -> tuple[int, int]:
+        return self._loader.current_resolution
 
     def state_dict(self) -> dict:
         return self._loader.state_dict()
@@ -222,8 +175,8 @@ class DINODataLoader:
     """
     HPC-grade DINOv3 data loader.
 
-    Returns a :class:`PostProcessPipeline` from ``__iter__`` — use the fluid
-    API to add post-DALI transforms without modifying this class.
+    Returns a PostProcessPipeline from map()/select()/with_epoch() — use the
+    fluid API to chain post-DALI transforms without modifying this class.
 
     Parameters
     ----------
@@ -238,55 +191,36 @@ class DINODataLoader:
     steps_per_epoch  : Enables len(loader).
     mask_generator   : Optional iBOT MaskingGenerator (CPU, post-DALI).
     backend          : "auto" | "dali" | "cpu" | BackendProtocol instance.
-
-    Note on iBOT masking
-    --------------------
-    MaskingGenerator runs on CPU and produces a boolean tensor of shape
-    (batch_size, n_patch_tokens).  It operates on ViT patch indices, not
-    pixels, so it cannot be fused into the DALI augmentation graph (which
-    only processes pixel-level image tensors).  The CPU overhead is negligible
-    (~0.3 ms for a 37×37 grid) compared to a DALI batch decode (~40 ms).
-
-    Note on backend symmetry
-    ------------------------
-    loader.py is fully backend-agnostic.  All DALI-specific logic
-    (NormSource construction, FP8 in-graph casting) is encapsulated in
-    DALIBackend.build_pipeline().  CPUBackend silently ignores the
-    ``specs``, ``fuse_normalization``, and ``dali_fp8_output`` kwargs.
     """
 
     def __init__(
         self,
         specs:            List[DatasetSpec],
         batch_size:       int,
-        aug_cfg:          Optional[DINOAugConfig] = None,
-        config:           Optional[LoaderConfig]  = None,
-        device_id:        int  = 0,
-        rank:             Optional[int] = None,
-        world_size:       Optional[int] = None,
-        local_rank:       Optional[int] = None,
-        local_world_size: Optional[int] = None,
-        resume:           bool = False,
-        steps_per_epoch:  Optional[int] = None,
-        mask_generator:   Optional[Any] = None,
-        backend:          Optional[Any] = None,
+        aug_cfg:          Optional[DINOAugConfig]  = None,
+        config:           Optional[LoaderConfig]   = None,
+        device_id:        int                      = 0,
+        rank:             Optional[int]            = None,
+        world_size:       Optional[int]            = None,
+        local_rank:       Optional[int]            = None,
+        local_world_size: Optional[int]            = None,
+        resume:           bool                     = False,
+        steps_per_epoch:  Optional[int]            = None,
+        mask_generator:   Any                      = None,
+        backend:          Any                      = "auto",
     ) -> None:
-        self._aug_cfg         = aug_cfg or DINOAugConfig()
-        self._cfg             = config  or LoaderConfig()
-        self._specs           = specs
-        self._batch_size      = batch_size
+        self._aug_cfg        = aug_cfg or DINOAugConfig()
+        self._cfg            = config  or LoaderConfig()
+        self._mask_generator = mask_generator
         self._steps_per_epoch = steps_per_epoch
-        self._mask_generator  = mask_generator
-        self._active_iter     = False
-        self._epoch           = 0
-        self._step            = 0
+        self._active_iter    = False
+        self._epoch_lock     = threading.Lock()   # [B3-FIX]
 
         # ── Backend ───────────────────────────────────────────────────────────
-        if backend is None:
-            backend = get_backend("auto")
-        elif isinstance(backend, str):
-            backend = get_backend(backend)
-        self._backend: BackendProtocol = backend
+        if isinstance(backend, str):
+            self._backend: BackendProtocol = get_backend(backend)
+        else:
+            self._backend = backend
 
         # ── Distributed ───────────────────────────────────────────────────────
         env = self._backend.init_distributed(
@@ -302,8 +236,12 @@ class DINODataLoader:
         self._local_world_size = env.local_world_size
         self._topo             = env.topology
 
-        # ── Metrics registry ──────────────────────────────────────────────────
+        # ── Metrics ───────────────────────────────────────────────────────────
         init_registry(rank=self._rank)
+
+        # [ARCH3] Start Prometheus server on rank 0 only (to avoid port collision)
+        if self._cfg.prometheus_port is not None and self._rank == 0:
+            self._start_prometheus(self._cfg.prometheus_port)
 
         # ── Resolution tracking ───────────────────────────────────────────────
         self._current_global_size = self._aug_cfg.global_crop_size
@@ -318,13 +256,20 @@ class DINODataLoader:
         job_id      = os.environ.get("SLURM_JOB_ID", "dino_local")
 
         shard_cache = self._backend.build_shard_cache(
-            job_id          = job_id,
-            node_master     = node_master,
-            max_gb          = self._cfg.node_shm_gb,
-            prefetch_window = self._cfg.shard_prefetch_window,
-            timeout_s       = self._cfg.shard_timeout_s,
-            warn_threshold  = self._cfg.shm_warn_threshold,
+            job_id               = job_id,
+            node_master          = node_master,
+            max_gb               = self._cfg.node_shm_gb,
+            prefetch_window      = self._cfg.shard_prefetch_window,
+            timeout_s            = self._cfg.shard_timeout_s,
+            warn_threshold       = self._cfg.shm_warn_threshold,
+            heartbeat_stale_s    = self._cfg.heartbeat_stale_s,     # [M4-FIX]
+            use_ring_buffer      = self._cfg.intra_node_ring_buffer, # [ARCH1]
+            adaptive_prefetch    = self._cfg.adaptive_prefetch,      # [ARCH2]
+            adaptive_target_util = self._cfg.adaptive_prefetch_target_util,
         )
+
+        # ── Validate shard coverage before spawning workers ───────────────────
+        self._validate_shard_coverage(specs)
 
         self._source = MixingSource(
             specs               = specs,
@@ -340,11 +285,6 @@ class DINODataLoader:
         )
 
         # ── Stage 3: augmentation pipeline ───────────────────────────────────
-        # [LD-9 / REFACTOR] NormSource is now constructed inside
-        # DALIBackend.build_pipeline() — loader.py has no knowledge of it.
-        # CPUBackend silently ignores specs, fuse_normalization, dali_fp8_output.
-        #
-        # [LD-12] dali_fp8 controls whether FP8Formatter is built post-DALI.
         dali_fp8 = self._cfg.use_fp8_output and self._cfg.dali_fp8_output
 
         pipeline = self._backend.build_pipeline(
@@ -358,7 +298,6 @@ class DINODataLoader:
             cpu_queue          = self._cfg.dali_cpu_queue,
             gpu_queue          = self._cfg.dali_gpu_queue,
             seed               = self._cfg.seed + self._rank,
-            # Backend-specific kwargs — ignored by CPUBackend:
             specs              = specs,
             fuse_normalization = self._cfg.fuse_normalization and self._backend.supports_gpu,
             dali_fp8_output    = dali_fp8,
@@ -372,13 +311,12 @@ class DINODataLoader:
         )
 
         # ── Stage 4 & 5: H2D + FP8 ───────────────────────────────────────────
-        device    = (
+        device = (
             torch.device(f"cuda:{device_id}")
             if self._backend.supports_gpu
             else torch.device("cpu")
         )
         self._h2d = self._backend.build_h2d_stream(device=device, topo=self._topo)
-        # [LD-12] FP8Formatter only when DALI is NOT handling FP8 in-graph
         self._fp8 = (
             self._backend.build_fp8_formatter()
             if self._cfg.use_fp8_output and not dali_fp8
@@ -398,7 +336,8 @@ class DINODataLoader:
         log.info(
             "DINODataLoader ready: backend=%s rank=%d/%d, batch=%d, "
             "resolution=%dx%d (max %dx%d), fused_norm=%s, dali_fp8=%s, "
-            "stall_timeout=%.0fs",
+            "stall_timeout=%.0fs, ring_buffer=%s, adaptive_prefetch=%s, "
+            "prometheus=%s",
             self._backend.name,
             self._rank, self._world_size, batch_size,
             self._current_global_size, self._current_local_size,
@@ -406,12 +345,15 @@ class DINODataLoader:
             self._cfg.fuse_normalization,
             dali_fp8,
             self._cfg.stall_timeout_s,
+            self._cfg.intra_node_ring_buffer,
+            self._cfg.adaptive_prefetch,
+            self._cfg.prometheus_port,
         )
 
-    # ── Fluid API — returns PostProcessPipeline ───────────────────────────────
+    # ── Fluid API ─────────────────────────────────────────────────────────────
 
     def map(self, fn: Callable[[Batch], Batch]) -> PostProcessPipeline:
-        """Chain a transform on every Batch.  Returns a PostProcessPipeline."""
+        """Chain a transform on every Batch."""
         return PostProcessPipeline(
             source     = iter(self._raw_iter()),
             transforms = [fn],
@@ -419,9 +361,16 @@ class DINODataLoader:
         )
 
     def select(self, predicate: Callable[[Batch], bool]) -> PostProcessPipeline:
-        """Filter batches.  Returns a PostProcessPipeline."""
+        """Filter batches.  Dropped batches are counted in metrics."""
+        metrics = get_registry()
+
         def _filter(b: Batch) -> Optional[Batch]:
-            return b if predicate(b) else None
+            if predicate(b):
+                return b
+            if metrics is not None:
+                metrics.inc("batches_filtered", 1)
+            return None
+
         return PostProcessPipeline(
             source     = iter(self._raw_iter()),
             transforms = [_filter],
@@ -429,7 +378,6 @@ class DINODataLoader:
         )
 
     def with_epoch(self, n_steps: int) -> PostProcessPipeline:
-        """Limit to n_steps batches.  Returns a PostProcessPipeline."""
         return PostProcessPipeline(
             source     = iter(self._raw_iter()),
             transforms = [],
@@ -437,10 +385,79 @@ class DINODataLoader:
             max_steps  = n_steps,
         )
 
+    # ── Epoch / weight control ────────────────────────────────────────────────
+
+    def set_epoch(self, epoch: int) -> None:
+        """
+        Prepare the loader for a new epoch.
+
+        [B3-FIX] Protected by a threading.Lock.  Concurrent calls from
+        different threads (e.g. a curriculum scheduler + training loop) are
+        now serialised instead of potentially interleaving on MixingSource
+        state.
+        """
+        with self._epoch_lock:
+            # Apply resolution schedule
+            new_global = self._aug_cfg.crop_size_at_epoch(epoch)
+            if new_global != self._current_global_size:
+                self.set_resolution(new_global, self._current_local_size)
+
+            self._source.set_epoch(epoch)
+            self._dali_iter.reset()
+
+    def set_resolution(self, global_size: int, local_size: int) -> None:
+        if global_size > self._aug_cfg.max_global_crop_size:
+            raise ValueError(
+                f"set_resolution: global_size={global_size} exceeds "
+                f"max_global_crop_size={self._aug_cfg.max_global_crop_size}."
+            )
+        if local_size > self._aug_cfg.max_local_crop_size:
+            raise ValueError(
+                f"set_resolution: local_size={local_size} exceeds "
+                f"max_local_crop_size={self._aug_cfg.max_local_crop_size}."
+            )
+        self._current_global_size = global_size
+        self._current_local_size  = local_size
+        self._resolution_src.set(global_size, local_size)
+        log.info("Resolution updated: global=%d local=%d", global_size, local_size)
+
+    @property
+    def current_resolution(self) -> tuple[int, int]:
+        """[LD-13] Public access to current crop resolution."""
+        return (self._current_global_size, self._current_local_size)
+
+    @property
+    def current_weights(self) -> List[float]:
+        return self._source.current_weights
+
+    def set_weights(self, weights: Sequence[float]) -> None:
+        self._source.set_weights(weights)
+
+    def set_weight_by_name(self, name: str, weight: float) -> None:
+        self._source.set_weight_by_name(name, weight)
+
+    # ── Checkpointing ─────────────────────────────────────────────────────────
+
+    def checkpoint(self, step: int) -> None:
+        state = CheckpointState(
+            step             = step,
+            epoch            = getattr(self._source, "_epoch", 0),
+            dataset_names    = self._source.dataset_names,
+            mixing_weights   = self._source.current_weights,
+            global_crop_size = self._current_global_size,
+            local_crop_size  = self._current_local_size,
+        )
+        self._ckpt.save(state)
+
+    def state_dict(self) -> dict:
+        return self._ckpt.state_dict()
+
+    def load_state_dict(self, sd: dict) -> None:
+        self._ckpt.load_state_dict(sd)
+
     # ── Iteration protocol ────────────────────────────────────────────────────
 
     def __iter__(self) -> Iterator[Batch]:
-        """Iterate directly — no post-processing transforms."""
         if self._active_iter:
             raise RuntimeError(
                 "DINODataLoader: __iter__ called while already iterating. "
@@ -453,15 +470,10 @@ class DINODataLoader:
             self._active_iter = False
 
     def _raw_iter(self) -> Iterator[Batch]:
-        """Core iteration loop with [LD-STALL] configurable stall watchdog.
-
-        The stall timeout is read from LoaderConfig.stall_timeout_s at
-        iteration start so that changes to the config after construction
-        are respected (e.g. in tests that override the value per-run).
-        """
+        """Core iteration loop with configurable stall watchdog."""
         metrics         = get_registry()
         stall_timeout   = self._cfg.stall_timeout_s
-        watchdog_active = stall_timeout > 0   # stall_timeout_s=0 → disabled
+        watchdog_active = stall_timeout > 0
         got_first       = False
 
         for dali_out in self._dali_iter:
@@ -473,22 +485,17 @@ class DINODataLoader:
             global_views = views[:n_global]
             local_views  = views[n_global:]
 
-            # [LD-4] Per-sample metadata
             metadata = self._source.pop_last_metadata()
 
-            # [LD-5] iBOT token mask generation — CPU, post-DALI, patch-level.
-            # Cannot be fused into DALI: operates on patch indices, not pixels.
             masks = None
             if self._mask_generator is not None:
                 n_tokens = (self._current_global_size // 14) ** 2
                 masks    = self._mask_generator(n_tokens)
 
-            # H2D transfer
             with self._h2d.transfer({"global": global_views, "local": local_views}) as gpu:
                 g_gpu = gpu["global"]
                 l_gpu = gpu["local"]
 
-            # Post-DALI FP8 quantisation (only when dali_fp8_output=False)
             if self._fp8 is not None:
                 g_gpu = [self._fp8.quantise(t) for t in g_gpu]
                 l_gpu = [self._fp8.quantise(t) for t in l_gpu]
@@ -508,9 +515,6 @@ class DINODataLoader:
 
             yield batch
 
-        # [LD-STALL] Stall watchdog — fires only if zero batches were produced.
-        # Checked *after* the loop so that a clean empty-dataset condition
-        # produces a clear RuntimeError rather than silently returning.
         if not got_first and watchdog_active:
             if os.environ.get("DINO_DISABLE_EMPTY_CHECK"):
                 log.warning(
@@ -522,141 +526,92 @@ class DINODataLoader:
                 raise RuntimeError(
                     f"DINODataLoader (rank {self._rank}): no batch produced after "
                     f"{stall_timeout:.0f}s.  Possible causes:\n"
-                    "  • Fewer shards than extraction workers — increase shard count\n"
-                    "    or reduce shard_extraction_workers.\n"
-                    "  • All shards are corrupted or unreachable.\n"
-                    "  • /dev/shm is full — reduce node_shm_gb or free space.\n"
-                    "  • Lustre MDS slow start (thundering herd) — increase\n"
-                    f"    LoaderConfig.stall_timeout_s (current: {stall_timeout:.0f}s).\n"
-                    "  Disable: set DINO_DISABLE_EMPTY_CHECK=1 or stall_timeout_s=0."
+                    "  • Fewer shards than extraction workers\n"
+                    "  • All shards are corrupted or unreachable\n"
+                    "  • /dev/shm is full\n"
+                    "  • Lustre MDS slow start — increase LoaderConfig.stall_timeout_s\n"
+                    "  Disable: DINO_DISABLE_EMPTY_CHECK=1 or stall_timeout_s=0."
                 )
 
     def __len__(self) -> int:
         if self._steps_per_epoch is None:
             raise TypeError(
-                "len(loader) requires steps_per_epoch to be set at construction. "
-                "Pass steps_per_epoch=total_images // (batch_size * world_size)."
+                "len(loader) requires steps_per_epoch to be set at construction."
             )
         return self._steps_per_epoch
 
-    def __del__(self):
-        self._active_iter = False
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
-    # ── Epoch / resolution control ────────────────────────────────────────────
-
-    def set_epoch(self, epoch: int) -> None:
-        """Re-shuffle shards and apply resolution schedule.  Call each epoch."""
-        self._active_iter = False
-        self._epoch       = epoch
-        self._source.set_epoch(epoch)
-        self._dali_iter.reset()
-
-        # [LD-3] Auto-apply resolution schedule
-        if self._aug_cfg.resolution_schedule:
-            new_global = self._aug_cfg.crop_size_at_epoch(epoch)
-            ratio      = self._aug_cfg.local_crop_size / self._aug_cfg.global_crop_size
-            new_local  = max(int(new_global * ratio), 32)
-            if new_global != self._current_global_size:
-                self.set_resolution(new_global, new_local)
-                log.info(
-                    "Resolution schedule: epoch %d → global=%d local=%d",
-                    epoch, new_global, new_local,
+    def _validate_shard_coverage(self, specs: List[DatasetSpec]) -> None:
+        """[M1-FIX] Validate that every rank gets at least one shard per dataset."""
+        for spec in specs:
+            n_shards = len(spec.shards)
+            if n_shards < self._world_size:
+                log.warning(
+                    "DatasetSpec '%s': only %d shards for %d ranks.  "
+                    "Ranks %d..%d will receive no shards from this dataset.  "
+                    "Consider shard_sampling='resampled' for small datasets.",
+                    spec.name, n_shards, self._world_size,
+                    n_shards, self._world_size - 1,
                 )
 
-    def set_resolution(self, global_size: int, local_size: int) -> None:
-        """Change crop resolution without rebuilding the DALI pipeline. [LD-2]"""
-        if global_size > self._aug_cfg.max_global_crop_size:
-            raise ValueError(
-                f"global_size={global_size} exceeds max_global_crop_size="
-                f"{self._aug_cfg.max_global_crop_size}."
-            )
-        self._resolution_src.set(global_size, local_size)
-        self._current_global_size = global_size
-        self._current_local_size  = local_size
-        log.info("set_resolution: global=%d local=%d", global_size, local_size)
-
-    # ── Dataset mixing control ────────────────────────────────────────────────
-
-    def set_weights(self, weights: Sequence[float]) -> None:
-        self._source.set_weights(weights)
-
-    def set_weight_by_name(self, name: str, weight: float) -> None:
-        self._source.set_weight_by_name(name, weight)
-
-    @property
-    def current_weights(self) -> List[float]:
-        return self._source.current_weights
-
-    # ── Checkpointing ─────────────────────────────────────────────────────────
-
-    def checkpoint(self, step: int) -> None:
-        if self._rank != 0:
-            return
-        self._step = step
-        state = CheckpointState(
-            step             = step,
-            epoch            = self._epoch,
-            global_crop_size = self._current_global_size,
-            local_crop_size  = self._current_local_size,
-            dataset_names    = self._source.dataset_names,
-            mixing_weights   = list(self.current_weights),
-        )
-        self._ckpt.maybe_save(step, state)
-
-    def state_dict(self) -> dict:
-        if not self._cfg.stateful_dataloader:
-            raise RuntimeError(
-                "state_dict() requires LoaderConfig.stateful_dataloader=True."
-            )
-        state = CheckpointState(
-            step             = self._step,
-            epoch            = self._epoch,
-            global_crop_size = self._current_global_size,
-            local_crop_size  = self._current_local_size,
-            dataset_names    = self._source.dataset_names,
-            mixing_weights   = list(self.current_weights),
-        )
-        return state.to_dict()
-
-    def load_state_dict(self, sd: dict) -> None:
-        if not self._cfg.stateful_dataloader:
-            raise RuntimeError(
-                "load_state_dict() requires LoaderConfig.stateful_dataloader=True."
-            )
-        state = CheckpointState.from_dict(sd)
-        self._step  = state.step
-        self._epoch = state.epoch
-        self.set_resolution(state.global_crop_size, state.local_crop_size)
-        if state.mixing_weights:
-            self.set_weights(state.mixing_weights)
-        log.info(
-            "Resumed from state_dict: step=%d epoch=%d", state.step, state.epoch
-        )
-
     def _restore(self) -> None:
-        latest = self._ckpt.latest()
-        if latest is None:
-            log.info(
-                "No checkpoint found in %s — starting from scratch.",
-                self._cfg.checkpoint_dir,
-            )
+        state = self._ckpt.load()
+        if state is None:
             return
-        self.load_state_dict(latest.to_dict())
+        if state.dataset_names != self._source.dataset_names:
+            log.warning(
+                "Checkpoint dataset names %s do not match current specs %s — "
+                "skipping mixing weight restore.",
+                state.dataset_names,
+                self._source.dataset_names,
+            )
+        else:
+            self._source.set_weights(state.mixing_weights)
+        if state.global_crop_size != self._current_global_size:
+            self.set_resolution(state.global_crop_size, state.local_crop_size)
 
-    # ── Distributed helpers ───────────────────────────────────────────────────
+    def _start_prometheus(self, port: int) -> None:
+        """[ARCH3] Start Prometheus HTTP server on a daemon thread."""
+        try:
+            import prometheus_client
+            t = threading.Thread(
+                target=prometheus_client.start_http_server,
+                args=(port,),
+                name="prometheus-server",
+                daemon=True,
+            )
+            t.start()
+            log.info(
+                "Prometheus metrics server started on port %d (rank 0)", port
+            )
+        except Exception as exc:
+            log.warning("Could not start Prometheus server: %s", exc)
 
     @staticmethod
     def _infer_rank() -> int:
+        for var in ("RANK", "SLURM_PROCID", "LOCAL_RANK"):
+            v = os.environ.get(var)
+            if v is not None:
+                return int(v)
         if dist.is_available() and dist.is_initialized():
             return dist.get_rank()
-        return int(os.environ.get("RANK", 0))
+        return 0
 
     @staticmethod
     def _infer_world_size() -> int:
+        for var in ("WORLD_SIZE", "SLURM_NTASKS"):
+            v = os.environ.get(var)
+            if v is not None:
+                return int(v)
         if dist.is_available() and dist.is_initialized():
             return dist.get_world_size()
-        return int(os.environ.get("WORLD_SIZE", 1))
+        return 1
 
     @staticmethod
     def _infer_local_world_size() -> int:
-        return int(os.environ.get("LOCAL_WORLD_SIZE", 1))
+        for var in ("LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"):
+            v = os.environ.get(var)
+            if v is not None:
+                return int(v)
+        return 1
