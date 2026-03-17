@@ -12,7 +12,6 @@ Changes in this version
 [CFG-S4]  LoaderConfig.fuse_normalization — DALI-fused per-dataset norm (retained).
 [CFG-S5]  LoaderConfig.dali_fp8_output — in-graph FP8 cast (retained).
 [CFG-S6]  LoaderConfig.stall_timeout_s — configurable watchdog timeout (retained).
-[CFG-REFACTOR] DatasetSpec moved to dino_loader.datasets.spec (retained).
 
 New in this version
 -------------------
@@ -60,8 +59,7 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
-# ── [CFG-REFACTOR] DatasetSpec re-exported for backward compatibility ─────────
-from dino_loader.datasets.spec import DatasetSpec  # noqa: F401
+from dino_datasets.spec import DatasetSpec
 
 
 # ── Augmentation ──────────────────────────────────────────────────────────────

@@ -29,13 +29,12 @@ New in this version
 - ResolutionSource exposed for advanced pipeline customisation
 """
 
-from dino_loader.config import DatasetSpec, DINOAugConfig, LoaderConfig
+from dino_loader.config import DINOAugConfig, LoaderConfig
 
 import logging
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "DatasetSpec",
     "DINOAugConfig",
     "LoaderConfig",
 ]

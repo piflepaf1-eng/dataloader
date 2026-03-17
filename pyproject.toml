@@ -11,22 +11,18 @@ dependencies = [
     "torch~=2.10",
     "torchvision~=0.25",
     "numpy~=2.0",
-
     # ── WebDataset ────────────────────────────────────────────────────────────
     "webdataset~=1.0",
-
     # ── Async I/O ─────────────────────────────────────────────────────────────
     "aiofiles~=25.1",
-
     # ── Monitoring / CLI ──────────────────────────────────────────────────────
     "rich~=14.3",
     "psutil~=7.2",
-
     # ── Config parsing ────────────────────────────────────────────────────────
     "tomli~=2.4",
-
     # ── Pillow: CPU backend augmentation pipeline ─────────────────────────────
     "pillow~=11.0",
+    "dino-datasets",
 ]
 
 # ── Optional GPU-only / cluster dependencies ──────────────────────────────────
@@ -94,6 +90,9 @@ markers = [
     "slow: long-running integration tests",
 ]
 timeout = 120
+
+[tool.uv.sources]
+dino-datasets = { git = "https://github.com/piflepaf1-eng/dino_datasets" }
 
 [build-system]
 requires      = ["hatchling"]

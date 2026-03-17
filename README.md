@@ -29,7 +29,8 @@ HPC clusters backed by Lustre parallel filesystems.
 ## Quick start
 
 ```python
-from dino_loader import DatasetSpec, DINOAugConfig, DINODataLoader, LoaderConfig, slurm_init
+from dino_loader import DINOAugConfig, DINODataLoader, LoaderConfig, slurm_init
+from dino_dataset import DatasetSpec
 
 env = slurm_init()          # reads SLURM env vars, sets NCCL knobs, inits process group
 
