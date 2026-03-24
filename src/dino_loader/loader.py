@@ -1,53 +1,59 @@
-"""
-dino_loader.loader
-==================
+"""dino_loader.loader.
+
 DINODataLoader: the single public entry point for training code.
 
 Changes in this version
 -----------------------
-[LD-1..LD-12] All previous changes retained (see previous version header).
+[LD-AUG-1]  ``aug_spec`` parameter replaces ``aug_cfg`` in ``DINODataLoader``.
+            Pass any ``AugmentationSpec`` subclass — ``DinoV2AugSpec``
+            (default), ``EvalAugSpec``, ``LeJEPAAugSpec``, or
+            ``UserAugSpec``.  The old ``aug_cfg`` kwarg is accepted for
+            backward compatibility and silently wrapped in
+            ``DinoV2AugSpec(aug_cfg=aug_cfg)``.
 
-[B3-FIX]  set_epoch() is now guarded by a threading.Lock.              ← FIX B3
-          Previously two concurrent calls (e.g. from PostProcessPipeline
-          and a background scheduler thread) could interleave, corrupting
-          the MixingSource epoch state.  A reentrant guard also prevents
-          starting a new epoch loop while the previous is still active.
+[LD-AUG-2]  ``sample_predicate`` parameter added to ``DINODataLoader``.
+            An optional ``SamplePredicate`` callable is forwarded to
+            ``MixingSource`` so that samples failing the predicate are
+            discarded *before* entering the DALI pipeline (zero decode cost).
 
-[M6-FIX]  PostProcessPipeline.select() now tracks filtered batches.   ← FIX M6
-          A ``batches_filtered`` counter is incremented in the metrics
-          registry for each batch dropped by select().  Cumulative and
-          per-step filtering rates are exposed so operators can detect
-          mis-calibrated min_sample_quality or quality predicates.
+[LD-AUG-3]  ``PostProcessPipeline.select()`` still works as before for
+            post-decode filtering, but the docstring now explicitly guides
+            users toward ``sample_predicate`` for metadata-based filtering.
 
-[LD-13]   current_resolution property exposed publicly.               ← NEW
-          Replaces direct access to ``loader._current_global_size``
-          (which appeared in train.py and user code).  Returns a
-          ``(global_size, local_size)`` tuple.
-
-[ARCH1]   Ring buffer flag forwarded to build_shard_cache.            ← WIRING
-[ARCH2]   Adaptive prefetch flags forwarded to build_shard_cache.     ← WIRING
-[ARCH3]   Prometheus metrics server started if prometheus_port is set. ← WIRING
+[B3-FIX]    set_epoch() threading.Lock (retained).
+[M6-FIX]    PostProcessPipeline.select() metrics (retained).
+[LD-13]     current_resolution public property (retained).
+[ARCH1..3]  All architectural options retained.
 """
 
 from __future__ import annotations
 
-import fcntl
 import logging
 import os
 import threading
 import time
-from typing import Any, Callable, Iterator, List, Optional, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 import torch
 import torch.distributed as dist
 
+from dino_loader.augmentation import (
+    AugmentationSpec,
+    DinoV2AugSpec,
+    EvalAugSpec,
+    LeJEPAAugSpec,
+    SamplePredicate,
+    UserAugSpec,
+)
 from dino_loader.backends          import get_backend
 from dino_loader.backends.protocol import BackendProtocol
 from dino_loader.checkpoint        import DataLoaderCheckpointer
-from dino_loader.config            import CheckpointState, DatasetSpec, DINOAugConfig, LoaderConfig
+from dino_loader.config            import CheckpointState, DINOAugConfig, LoaderConfig
 from dino_loader.memory            import Batch
 from dino_loader.mixing_source     import MixingSource, ResolutionSource
 from dino_loader.monitor.metrics   import get_registry, init_registry
+
+from dino_datasets import DatasetSpec
 
 log = logging.getLogger(__name__)
 
@@ -57,25 +63,31 @@ log = logging.getLogger(__name__)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class PostProcessPipeline:
-    """
-    A lazy, composable wrapper over a Batch iterator.
+    """Lazy, composable wrapper over a Batch iterator.
 
     Each method returns a new PostProcessPipeline; the original is not mutated.
     Transforms execute only as batches flow through — no buffering.
 
-    Notes on select()
-    -----------------
-    ``select`` silently drops non-matching batches.  Each dropped batch still
-    consumed a DALI decode slot.  The number of dropped batches is tracked in
-    the metrics registry under ``batches_filtered``.  [M6-FIX]
+    Filtering guidance
+    ------------------
+    ``select()`` drops batches *after* DALI decode, H2D transfer, and optional
+    FP8 cast.  It is appropriate for filtering that requires inspecting decoded
+    pixel values (e.g. blank-image detection, perceptual quality models).
+
+    For filtering that can be expressed on metadata alone (quality score,
+    class label, domain tag, …), always prefer ``DINODataLoader``'s
+    ``sample_predicate`` parameter, which rejects samples *before* DALI
+    decode at near-zero cost.
+
+    [M6-FIX] Dropped batches increment ``batches_filtered`` in MetricsRegistry.
     """
 
     def __init__(
         self,
         source:     Iterator[Batch],
-        transforms: List[Callable],
+        transforms: list[Callable],
         loader:     "DINODataLoader",
-        max_steps:  Optional[int] = None,
+        max_steps:  int | None = None,
     ) -> None:
         self._source     = source
         self._transforms = transforms
@@ -85,6 +97,7 @@ class PostProcessPipeline:
     # ── Fluent chaining ───────────────────────────────────────────────────────
 
     def map(self, fn: Callable[[Batch], Batch]) -> "PostProcessPipeline":
+        """Apply ``fn`` to every batch."""
         return PostProcessPipeline(
             source     = self._source,
             transforms = self._transforms + [fn],
@@ -93,12 +106,20 @@ class PostProcessPipeline:
         )
 
     def select(self, predicate: Callable[[Batch], bool]) -> "PostProcessPipeline":
+        """Drop batches for which ``predicate`` returns False.
+
+        Note: filtering happens *after* DALI decode.  For metadata-based
+        filtering, use ``DINODataLoader(sample_predicate=...)`` instead to
+        avoid the decode cost entirely.
+
+        [M6-FIX] Each dropped batch increments ``batches_filtered`` in the
+        MetricsRegistry.
+        """
         metrics = get_registry()
 
-        def _filter(b: Batch) -> Optional[Batch]:
+        def _filter(b: Batch) -> Batch | None:
             if predicate(b):
                 return b
-            # [M6-FIX] Track dropped batches.
             if metrics is not None:
                 metrics.inc("batches_filtered", 1)
             return None
@@ -111,6 +132,7 @@ class PostProcessPipeline:
         )
 
     def with_epoch(self, n_steps: int) -> "PostProcessPipeline":
+        """Limit iteration to ``n_steps`` batches per epoch."""
         return PostProcessPipeline(
             source     = self._source,
             transforms = self._transforms,
@@ -118,31 +140,39 @@ class PostProcessPipeline:
             max_steps  = n_steps,
         )
 
-    # ── Delegation to underlying DINODataLoader ───────────────────────────────
+    # ── Delegation ────────────────────────────────────────────────────────────
 
     def set_epoch(self, epoch: int) -> None:
+        """Delegate to underlying loader."""
         self._loader.set_epoch(epoch)
 
     def checkpoint(self, step: int) -> None:
+        """Delegate to underlying loader."""
         self._loader.checkpoint(step)
 
     def set_weights(self, weights: Sequence[float]) -> None:
+        """Delegate to underlying loader."""
         self._loader.set_weights(weights)
 
     def set_weight_by_name(self, name: str, weight: float) -> None:
+        """Delegate to underlying loader."""
         self._loader.set_weight_by_name(name, weight)
 
     def set_resolution(self, global_size: int, local_size: int) -> None:
+        """Delegate to underlying loader."""
         self._loader.set_resolution(global_size, local_size)
 
     @property
     def current_resolution(self) -> tuple[int, int]:
+        """Current crop resolution."""
         return self._loader.current_resolution
 
     def state_dict(self) -> dict:
+        """Delegate to underlying loader."""
         return self._loader.state_dict()
 
     def load_state_dict(self, sd: dict) -> None:
+        """Delegate to underlying loader."""
         self._loader.load_state_dict(sd)
 
     # ── Iteration ─────────────────────────────────────────────────────────────
@@ -152,7 +182,7 @@ class PostProcessPipeline:
         for batch in self._source:
             if self._max_steps is not None and step >= self._max_steps:
                 break
-            result = batch
+            result: Batch | None = batch
             for fn in self._transforms:
                 if result is None:
                     break
@@ -172,49 +202,103 @@ class PostProcessPipeline:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DINODataLoader:
-    """
-    HPC-grade DINOv3 data loader.
+    """HPC-grade data loader for DINO-style self-supervised training.
 
-    Returns a PostProcessPipeline from map()/select()/with_epoch() — use the
-    fluid API to chain post-DALI transforms without modifying this class.
+    Augmentation strategies
+    -----------------------
+    Pass an ``AugmentationSpec`` to ``aug_spec`` to select the augmentation
+    strategy at construction time:
+
+    * ``DinoV2AugSpec(aug_cfg)`` — DINOv2 multi-crop (default).
+    * ``EvalAugSpec(crop_size=224)`` — deterministic resize + centre-crop.
+    * ``LeJEPAAugSpec(...)`` — one context + N target crops (LeJEPA).
+    * ``UserAugSpec(aug_fn, output_map)`` — custom function on GPU tensors.
+
+    Early sample filtering
+    ----------------------
+    ``sample_predicate`` accepts any ``SamplePredicate`` callable that is
+    evaluated *before* JPEG decoding, at zero decode cost.  Use this for
+    metadata-based filtering (quality score, class label, domain, …).
+
+    For post-decode filtering (e.g. blank-image detection), use the fluid API::
+
+        loader.select(lambda batch: not is_blank(batch))
 
     Parameters
     ----------
-    specs            : List of DatasetSpec.
-    batch_size       : Per-GPU batch size.
-    aug_cfg          : DINOAugConfig.
-    config           : LoaderConfig.
-    device_id        : Local GPU index.
-    rank / world_size / local_rank / local_world_size
-                     : Distributed identity.
-    resume           : Load latest dataloader checkpoint if available.
-    steps_per_epoch  : Enables len(loader).
-    mask_generator   : Optional iBOT MaskingGenerator (CPU, post-DALI).
-    backend          : "auto" | "dali" | "cpu" | BackendProtocol instance.
+    specs:
+        List of ``DatasetSpec`` objects describing the training data.
+    batch_size:
+        Per-GPU batch size.
+    aug_spec:
+        Augmentation strategy.  Defaults to ``DinoV2AugSpec(DINOAugConfig())``.
+        Pass ``aug_cfg`` (legacy) to wrap it automatically.
+    aug_cfg:
+        Legacy parameter.  If provided without ``aug_spec``, it is wrapped in
+        ``DinoV2AugSpec(aug_cfg=aug_cfg)``.
+    config:
+        Loader runtime configuration.
+    device_id:
+        Local GPU index.
+    rank / world_size / local_rank / local_world_size:
+        Distributed identity.
+    resume:
+        Load the latest checkpoint on construction.
+    steps_per_epoch:
+        Enables ``len(loader)``.
+    mask_generator:
+        Optional iBOT ``MaskingGenerator`` (CPU, post-DALI).
+    sample_predicate:
+        Optional callable ``(SampleMeta) → bool`` evaluated before DALI
+        decode.  Return ``False`` to discard a sample.
+    backend:
+        ``"auto"`` | ``"dali"`` | ``"cpu"`` | ``BackendProtocol`` instance.
     """
 
     def __init__(
         self,
-        specs:            List[DatasetSpec],
+        specs:            list[DatasetSpec],
         batch_size:       int,
-        aug_cfg:          Optional[DINOAugConfig]  = None,
-        config:           Optional[LoaderConfig]   = None,
-        device_id:        int                      = 0,
-        rank:             Optional[int]            = None,
-        world_size:       Optional[int]            = None,
-        local_rank:       Optional[int]            = None,
-        local_world_size: Optional[int]            = None,
-        resume:           bool                     = False,
-        steps_per_epoch:  Optional[int]            = None,
-        mask_generator:   Any                      = None,
-        backend:          Any                      = "auto",
+        aug_spec:         AugmentationSpec | None   = None,
+        aug_cfg:          DINOAugConfig | None      = None,   # legacy compat
+        config:           LoaderConfig | None       = None,
+        device_id:        int                       = 0,
+        rank:             int | None                = None,
+        world_size:       int | None                = None,
+        local_rank:       int | None                = None,
+        local_world_size: int | None                = None,
+        resume:           bool                      = False,
+        steps_per_epoch:  int | None                = None,
+        mask_generator:   Any                       = None,
+        sample_predicate: SamplePredicate | None    = None,
+        backend:          Any                       = "auto",
     ) -> None:
-        self._aug_cfg        = aug_cfg or DINOAugConfig()
-        self._cfg            = config  or LoaderConfig()
-        self._mask_generator = mask_generator
+        # ── Backward-compat: wrap legacy aug_cfg in DinoV2AugSpec ─────────────
+        if aug_spec is None:
+            effective_aug_cfg = aug_cfg if aug_cfg is not None else DINOAugConfig()
+            self._aug_spec: AugmentationSpec = DinoV2AugSpec(aug_cfg=effective_aug_cfg)
+        else:
+            if aug_cfg is not None:
+                log.warning(
+                    "DINODataLoader: both aug_spec and aug_cfg provided; "
+                    "aug_cfg is ignored (aug_spec takes precedence)."
+                )
+            self._aug_spec = aug_spec
+
+        # Keep a reference to the DINOAugConfig for resolution scheduling
+        # (only relevant for DinoV2AugSpec and LeJEPAAugSpec).
+        self._aug_cfg: DINOAugConfig = (
+            self._aug_spec.aug_cfg  # type: ignore[attr-defined]
+            if isinstance(self._aug_spec, DinoV2AugSpec)
+            else DINOAugConfig()
+        )
+
+        self._cfg             = config or LoaderConfig()
+        self._mask_generator  = mask_generator
+        self._sample_predicate = sample_predicate
         self._steps_per_epoch = steps_per_epoch
-        self._active_iter    = False
-        self._epoch_lock     = threading.Lock()   # [B3-FIX]
+        self._active_iter     = False
+        self._epoch_lock      = threading.Lock()  # [B3-FIX]
 
         # ── Backend ───────────────────────────────────────────────────────────
         if isinstance(backend, str):
@@ -239,13 +323,13 @@ class DINODataLoader:
         # ── Metrics ───────────────────────────────────────────────────────────
         init_registry(rank=self._rank)
 
-        # [ARCH3] Start Prometheus server on rank 0 only (to avoid port collision)
         if self._cfg.prometheus_port is not None and self._rank == 0:
             self._start_prometheus(self._cfg.prometheus_port)
 
         # ── Resolution tracking ───────────────────────────────────────────────
-        self._current_global_size = self._aug_cfg.global_crop_size
-        self._current_local_size  = self._aug_cfg.local_crop_size
+        # For non-DinoV2 specs, we use fixed sizes from the spec.
+        self._current_global_size = self._initial_global_size()
+        self._current_local_size  = self._initial_local_size()
         self._resolution_src      = ResolutionSource(
             self._current_global_size,
             self._current_local_size,
@@ -262,13 +346,12 @@ class DINODataLoader:
             prefetch_window      = self._cfg.shard_prefetch_window,
             timeout_s            = self._cfg.shard_timeout_s,
             warn_threshold       = self._cfg.shm_warn_threshold,
-            heartbeat_stale_s    = self._cfg.heartbeat_stale_s,     # [M4-FIX]
-            use_ring_buffer      = self._cfg.intra_node_ring_buffer, # [ARCH1]
-            adaptive_prefetch    = self._cfg.adaptive_prefetch,      # [ARCH2]
+            heartbeat_stale_s    = self._cfg.heartbeat_stale_s,
+            use_ring_buffer      = self._cfg.intra_node_ring_buffer,
+            adaptive_prefetch    = self._cfg.adaptive_prefetch,
             adaptive_target_util = self._cfg.adaptive_prefetch_target_util,
         )
 
-        # ── Validate shard coverage before spawning workers ───────────────────
         self._validate_shard_coverage(specs)
 
         self._source = MixingSource(
@@ -282,14 +365,14 @@ class DINODataLoader:
             device_id           = device_id,
             shuffle_buffer_size = self._cfg.shuffle_buffer_size,
             debug_log_keys      = self._cfg.debug_log_keys,
+            sample_predicate    = sample_predicate,  # [PRED-1]
         )
 
         # ── Stage 3: augmentation pipeline ───────────────────────────────────
-        dali_fp8 = self._cfg.use_fp8_output and self._cfg.dali_fp8_output
-
         pipeline = self._backend.build_pipeline(
             source             = self._source,
-            aug_cfg            = self._aug_cfg,
+            aug_spec           = self._aug_spec,
+            aug_cfg            = self._aug_cfg,  # passed for backward compat with DALIBackend
             batch_size         = batch_size,
             num_threads        = self._cfg.dali_num_threads,
             device_id          = device_id,
@@ -300,13 +383,13 @@ class DINODataLoader:
             seed               = self._cfg.seed + self._rank,
             specs              = specs,
             fuse_normalization = self._cfg.fuse_normalization and self._backend.supports_gpu,
-            dali_fp8_output    = dali_fp8,
+            dali_fp8_output    = self._cfg.use_fp8_output and self._cfg.dali_fp8_output,
         )
 
-        output_map      = [f"view_{i}" for i in range(self._aug_cfg.n_views)]
         self._dali_iter = self._backend.build_pipeline_iterator(
             pipeline   = pipeline,
-            output_map = output_map,
+            aug_spec   = self._aug_spec,
+            output_map = self._aug_spec.output_map,
             batch_size = batch_size,
         )
 
@@ -316,6 +399,7 @@ class DINODataLoader:
             if self._backend.supports_gpu
             else torch.device("cpu")
         )
+        dali_fp8 = self._cfg.use_fp8_output and self._cfg.dali_fp8_output
         self._h2d = self._backend.build_h2d_stream(device=device, topo=self._topo)
         self._fp8 = (
             self._backend.build_fp8_formatter()
@@ -334,21 +418,42 @@ class DINODataLoader:
             self._restore()
 
         log.info(
-            "DINODataLoader ready: backend=%s rank=%d/%d, batch=%d, "
-            "resolution=%dx%d (max %dx%d), fused_norm=%s, dali_fp8=%s, "
-            "stall_timeout=%.0fs, ring_buffer=%s, adaptive_prefetch=%s, "
-            "prometheus=%s",
+            "DINODataLoader ready: backend=%s rank=%d/%d batch=%d "
+            "aug=%s resolution=%dx%d sample_predicate=%s",
             self._backend.name,
             self._rank, self._world_size, batch_size,
+            type(self._aug_spec).__name__,
             self._current_global_size, self._current_local_size,
-            self._aug_cfg.max_global_crop_size, self._aug_cfg.max_local_crop_size,
-            self._cfg.fuse_normalization,
-            dali_fp8,
-            self._cfg.stall_timeout_s,
-            self._cfg.intra_node_ring_buffer,
-            self._cfg.adaptive_prefetch,
-            self._cfg.prometheus_port,
+            "yes" if sample_predicate is not None else "no",
         )
+
+    # ── Augmentation spec helpers ─────────────────────────────────────────────
+
+    def _initial_global_size(self) -> int:
+        match self._aug_spec:
+            case DinoV2AugSpec(aug_cfg=cfg):
+                return cfg.global_crop_size
+            case EvalAugSpec(crop_size=s):
+                return s
+            case LeJEPAAugSpec(context_crop_size=s):
+                return s
+            case UserAugSpec(decode_size=s):
+                return s
+            case _:
+                return 224
+
+    def _initial_local_size(self) -> int:
+        match self._aug_spec:
+            case DinoV2AugSpec(aug_cfg=cfg):
+                return cfg.local_crop_size
+            case EvalAugSpec(crop_size=s):
+                return s
+            case LeJEPAAugSpec(target_crop_size=s):
+                return s
+            case UserAugSpec(decode_size=s):
+                return s
+            case _:
+                return 96
 
     # ── Fluid API ─────────────────────────────────────────────────────────────
 
@@ -361,10 +466,14 @@ class DINODataLoader:
         )
 
     def select(self, predicate: Callable[[Batch], bool]) -> PostProcessPipeline:
-        """Filter batches.  Dropped batches are counted in metrics."""
+        """Drop batches post-decode.
+
+        For metadata-based filtering, prefer ``sample_predicate`` in the
+        constructor to avoid decode cost entirely.
+        """
         metrics = get_registry()
 
-        def _filter(b: Batch) -> Optional[Batch]:
+        def _filter(b: Batch) -> Batch | None:
             if predicate(b):
                 return b
             if metrics is not None:
@@ -378,6 +487,7 @@ class DINODataLoader:
         )
 
     def with_epoch(self, n_steps: int) -> PostProcessPipeline:
+        """Limit to ``n_steps`` batches per epoch."""
         return PostProcessPipeline(
             source     = iter(self._raw_iter()),
             transforms = [],
@@ -385,36 +495,39 @@ class DINODataLoader:
             max_steps  = n_steps,
         )
 
-    # ── Epoch / weight control ────────────────────────────────────────────────
+    # ── Epoch / weight / resolution control ──────────────────────────────────
 
     def set_epoch(self, epoch: int) -> None:
-        """
-        Prepare the loader for a new epoch.
-
-        [B3-FIX] Protected by a threading.Lock.  Concurrent calls from
-        different threads (e.g. a curriculum scheduler + training loop) are
-        now serialised instead of potentially interleaving on MixingSource
-        state.
-        """
+        """Prepare for a new epoch.  [B3-FIX] Thread-safe."""
         with self._epoch_lock:
-            # Apply resolution schedule
-            new_global = self._aug_cfg.crop_size_at_epoch(epoch)
-            if new_global != self._current_global_size:
-                self.set_resolution(new_global, self._current_local_size)
+            if isinstance(self._aug_spec, DinoV2AugSpec):
+                new_global = self._aug_spec.aug_cfg.crop_size_at_epoch(epoch)
+                if new_global != self._current_global_size:
+                    self.set_resolution(new_global, self._current_local_size)
 
             self._source.set_epoch(epoch)
             self._dali_iter.reset()
 
     def set_resolution(self, global_size: int, local_size: int) -> None:
-        if global_size > self._aug_cfg.max_global_crop_size:
-            raise ValueError(
-                f"set_resolution: global_size={global_size} exceeds "
-                f"max_global_crop_size={self._aug_cfg.max_global_crop_size}."
-            )
-        if local_size > self._aug_cfg.max_local_crop_size:
-            raise ValueError(
-                f"set_resolution: local_size={local_size} exceeds "
-                f"max_local_crop_size={self._aug_cfg.max_local_crop_size}."
+        """Update crop resolution (only meaningful for DinoV2AugSpec)."""
+        if isinstance(self._aug_spec, DinoV2AugSpec):
+            if global_size > self._aug_spec.aug_cfg.max_global_crop_size:
+                msg = (
+                    f"set_resolution: global_size={global_size} exceeds "
+                    f"max_global_crop_size={self._aug_spec.aug_cfg.max_global_crop_size}."
+                )
+                raise ValueError(msg)
+            if local_size > self._aug_spec.aug_cfg.max_local_crop_size:
+                msg = (
+                    f"set_resolution: local_size={local_size} exceeds "
+                    f"max_local_crop_size={self._aug_spec.aug_cfg.max_local_crop_size}."
+                )
+                raise ValueError(msg)
+        else:
+            log.warning(
+                "set_resolution called on a %s — resolution changes have no effect "
+                "for non-DinoV2 augmentation specs.",
+                type(self._aug_spec).__name__,
             )
         self._current_global_size = global_size
         self._current_local_size  = local_size
@@ -423,22 +536,31 @@ class DINODataLoader:
 
     @property
     def current_resolution(self) -> tuple[int, int]:
-        """[LD-13] Public access to current crop resolution."""
+        """Current crop resolution (global_size, local_size)."""
         return (self._current_global_size, self._current_local_size)
 
     @property
-    def current_weights(self) -> List[float]:
+    def aug_spec(self) -> AugmentationSpec:
+        """The augmentation spec this loader was constructed with."""
+        return self._aug_spec
+
+    @property
+    def current_weights(self) -> list[float]:
+        """Current normalised dataset mixing weights."""
         return self._source.current_weights
 
     def set_weights(self, weights: Sequence[float]) -> None:
+        """Update mixing weights (re-normalised automatically)."""
         self._source.set_weights(weights)
 
     def set_weight_by_name(self, name: str, weight: float) -> None:
+        """Update one dataset's weight by name."""
         self._source.set_weight_by_name(name, weight)
 
     # ── Checkpointing ─────────────────────────────────────────────────────────
 
     def checkpoint(self, step: int) -> None:
+        """Save a checkpoint (rank 0 only, every N steps)."""
         state = CheckpointState(
             step             = step,
             epoch            = getattr(self._source, "_epoch", 0),
@@ -450,19 +572,27 @@ class DINODataLoader:
         self._ckpt.save(state)
 
     def state_dict(self) -> dict:
+        """Return checkpoint state as a plain dict."""
+        if not self._cfg.stateful_dataloader:
+            msg = (
+                "state_dict() requires stateful_dataloader=True in LoaderConfig."
+            )
+            raise RuntimeError(msg)
         return self._ckpt.state_dict()
 
     def load_state_dict(self, sd: dict) -> None:
+        """Restore from a state dict."""
         self._ckpt.load_state_dict(sd)
 
     # ── Iteration protocol ────────────────────────────────────────────────────
 
     def __iter__(self) -> Iterator[Batch]:
         if self._active_iter:
-            raise RuntimeError(
+            msg = (
                 "DINODataLoader: __iter__ called while already iterating. "
                 "Call set_epoch() before starting a new epoch loop."
             )
+            raise RuntimeError(msg)
         self._active_iter = True
         try:
             yield from self._raw_iter()
@@ -470,42 +600,19 @@ class DINODataLoader:
             self._active_iter = False
 
     def _raw_iter(self) -> Iterator[Batch]:
-        """Core iteration loop with configurable stall watchdog."""
         metrics         = get_registry()
         stall_timeout   = self._cfg.stall_timeout_s
-        watchdog_active = stall_timeout > 0
         got_first       = False
 
         for dali_out in self._dali_iter:
-            got_first = True
-            t0        = time.perf_counter()
+            got_first   = True
+            t0          = time.perf_counter()
 
-            views        = [dali_out[0][f"view_{i}"] for i in range(self._aug_cfg.n_views)]
-            n_global     = self._aug_cfg.n_global_crops
-            global_views = views[:n_global]
-            local_views  = views[n_global:]
+            views        = [dali_out[0][name] for name in self._aug_spec.output_map]
+            metadata     = self._source.pop_last_metadata()
 
-            metadata = self._source.pop_last_metadata()
-
-            masks = None
-            if self._mask_generator is not None:
-                n_tokens = (self._current_global_size // 14) ** 2
-                masks    = self._mask_generator(n_tokens)
-
-            with self._h2d.transfer({"global": global_views, "local": local_views}) as gpu:
-                g_gpu = gpu["global"]
-                l_gpu = gpu["local"]
-
-            if self._fp8 is not None:
-                g_gpu = [self._fp8.quantise(t) for t in g_gpu]
-                l_gpu = [self._fp8.quantise(t) for t in l_gpu]
-
-            batch = Batch(
-                global_crops = g_gpu,
-                local_crops  = l_gpu,
-                metadata     = metadata,
-                masks        = masks,
-            )
+            # ── Route views into Batch ─────────────────────────────────────────
+            batch = self._build_batch(views, metadata)
 
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
             if metrics:
@@ -515,7 +622,7 @@ class DINODataLoader:
 
             yield batch
 
-        if not got_first and watchdog_active:
+        if not got_first and stall_timeout > 0:
             if os.environ.get("DINO_DISABLE_EMPTY_CHECK"):
                 log.warning(
                     "DINODataLoader rank %d: no batch produced but "
@@ -523,27 +630,85 @@ class DINODataLoader:
                     self._rank,
                 )
             else:
-                raise RuntimeError(
+                msg = (
                     f"DINODataLoader (rank {self._rank}): no batch produced after "
                     f"{stall_timeout:.0f}s.  Possible causes:\n"
                     "  • Fewer shards than extraction workers\n"
                     "  • All shards are corrupted or unreachable\n"
                     "  • /dev/shm is full\n"
+                    "  • sample_predicate rejected every sample\n"
                     "  • Lustre MDS slow start — increase LoaderConfig.stall_timeout_s\n"
                     "  Disable: DINO_DISABLE_EMPTY_CHECK=1 or stall_timeout_s=0."
                 )
+                raise RuntimeError(msg)
+
+    def _build_batch(
+        self,
+        views:    list[Any],
+        metadata: list[dict | None],
+    ) -> Batch:
+        """Build a Batch from pipeline output views, routing to H2D and FP8.
+
+        Routing depends on the augmentation spec type:
+        - DinoV2AugSpec: split into global_crops + local_crops (existing layout).
+        - EvalAugSpec: single view → global_crops=[view_0], local_crops=[].
+        - LeJEPAAugSpec: context → global_crops, targets → local_crops.
+        - UserAugSpec: user dict is re-mapped to global_crops/local_crops based
+          on output_map ordering (first half → global, rest → local).
+        """
+        match self._aug_spec:
+            case DinoV2AugSpec(aug_cfg=cfg):
+                n_global     = cfg.n_global_crops
+                global_views = views[:n_global]
+                local_views  = views[n_global:]
+            case EvalAugSpec():
+                global_views = views
+                local_views  = []
+            case LeJEPAAugSpec():
+                # context is index 0; targets are 1..N
+                global_views = [views[0]]
+                local_views  = views[1:]
+            case UserAugSpec():
+                # Split at midpoint by convention; user can override via map().
+                mid          = max(1, len(views) // 2)
+                global_views = views[:mid]
+                local_views  = views[mid:]
+            case _:
+                global_views = views
+                local_views  = []
+
+        # H2D transfer
+        with self._h2d.transfer({"global": global_views, "local": local_views}) as gpu:
+            g_gpu = gpu["global"]
+            l_gpu = gpu["local"]
+
+        # Optional FP8 quantisation
+        if self._fp8 is not None:
+            g_gpu = [self._fp8.quantise(t) for t in g_gpu]
+            l_gpu = [self._fp8.quantise(t) for t in l_gpu]
+
+        # Optional iBOT masks (DinoV2 only)
+        masks = None
+        if self._mask_generator is not None and isinstance(self._aug_spec, DinoV2AugSpec):
+            n_tokens = (self._current_global_size // 14) ** 2
+            masks    = self._mask_generator(n_tokens)
+
+        return Batch(
+            global_crops = g_gpu,
+            local_crops  = l_gpu,
+            metadata     = metadata,
+            masks        = masks,
+        )
 
     def __len__(self) -> int:
         if self._steps_per_epoch is None:
-            raise TypeError(
-                "len(loader) requires steps_per_epoch to be set at construction."
-            )
+            msg = "len(loader) requires steps_per_epoch to be set at construction."
+            raise TypeError(msg)
         return self._steps_per_epoch
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _validate_shard_coverage(self, specs: List[DatasetSpec]) -> None:
-        """[M1-FIX] Validate that every rank gets at least one shard per dataset."""
+    def _validate_shard_coverage(self, specs: list[DatasetSpec]) -> None:
         for spec in specs:
             n_shards = len(spec.shards)
             if n_shards < self._world_size:
@@ -572,19 +737,16 @@ class DINODataLoader:
             self.set_resolution(state.global_crop_size, state.local_crop_size)
 
     def _start_prometheus(self, port: int) -> None:
-        """[ARCH3] Start Prometheus HTTP server on a daemon thread."""
         try:
             import prometheus_client
             t = threading.Thread(
-                target=prometheus_client.start_http_server,
-                args=(port,),
-                name="prometheus-server",
-                daemon=True,
+                target  = prometheus_client.start_http_server,
+                args    = (port,),
+                name    = "prometheus-server",
+                daemon  = True,
             )
             t.start()
-            log.info(
-                "Prometheus metrics server started on port %d (rank 0)", port
-            )
+            log.info("Prometheus metrics server started on port %d (rank 0)", port)
         except Exception as exc:
             log.warning("Could not start Prometheus server: %s", exc)
 

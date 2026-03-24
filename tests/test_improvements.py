@@ -37,7 +37,7 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from tests.fixtures import make_minimal_tar_bytes, write_shm_file
+from tests.fixtures import write_shm_file
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -312,7 +312,6 @@ class TestMixingSourceVectorised:
 
     def test_weights_respected_statistically(self):
         """With weights [0.9, 0.1], dataset 0 should win ~90% of the time."""
-        import numpy as np
         src     = self._make_source([0.9, 0.1])
         N       = 1_000
         indices = [src._draw_dataset_index() for _ in range(N)]

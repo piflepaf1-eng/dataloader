@@ -34,7 +34,7 @@ Public API
 
 from __future__ import annotations
 
-from typing import Literal, Optional, Union
+from typing import Literal
 
 from dino_loader.backends.protocol import BackendProtocol  # noqa: F401
 

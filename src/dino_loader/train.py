@@ -43,10 +43,8 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 
 import torch
-import transformer_engine.pytorch as te
 
 from dino_loader import (
     DatasetSpec,

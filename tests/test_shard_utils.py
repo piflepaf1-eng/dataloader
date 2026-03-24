@@ -9,7 +9,6 @@ All tests use in-memory or tmp-dir synthetic shards, no Lustre required.
 from __future__ import annotations
 
 import io
-import struct
 import sys
 import tarfile
 from pathlib import Path

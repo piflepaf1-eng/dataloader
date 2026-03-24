@@ -13,7 +13,6 @@ Tests for the new confidentiality-aware filesystem configuration:
 
 from __future__ import annotations
 
-import os
 import struct
 import sys
 import textwrap
@@ -258,7 +257,6 @@ class TestResolvePathForConfidentiality:
         reg = ConfidentialityRegistry()
         reg._bootstrapped = True  # suppress auto-discovery
         with pytest.raises(KeyError, match="register_confidentiality"):
-            from dino_loader.datasets import settings
             # Bypass the singleton; call the method directly on a clean instance
             mount = reg.get("nonexistent_xyz_99")
             if mount is None:
@@ -294,7 +292,7 @@ class TestDatasetResolveMultiMount:
         _scaffold(pub,  name="ds_filter")
         _scaffold(priv, name="ds_filter")
 
-        from dino_loader.datasets.settings import ConfidentialityRegistry, ConfidentialityMount
+        from dino_loader.datasets.settings import ConfidentialityRegistry
         reg = ConfidentialityRegistry()
         reg._bootstrapped = True
         reg.register("public",  pub)
@@ -319,7 +317,7 @@ class TestDatasetResolveMultiMount:
         reg._bootstrapped = True
         reg.register("ghost", tmp_path / "does_not_exist")
 
-        from dino_loader.datasets.dataset import Dataset, GlobalDatasetFilter
+        from dino_loader.datasets.dataset import Dataset
         with patch("dino_loader.datasets.dataset.get_confidentiality_mounts", reg.all):
             ds = Dataset("whatever")
             shards = ds.resolve()

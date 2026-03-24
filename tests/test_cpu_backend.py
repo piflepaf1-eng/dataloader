@@ -20,8 +20,6 @@ Coverage
 
 from __future__ import annotations
 
-import io
-import struct
 import sys
 from pathlib import Path
 
@@ -34,10 +32,9 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from tests.fixtures import make_shard_tar, write_shard
+from tests.fixtures import write_shard
 from dino_loader.backends.cpu import (
     CPUAugPipeline,
-    CPUBackend,
     CPUPipelineIterator,
     InProcessShardCache,
     NullFP8Formatter,
@@ -46,7 +43,6 @@ from dino_loader.backends.cpu import (
     StubDistribEnv,
     _augment_one,
 )
-from dino_loader.config import DINOAugConfig
 from dino_loader.mixing_source import ResolutionSource
 
 

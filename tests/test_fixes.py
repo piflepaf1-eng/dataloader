@@ -31,7 +31,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import List
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import numpy as np
@@ -120,7 +119,7 @@ class TestEvictForLockedB2:
 
     def test_evict_raises_when_all_slots_pinned(self, tmp_path):
         """If no entry can be evicted (all ref>0), raise RuntimeError after retries."""
-        from dino_loader.shard_cache import NodeSharedShardCache, _MMAP_POOL_MAX
+        from dino_loader.shard_cache import NodeSharedShardCache
         import asyncio
 
         # Patch _EVICT_RETRIES to 1 for speed
@@ -232,7 +231,6 @@ class TestNormSourceM2:
 
     def test_set_indices_is_full_replacement(self):
         """set_dataset_indices must atomically replace the list."""
-        from dino_loader.pipeline import NormSource
         ns = self._make_norm_source(3)
         ns.set_dataset_indices([0, 1, 2])
         ns.set_dataset_indices([2, 1])
@@ -242,7 +240,6 @@ class TestNormSourceM2:
 
     def test_call_returns_copies(self):
         """Returned arrays must be independent copies (not views of _lookup)."""
-        from dino_loader.pipeline import NormSource
         ns = self._make_norm_source(1)
         ns.set_dataset_indices([0])
         means1, _ = ns()
@@ -254,7 +251,6 @@ class TestNormSourceM2:
 
     def test_concurrent_set_and_call(self):
         """Concurrent set_dataset_indices and __call__ must not raise."""
-        from dino_loader.pipeline import NormSource
         ns = self._make_norm_source(4)
         ns.set_dataset_indices([0, 1, 2, 3])
         errors = []

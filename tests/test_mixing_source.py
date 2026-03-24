@@ -10,10 +10,8 @@ shards, so they exercise the actual WebDataset extraction path.
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 _SRC = str(Path(__file__).parent.parent / "src")
@@ -196,7 +194,6 @@ class TestShardIterator:
 
     def test_quality_filter_drops_low_scores(self, tmp_path):
         """Samples with quality_score < 0.5 are filtered when min_sample_quality=0.5."""
-        from tests.fixtures import write_shard
         scores = [0.1, 0.9, 0.1, 0.9]
         tar_path, _ = write_shard(tmp_path, n_samples=4, with_metadata=True,
                                    quality_scores=scores)

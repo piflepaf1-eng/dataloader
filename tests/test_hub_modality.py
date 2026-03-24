@@ -38,26 +38,20 @@ Filesystem fixture used by most tests
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
-import os
 import sys
-import types
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
 
 _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from tests.fixtures import scaffold_dataset_dir, write_shard
+from tests.fixtures import scaffold_dataset_dir
 from dino_loader.datasets.stub_gen import (
     generate_stubs_to_dir,
     compute_registry_hash,
     hub_is_stale,
-    read_hub_hash,
     _HASH_FILENAME,
 )
 from dino_loader.datasets.dataset import GlobalDatasetFilter, _merge_filters
@@ -455,7 +449,6 @@ class TestMergeFilters:
         assert result.allowed_splits     == ["val"]   # override wins
 
     def test_override_strategy_wins_when_non_default(self):
-        from dino_loader.datasets.dataset import DEFAULT_STRATEGY
         b  = self._f(strategy="v2")
         ov = self._f(strategy="experimental")
         result = _merge_filters(b, ov)
@@ -529,7 +522,8 @@ class TestModalitiesCLI:
 
     def test_modalities_command_in_argparse(self):
         """The 'modalities' subcommand must be registered in main()."""
-        import subprocess, sys
+        import subprocess
+        import sys
         # We can't easily invoke main() without mounts; just verify the
         # 'modalities' command appears in --help output.
         result = subprocess.run(

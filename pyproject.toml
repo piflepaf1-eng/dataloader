@@ -24,6 +24,17 @@ dependencies = [
     "pillow~=11.0",
     "dino-datasets",
     "dino-env",
+    "nvidia-dali-cuda120>=2.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest~=8.0",
+    "pytest-timeout~=2.3",
+    "pytest-mock~=3.14",
+    "pytest-cov",
+    "ruff",
+    "ty",
 ]
 
 # ── Optional GPU-only / cluster dependencies ──────────────────────────────────
@@ -56,27 +67,6 @@ monitoring = [
     # Prometheus metrics endpoint (LoaderConfig.prometheus_port != None).
     # [ARCH3] Enables the opt-in Prometheus HTTP server.
     "prometheus-client~=0.21",
-]
-
-# Dev / test extras
-dev = [
-    "pytest~=8.0",
-    "pytest-timeout~=2.3",
-    # For test_improvements.py mocking
-    "pytest-mock~=3.14",
-]
-
-all = [
-    "dino_loader[gpu]",
-    "dino_loader[monitoring]",
-    "dino_loader[dev]",
-]
-
-[dependency-groups]
-dev = [
-    "pytest~=8.0",
-    "pytest-timeout~=2.3",
-    "pytest-mock~=3.14",
 ]
 
 [tool.dino_loader.datasets]
