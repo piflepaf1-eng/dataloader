@@ -50,7 +50,6 @@ in nightly CI only.
 
 from __future__ import annotations
 
-import os
 import sys
 import time
 from pathlib import Path
@@ -76,9 +75,9 @@ pytestmark = [
     pytest.mark.skipif(not HAS_TORCH, reason="torch not installed"),
 ]
 
-from tests.fixtures import scaffold_dataset_dir, write_shard
+from tests.fixtures import scaffold_dataset_dir
 from dino_loader.backends.cpu import InProcessShardCache
-from dino_loader.config import DatasetSpec
+from dino_datasets import DatasetSpec
 from dino_loader.mixing_source import MixingSource, ShardIterator
 
 

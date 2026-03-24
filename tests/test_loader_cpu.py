@@ -24,10 +24,8 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 
@@ -570,7 +568,6 @@ class TestLoaderBackendSwitch:
 
     def test_get_backend_auto_returns_cpu_without_dali(self):
         """In a test environment without DALI, auto should pick CPU."""
-        import importlib
         try:
             import nvidia.dali  # noqa: F401
             pytest.skip("DALI is installed; auto-select would pick DALI")

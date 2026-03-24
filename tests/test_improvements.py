@@ -8,7 +8,8 @@ stable references used in commit messages and the changelog.
 
 Coverage
 --------
-Item #1  — AsyncPrefetchIterator: genuine background prefetch overlap
+Item #1  — DALI queue-based buffering replaces AsyncPrefetchIterator
+           (verify removal and that dali_cpu_queue compensates)
 Item #2  — _MmapPool: persistent pool, ref-counting, LRU eviction
 Item #3  — NodeSharedShardCache._write: no fsync on tmpfs; atomic rename
 Item #4  — MixingSource.__call__: vectorised np.rng.choice dataset selection
@@ -17,10 +18,6 @@ Item #7  — DataLoaderCheckpointer: LATEST pointer, crash-safe discovery
 Item #9  — Queue depth metric wired (MetricField.MIXING_QUEUE_DEPTH != 0)
 Item #11 — ShardIterator.reservoir_size property exists and returns a positive int
 Item #12 — pyproject.toml has pinned dependency versions (smoke test)
-
-Out of scope (covered in test_fixes.py)
-----------------------------------------
-B1 — AsyncPrefetchIterator race-free exception path (see TestAsyncPrefetchIteratorB1)
 """
 
 from __future__ import annotations
@@ -32,88 +29,89 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-# ---------------------------------------------------------------------------
 _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from tests.fixtures import make_minimal_tar_bytes, write_shm_file
+from tests.fixtures import write_shm_file
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Item #1 — AsyncPrefetchIterator: genuine background prefetch
+# Item #1 — DALI queue-based buffering (AsyncPrefetchIterator removed)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestAsyncPrefetchIterator:
+class TestDALIQueueBuffering:
+    """DALI's prefetch queues now provide all pipeline buffering.
+
+    AsyncPrefetchIterator has been removed.  These tests verify:
+    1. The class is gone from the codebase.
+    2. dali_cpu_queue is large enough to compensate.
+    3. _raw_iter is a simple for-loop over self._dali_iter (no Future layer).
     """
-    AsyncPrefetchIterator must overlap background fetch with foreground compute.
 
-    Note: exception-propagation and race-condition behaviour is tested in
-    ``test_fixes.py::TestAsyncPrefetchIteratorB1``.
-    """
-
-    def _make(self, source, h2d=None):
-        from dino_loader.memory import AsyncPrefetchIterator
-        return AsyncPrefetchIterator(source, h2d=h2d or MagicMock())
-
-    def test_yields_all_items_in_order(self):
-        items  = list(range(10))
-        it     = self._make(iter(items))
-        result = list(it)
-        it.close()
-        assert result == items
-
-    def test_raises_stop_iteration_after_exhaustion(self):
-        it = self._make(iter([1, 2]))
-        assert next(it) == 1
-        assert next(it) == 2
-        with pytest.raises(StopIteration):
-            next(it)
-        it.close()
-
-    def test_background_prefetch_overlaps_with_compute(self):
-        """
-        Wall time must be meaningfully shorter than serial execution.
-
-        Each item takes DELAY to fetch and DELAY × 0.8 to "process".  With
-        genuine overlap, elapsed time is dominated by the slowest of the two,
-        not their sum.
-        """
-        DELAY   = 0.05    # 50 ms per DALI fetch
-        N_ITEMS = 5
-
-        def slow_iter():
-            for x in range(N_ITEMS):
-                time.sleep(DELAY)
-                yield x
-
-        it      = self._make(slow_iter())
-        t0      = time.perf_counter()
-        results = []
-        for val in it:
-            results.append(val)
-            time.sleep(DELAY * 0.8)   # simulate GPU compute
-        elapsed     = time.perf_counter() - t0
-        serial_time = N_ITEMS * (DELAY + DELAY * 0.8)
-        it.close()
-
-        assert results == list(range(N_ITEMS))
-        assert elapsed < serial_time * 0.85, (
-            f"Expected background prefetch overlap: "
-            f"elapsed={elapsed:.3f}s, serial={serial_time:.3f}s"
+    def test_async_prefetch_iterator_not_in_memory_module(self):
+        """AsyncPrefetchIterator must no longer be importable from memory.py."""
+        import dino_loader.memory as m
+        assert not hasattr(m, "AsyncPrefetchIterator"), (
+            "AsyncPrefetchIterator still exists in memory.py — it should be removed."
         )
 
-    def test_close_stops_iteration(self):
-        it = self._make(iter(range(100)))
-        next(it)
-        it.close()
-        with pytest.raises(StopIteration):
-            next(it)
+    def test_async_prefetch_iterator_not_in_loader(self):
+        """loader.py must not reference AsyncPrefetchIterator."""
+        loader_path = Path(_SRC) / "dino_loader" / "loader.py"
+        assert "AsyncPrefetchIterator" not in loader_path.read_text(), (
+            "loader.py still references AsyncPrefetchIterator."
+        )
 
-    def test_double_close_is_safe(self):
-        it = self._make(iter([1, 2, 3]))
-        it.close()
-        it.close()   # must not raise
+    def test_dali_cpu_queue_default_compensates(self):
+        """Default dali_cpu_queue must be ≥ 16 after AsyncPrefetchIterator removal."""
+        from dino_loader.config import LoaderConfig
+        cfg = LoaderConfig()
+        assert cfg.dali_cpu_queue >= 16, (
+            f"dali_cpu_queue={cfg.dali_cpu_queue} is insufficient; "
+            "set to ≥ 16 to replace AsyncPrefetchIterator buffering."
+        )
+
+    def test_raw_iter_is_simple_for_loop(self):
+        """_raw_iter must iterate directly over self._dali_iter (no threading)."""
+        import inspect
+        from dino_loader.loader import DINODataLoader
+        src = inspect.getsource(DINODataLoader._raw_iter)
+        # Must not contain Future or ThreadPoolExecutor references.
+        assert "Future" not in src
+        assert "ThreadPoolExecutor" not in src
+        assert "executor" not in src.lower()
+        # Must iterate over self._dali_iter directly.
+        assert "self._dali_iter" in src
+
+    def test_concurrent_iteration_produces_correct_batches(self, tmp_path):
+        """End-to-end: multiple sequential epochs produce valid batches."""
+        from tests.fixtures import scaffold_dataset_dir
+        from dino_loader.config import DatasetSpec, DINOAugConfig, LoaderConfig
+        from dino_loader.loader import DINODataLoader
+
+        tar_paths = scaffold_dataset_dir(
+            root=tmp_path, n_shards=2, n_samples_per_shard=8
+        )
+        loader = DINODataLoader(
+            specs      = [DatasetSpec(name="ds", shards=tar_paths, weight=1.0)],
+            batch_size = 4,
+            aug_cfg    = DINOAugConfig(global_crop_size=32, local_crop_size=16,
+                                       n_global_crops=2, n_local_crops=2),
+            config     = LoaderConfig(
+                node_shm_gb=0.1, stall_timeout_s=0,
+                stateful_dataloader=False,
+                checkpoint_dir=str(tmp_path / "ckpt"),
+            ),
+            backend    = "cpu",
+        )
+        from dino_loader.memory import Batch
+        for epoch in range(2):
+            loader.set_epoch(epoch)
+            batch = next(iter(loader))
+            assert isinstance(batch, Batch)
+            assert len(batch.global_crops) == 2
+            assert batch.global_crops[0].shape == (4, 3, 32, 32)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -121,12 +119,7 @@ class TestAsyncPrefetchIterator:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestMmapPool:
-    """
-    _MmapPool wraps a set of /dev/shm files as persistent memory-mapped views.
-
-    Tests use ``write_shm_file`` from ``tests.fixtures`` to produce correctly
-    formatted header + payload files without a running NodeSharedShardCache.
-    """
+    """_MmapPool wraps /dev/shm files as persistent memory-mapped views."""
 
     def test_acquire_opens_mmap(self, tmp_path):
         from dino_loader.shard_cache import _MmapPool
@@ -150,7 +143,7 @@ class TestMmapPool:
         pool = _MmapPool(max_entries=8)
         e1   = pool.acquire(p)
         e2   = pool.acquire(p)
-        assert e1 is e2       # same object — no double mmap
+        assert e1 is e2
         assert e2.refs == 2
         pool.release(p)
         pool.release(p)
@@ -170,7 +163,6 @@ class TestMmapPool:
         pool.close_all()
 
     def test_lru_eviction_closes_unreferenced(self, tmp_path):
-        """When the pool is full, the LRU unreferenced entry must be evicted."""
         from dino_loader.shard_cache import _MmapPool
         pool  = _MmapPool(max_entries=2)
         paths = []
@@ -180,10 +172,8 @@ class TestMmapPool:
             write_shm_file(p, data)
             paths.append(p)
 
-        # Acquire and release shards 0 and 1 (refs → 0, eligible for eviction)
         pool.acquire(paths[0]); pool.release(paths[0])
         pool.acquire(paths[1]); pool.release(paths[1])
-        # Acquiring shard 2 should evict shard 0 (oldest unreferenced)
         pool.acquire(paths[2])
         with pool._lock:
             assert str(paths[0]) not in pool._pool, "Shard 0 should have been evicted"
@@ -205,7 +195,6 @@ class TestMmapPool:
         pool.close_all()
 
     def test_thread_safety(self, tmp_path):
-        """Concurrent acquires / releases must not corrupt ref counts."""
         import threading
         from dino_loader.shard_cache import _MmapPool
 
@@ -220,16 +209,14 @@ class TestMmapPool:
             try:
                 for _ in range(20):
                     pool.acquire(p)
-                    time.sleep(0)     # yield
+                    time.sleep(0)
                     pool.release(p)
             except Exception as exc:
                 errors.append(exc)
 
         threads = [threading.Thread(target=worker) for _ in range(8)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        for t in threads: t.start()
+        for t in threads: t.join()
 
         pool.close_all()
         assert not errors, f"Thread safety violation: {errors}"
@@ -240,12 +227,6 @@ class TestMmapPool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestNodeSharedShardCacheWrite:
-    """
-    _write() must:
-    1. Produce the correct header + payload on disk.
-    2. Not call os.fsync (tmpfs — fsync is a no-op with a cost).
-    3. Clean up the .tmp file if the final rename fails.
-    """
 
     def test_write_produces_correct_content(self, tmp_path):
         from dino_loader.shard_cache import NodeSharedShardCache
@@ -257,7 +238,6 @@ class TestNodeSharedShardCacheWrite:
         assert len(raw) == 16 + len(data), "Header (16 B) + payload"
 
     def test_no_fsync_called(self, tmp_path):
-        """os.fsync must NOT be called on /dev/shm writes."""
         from dino_loader.shard_cache import NodeSharedShardCache
         shm = tmp_path / "nofsync.shm"
         with patch("os.fsync") as mock_fsync:
@@ -265,7 +245,6 @@ class TestNodeSharedShardCacheWrite:
         mock_fsync.assert_not_called()
 
     def test_tmp_cleaned_up_on_rename_failure(self, tmp_path):
-        """If rename() raises, the .tmp file must not be left behind."""
         from dino_loader.shard_cache import NodeSharedShardCache
         shm = tmp_path / "fail.shm"
 
@@ -284,16 +263,9 @@ class TestNodeSharedShardCacheWrite:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestMixingSourceVectorised:
-    """
-    MixingSource must use vectorised np.random.Generator.choice for dataset
-    selection rather than a Python-level loop.
-
-    We verify the statistical property (weights are respected over many draws)
-    rather than inspecting internal implementation details.
-    """
+    """Verify weights are statistically respected over many draws."""
 
     def _make_source(self, weights):
-        """Build a MixingSource with the given per-dataset weights."""
         from dino_loader.mixing_source import MixingSource
         from dino_loader.config import DatasetSpec, LoaderConfig, DINOAugConfig
 
@@ -311,8 +283,6 @@ class TestMixingSourceVectorised:
         assert all(i == 0 for i in indices)
 
     def test_weights_respected_statistically(self):
-        """With weights [0.9, 0.1], dataset 0 should win ~90% of the time."""
-        import numpy as np
         src     = self._make_source([0.9, 0.1])
         N       = 1_000
         indices = [src._draw_dataset_index() for _ in range(N)]
@@ -327,11 +297,6 @@ class TestMixingSourceVectorised:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestMetricField:
-    """
-    Every member of ``MetricField`` must correspond to a field in
-    ``MetricsStruct``.  A mismatch would cause a KeyError at runtime and is
-    caught at import time via the StrEnum validator.
-    """
 
     def test_all_enum_members_are_valid_struct_fields(self):
         from dino_loader.monitor.metrics import MetricField, MetricsStruct
@@ -353,11 +318,6 @@ class TestMetricField:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestCheckpointerLatest:
-    """
-    DataLoaderCheckpointer must maintain a LATEST pointer file that survives
-    pruning and is updated atomically so a crash mid-write leaves no stale
-    state.
-    """
 
     def _state(self, step: int = 100, epoch: int = 1):
         from dino_loader.config import CheckpointState
@@ -382,9 +342,7 @@ class TestCheckpointerLatest:
         for step in (10, 20, 30):
             ckpt.save(self._state(step=step))
         latest_name = (tmp_path / _LATEST_FILE).read_text().strip()
-        assert "000000000030" in latest_name, (
-            f"LATEST should point to step 30, got: {latest_name}"
-        )
+        assert "000000000030" in latest_name
 
     def test_load_uses_latest_pointer(self, tmp_path):
         from dino_loader.checkpoint import DataLoaderCheckpointer
@@ -396,10 +354,6 @@ class TestCheckpointerLatest:
         assert loaded.step == 30
 
     def test_load_falls_back_to_glob_if_no_latest(self, tmp_path):
-        """
-        Backward compatibility: directories written by older versions (without
-        LATEST) must still load correctly via glob-sort fallback.
-        """
         from dino_loader.checkpoint import DataLoaderCheckpointer
         state = self._state(step=50)
         state.save(tmp_path / "dl_state_000000000050.json")
@@ -410,19 +364,15 @@ class TestCheckpointerLatest:
         assert loaded.step == 50
 
     def test_latest_survives_prune(self, tmp_path):
-        """After pruning old checkpoints, LATEST must still point to the newest."""
         from dino_loader.checkpoint import DataLoaderCheckpointer, _LATEST_FILE, _KEEP_LAST
         ckpt = DataLoaderCheckpointer(str(tmp_path), every_n_steps=1, rank=0)
         n    = _KEEP_LAST + 2
         for step in range(1, n + 1):
             ckpt.save(self._state(step=step))
         latest_name = (tmp_path / _LATEST_FILE).read_text().strip()
-        assert f"{n:012d}" in latest_name, (
-            f"LATEST should point to step {n} after prune, got: {latest_name}"
-        )
+        assert f"{n:012d}" in latest_name
 
     def test_latest_tmp_cleaned_up_on_failure(self, tmp_path):
-        """If the LATEST atomic rename fails, no stale .tmp must remain."""
         from dino_loader.checkpoint import DataLoaderCheckpointer, _LATEST_FILE
         ckpt = DataLoaderCheckpointer(str(tmp_path), every_n_steps=1, rank=0)
 
@@ -430,11 +380,9 @@ class TestCheckpointerLatest:
             raise OSError("simulated disk full")
 
         with patch.object(Path, "rename", bad_rename):
-            ckpt.save(self._state(step=5))   # must not raise
+            ckpt.save(self._state(step=5))
 
-        assert not (tmp_path / f"{_LATEST_FILE}.tmp").exists(), (
-            ".tmp must be cleaned up after a failed rename"
-        )
+        assert not (tmp_path / f"{_LATEST_FILE}.tmp").exists()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -442,26 +390,15 @@ class TestCheckpointerLatest:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestQueueDepthMetric:
-    """
-    MetricField.MIXING_QUEUE_DEPTH must be non-zero (i.e. the metric is
-    actually written to by MixingSource) when batches are flowing.
-    """
 
     def test_mixing_queue_depth_field_exists(self):
         from dino_loader.monitor.metrics import MetricField
-        assert hasattr(MetricField, "MIXING_QUEUE_DEPTH"), (
-            "MetricField.MIXING_QUEUE_DEPTH must exist"
-        )
+        assert hasattr(MetricField, "MIXING_QUEUE_DEPTH")
 
     def test_mixing_queue_depth_is_written(self):
-        """
-        After at least one batch is produced, MIXING_QUEUE_DEPTH must be > 0
-        or have been updated at least once.
-        """
         from dino_loader.monitor.metrics import MetricField, init_registry, get_registry
         init_registry(rank=0)
 
-        # Simulate MixingSource writing the metric
         reg = get_registry()
         if reg is not None:
             reg.set(MetricField.MIXING_QUEUE_DEPTH, 3)
@@ -473,16 +410,10 @@ class TestQueueDepthMetric:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestShardIteratorReservoirSize:
-    """
-    ShardIterator must expose a ``reservoir_size`` property that returns a
-    positive integer reflecting the current shuffle buffer capacity.
-    """
 
     def test_reservoir_size_property_exists(self):
         from dino_loader.shard_iterator import ShardIterator
-        assert hasattr(ShardIterator, "reservoir_size"), (
-            "ShardIterator must expose a reservoir_size property"
-        )
+        assert hasattr(ShardIterator, "reservoir_size")
 
     def test_reservoir_size_is_positive(self, tmp_dataset_dir):
         from dino_loader.shard_iterator import ShardIterator
@@ -490,9 +421,7 @@ class TestShardIteratorReservoirSize:
         _, tar_paths = tmp_dataset_dir
         cfg = LoaderConfig(shuffle_buffer_size=16)
         it  = ShardIterator(shards=tar_paths, config=cfg, rank=0, world_size=1)
-        assert it.reservoir_size > 0, (
-            f"reservoir_size must be > 0, got {it.reservoir_size}"
-        )
+        assert it.reservoir_size > 0
 
     def test_reservoir_size_matches_config(self, tmp_dataset_dir):
         from dino_loader.shard_iterator import ShardIterator
@@ -509,11 +438,6 @@ class TestShardIteratorReservoirSize:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestPyprojectToml:
-    """
-    pyproject.toml must exist and declare pinned (``>=x.y.z``) versions for
-    all critical runtime dependencies so that CI and production environments
-    reproduce exactly.
-    """
 
     _REQUIRED_DEPS = (
         "torch",
@@ -531,7 +455,7 @@ class TestPyprojectToml:
             return tomllib.load(f)
 
     def test_pyproject_is_parseable(self):
-        self._load_toml()   # raises if malformed
+        self._load_toml()
 
     def test_required_deps_are_declared(self):
         data = self._load_toml()
@@ -539,14 +463,10 @@ class TestPyprojectToml:
         dep_names = {d.split("[")[0].split(">=")[0].split("==")[0].strip().lower()
                      for d in deps}
         for dep in self._REQUIRED_DEPS:
-            assert dep.lower() in dep_names, (
-                f"Required dependency '{dep}' not found in pyproject.toml"
-            )
+            assert dep.lower() in dep_names
 
     def test_deps_have_version_pins(self):
         data = self._load_toml()
         deps = data.get("project", {}).get("dependencies", [])
         unpinned = [d for d in deps if ">=" not in d and "==" not in d and "~=" not in d]
-        assert not unpinned, (
-            f"Unpinned dependencies in pyproject.toml: {unpinned}"
-        )
+        assert not unpinned, f"Unpinned dependencies: {unpinned}"

@@ -9,7 +9,6 @@ import os
 import threading
 import time
 from contextlib import contextmanager
-from typing import Optional
 
 class ProcessTracer:
     def __init__(self):

@@ -25,17 +25,15 @@ Hierarchy under test (v2)
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
-import pytest
 
 _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from tests.fixtures import scaffold_dataset_dir, write_shard
+from tests.fixtures import scaffold_dataset_dir
 from dino_loader.datasets.cli import (
     add_dataset,
     count_elements,

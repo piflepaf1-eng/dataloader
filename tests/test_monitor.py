@@ -13,7 +13,6 @@ import sys
 import time
 from pathlib import Path
 
-import pytest
 
 _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
