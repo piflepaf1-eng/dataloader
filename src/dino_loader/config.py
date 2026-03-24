@@ -15,6 +15,16 @@ Changes
 [CFG-B4]  use_fp8_output validates TE presence at construction time.
 [CFG-M4]  heartbeat_stale_s configurable (default 300 s).
 [CFG-ARCH3] prometheus_port — opt-in Prometheus metrics endpoint.
+
+Queue sizing note
+-----------------
+dali_cpu_queue defaults to 16 (previously 8).  AsyncPrefetchIterator has been
+removed from loader.py because DALI's own prefetch queues already provide
+equivalent double-buffering natively.  The larger cpu_queue value compensates
+for the removed application-level buffer, keeping the GPU compute pipeline
+fully saturated on NVL72 / B200 hardware where Lustre latency is variable.
+A value of 16 corresponds to ~2 full batches in-flight per worker thread at
+dali_num_threads=8.
 """
 
 import json
@@ -100,6 +110,7 @@ class DINOAugConfig:
 
     @property
     def n_views(self) -> int:
+        """Total number of crops (global + local)."""
         return self.n_global_crops + self.n_local_crops
 
     def crop_size_at_epoch(self, epoch: int) -> int:
@@ -123,8 +134,10 @@ class LoaderConfig:
         shard_timeout_s: Max seconds a non-master rank waits for a shard.
         shard_extraction_workers: Thread-pool workers for tar → JPEG extraction.
         heartbeat_stale_s: Seconds without heartbeat before a /dev/shm dir is
-            considered orphaned. Raised to 300 s to handle busy SLURM nodes.
+            considered orphaned.
         dali_cpu_queue: DALI CPU-side prefetch queue depth.
+            Default 16 (increased from 8 after AsyncPrefetchIterator removal —
+            DALI's own queues now provide all pipeline buffering).
         dali_gpu_queue: DALI GPU-side prefetch queue depth.
         dali_num_threads: DALI CPU worker threads for pre-decode operations.
         hw_decoder_load: Fraction of JPEG decodes routed to nvjpeg HW ASIC.
@@ -152,8 +165,8 @@ class LoaderConfig:
 
     heartbeat_stale_s:        float = 300.0
 
-    # DALI
-    dali_cpu_queue:           int   = 8
+    # DALI — cpu_queue raised to 16 after AsyncPrefetchIterator removal.
+    dali_cpu_queue:           int   = 16
     dali_gpu_queue:           int   = 6
     dali_num_threads:         int   = 8
     hw_decoder_load:          float = 0.90
@@ -191,7 +204,7 @@ class LoaderConfig:
     def __post_init__(self) -> None:
         if self.use_fp8_output:
             try:
-                import transformer_engine.pytorch  # noqa: F401
+                import transformer_engine.pytorch  # noqa: F401, PLC0415
             except ImportError:
                 msg = (
                     "LoaderConfig: use_fp8_output=True requires transformer-engine. "
@@ -247,7 +260,7 @@ class LoaderConfig:
                 )
                 raise ValueError(msg)
             try:
-                import prometheus_client  # noqa: F401
+                import prometheus_client  # noqa: F401, PLC0415
             except ImportError:
                 msg = (
                     f"LoaderConfig: prometheus_port={self.prometheus_port} requires "
@@ -256,10 +269,12 @@ class LoaderConfig:
                 raise ValueError(msg) from None
 
     def to_dict(self) -> dict:
+        """Serialise to a plain dict."""
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "LoaderConfig":
+        """Deserialise from a plain dict, ignoring unknown keys."""
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
 
@@ -277,7 +292,7 @@ class CheckpointState:
 
     def save(self, path: Path) -> None:
         """Write atomically via a .tmp file with SHA-256 integrity envelope."""
-        import hashlib
+        import hashlib  # noqa: PLC0415
         payload      = asdict(self)
         payload_json = json.dumps(payload, indent=2)
         checksum     = hashlib.sha256(payload_json.encode()).hexdigest()
@@ -294,17 +309,19 @@ class CheckpointState:
             raise
 
     def to_dict(self) -> dict:
+        """Serialise to a plain dict."""
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "CheckpointState":
+        """Deserialise from a plain dict, ignoring unknown keys."""
         known = {f.name for f in cls.__dataclass_fields__.values()}
         return cls(**{k: v for k, v in d.items() if k in known})
 
     @classmethod
     def load(cls, path: Path) -> "CheckpointState":
         """Load and verify checkpoint, supporting both envelope and legacy formats."""
-        import hashlib
+        import hashlib  # noqa: PLC0415
         raw = json.loads(path.read_text())
 
         if "payload" in raw and "sha256" in raw:

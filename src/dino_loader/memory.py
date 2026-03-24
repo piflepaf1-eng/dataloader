@@ -4,10 +4,13 @@ dino_loader.memory
 In-memory data structures and GPU transfer utilities.
 
 [MEM-1] Batch dataclass with metadata and masks.
-[MEM-3] AsyncPrefetchIterator — genuine background prefetch with race-free
-        exception handling (B1-FIX): future ownership transferred atomically
-        under lock before result() is called outside it.
 [MEM-4] FP8Formatter: no-op guard for dali_fp8_output=True path.
+
+AsyncPrefetchIterator has been removed: DALI's internal cpu_queue / gpu_queue
+pipeline (prefetch_queue_depth) already provides equivalent double-buffering
+natively — no application-level thread is needed.  Increasing dali_cpu_queue
+to ≥ 16 (see LoaderConfig) fully hides Lustre / extraction latency behind GPU
+compute, which is what AsyncPrefetchIterator was manually replicating.
 
 Note: Grace-Blackwell / NVL72 managed-memory paths have been removed.
       This loader targets B200, H200, H100 with standard PCIe topology.
@@ -17,9 +20,7 @@ Note: Grace-Blackwell / NVL72 managed-memory paths have been removed.
 
 import contextlib
 import logging
-import threading
 from collections.abc import Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -80,7 +81,7 @@ def allocate_buffers(
     Args:
         batch_size: Per-GPU batch size.
         aug_cfg: Augmentation config providing max crop dimensions.
-        topo: Cluster topology (used for API compatibility only).
+        topo: Cluster topology (accepted for API compat, not used).
         device: Target CUDA device.
         dtype: Tensor dtype (default bfloat16).
 
@@ -137,112 +138,8 @@ class H2DStream:
             }
 
     def wait(self) -> None:
+        """Synchronise the dedicated stream with the current CUDA stream."""
         torch.cuda.current_stream().wait_stream(self._stream)
-
-
-class AsyncPrefetchIterator:
-    """Wraps a DALI iterator and pre-fetches the next batch on a background thread.
-
-    Hides DALI decode latency behind GPU compute time.
-
-    Thread model
-    ------------
-    One ThreadPoolExecutor(max_workers=1) thread is the sole consumer of
-    next(self._iter); DALI iterators are not thread-safe.
-
-    Error propagation
-    -----------------
-    The future is transferred to local ownership under lock (setting
-    self._future = None atomically), then result() is called outside the lock.
-    This prevents close() from racing with result() and ensures the iterator
-    transitions cleanly to closed on any DALI decode failure.
-    _submit() is only called on the successful path — never after an error.
-
-    Shutdown
-    --------
-    Call close() explicitly or use as a context manager. The __del__ guard is
-    intentionally limited to a best-effort non-blocking close to avoid deadlocks
-    during interpreter shutdown.
-    """
-
-    _SENTINEL = object()
-
-    def __init__(self, dali_iter: Any, h2d: H2DStream) -> None:
-        self._iter     = dali_iter
-        self._h2d      = h2d
-        self._closed   = False
-        self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="dali-prefetch"
-        )
-        self._future: Future | None = None
-        self._lock     = threading.Lock()
-        self._submit()
-
-    def __iter__(self) -> "AsyncPrefetchIterator":
-        return self
-
-    def __next__(self) -> Any:
-        # Transfer future ownership atomically under lock.
-        with self._lock:
-            if self._closed or self._future is None:
-                raise StopIteration
-            fut          = self._future
-            self._future = None
-
-        # Wait for result outside the lock so close() can proceed concurrently.
-        try:
-            result = fut.result()
-        except Exception:
-            self.close()
-            raise
-
-        if result is self._SENTINEL:
-            raise StopIteration
-
-        # Only submit next fetch on success.
-        self._submit()
-        return result
-
-    def __enter__(self) -> "AsyncPrefetchIterator":
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.close()
-
-    def close(self) -> None:
-        """Signal shutdown and wait for the background thread to finish."""
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            fut          = self._future
-            self._future = None
-
-        if fut is not None:
-            fut.cancel()
-        # wait=False avoids blocking the caller (e.g. during error recovery).
-        self._executor.shutdown(wait=False, cancel_futures=True)
-        log.debug("AsyncPrefetchIterator closed")
-
-    def __del__(self) -> None:
-        # Best-effort, non-blocking cleanup only. Do not call shutdown(wait=True)
-        # here — it can deadlock during interpreter teardown.
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-
-    def _fetch_one(self) -> Any:
-        try:
-            return next(self._iter)
-        except StopIteration:
-            return self._SENTINEL
-
-    def _submit(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._future = self._executor.submit(self._fetch_one)
 
 
 class FP8Formatter:
@@ -270,6 +167,7 @@ class FP8Formatter:
             log.info("FP8Formatter: TE not installed — identity (no-op)")
 
     def quantise(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Quantise *tensor* to FP8 E4M3, or return it unchanged if already FP8."""
         if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             log.warning(
                 "FP8Formatter.quantise called on already-FP8 tensor (dtype=%s) — "

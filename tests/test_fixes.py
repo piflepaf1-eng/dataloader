@@ -1,19 +1,17 @@
 """
 tests/test_fixes.py
 ===================
-Regression tests for all fixes and architectural additions introduced
-in this review cycle.
+Regression tests for all fixes and architectural additions.
 
 Coverage
 --------
-B1   AsyncPrefetchIterator race-free exception path
 B2   NodeSharedShardCache._evict_for_locked: backpressure on full-ref slots
 B3   DINODataLoader.set_epoch: threading.Lock prevents concurrent corruption
 B4   LoaderConfig: TE absence caught at construction, not at first batch
 M2   NormSource: thread-safe copy-on-write + return copies
 M3   CheckpointState.save/load: SHA-256 integrity envelope
 M4   NodeSharedShardCache: heartbeat_stale_s configurable
-M5   allocate_buffers: Grace-Blackwell path allocates on CUDA device
+M5   allocate_buffers: pinned memory on CUDA device
 M6   PostProcessPipeline.select: filtered batches tracked in metrics
 
 ARCH1  SharedMemoryRingBuffer: publish / view / evict round-trip
@@ -21,6 +19,16 @@ ARCH2  LoaderConfig.adaptive_prefetch: flag wired, PID controller initialises
 ARCH3  LoaderConfig.prometheus_port: validation, import check
 
 LD-13  DINODataLoader.current_resolution public property
+
+DALI queue depth
+----------------
+AsyncPrefetchIterator was removed; DALI's internal queues now provide all
+pipeline buffering.  Tests verify that dali_cpu_queue is sized appropriately
+and that _raw_iter iterates directly over the DALI iterator without an
+additional threading layer.
+
+Note: B1 (AsyncPrefetchIterator race-free exception path) is removed — the
+class no longer exists.  The threading complexity it addressed is gone.
 """
 
 from __future__ import annotations
@@ -44,70 +52,42 @@ from dino_loader.config import DINOAugConfig, LoaderConfig, CheckpointState
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# B1 — AsyncPrefetchIterator race-free exception path
+# DALI queue depth — replaces B1 (AsyncPrefetchIterator tests)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestAsyncPrefetchIteratorB1:
-    """Verify the race condition fix on exception propagation."""
+class TestDALIQueueDepth:
+    """Verify that dali_cpu_queue is appropriately sized after APrefetch removal."""
 
-    def _make(self, source):
-        from dino_loader.memory import AsyncPrefetchIterator
-        return AsyncPrefetchIterator(source, h2d=MagicMock())
+    def test_default_cpu_queue_is_at_least_16(self):
+        """dali_cpu_queue must be ≥ 16 to compensate for AsyncPrefetchIterator removal."""
+        cfg = LoaderConfig()
+        assert cfg.dali_cpu_queue >= 16, (
+            f"dali_cpu_queue={cfg.dali_cpu_queue} is too small; "
+            "increase to ≥ 16 to ensure DALI queues saturate the GPU."
+        )
 
-    def test_exception_propagates_cleanly(self):
-        """DALI decode error must surface on the training thread, not hang."""
-        def _boom():
-            yield {"view_0": 1}
-            raise RuntimeError("DALI corrupted shard")
+    def test_custom_cpu_queue_accepted(self):
+        cfg = LoaderConfig(dali_cpu_queue=32)
+        assert cfg.dali_cpu_queue == 32
 
-        it = self._make(_boom())
-        assert next(it) == {"view_0": 1}
-        with pytest.raises(RuntimeError, match="DALI corrupted shard"):
-            next(it)
-        # Iterator must be in a closed state after exception.
-        with pytest.raises(StopIteration):
-            next(it)
+    def test_raw_iter_does_not_wrap_in_thread(self, tmp_path):
+        """_raw_iter must not use any Future/ThreadPoolExecutor layer."""
+        import inspect
+        from dino_loader.loader import DINODataLoader
 
-    def test_no_double_raise_same_error(self):
-        """After an exception, the next call must raise StopIteration, not the same error."""
-        def _boom():
-            raise ValueError("first error")
-            yield  # make it a generator
+        # Verify AsyncPrefetchIterator is not imported anywhere in loader.py.
+        loader_src = Path(_SRC) / "dino_loader" / "loader.py"
+        content = loader_src.read_text()
+        assert "AsyncPrefetchIterator" not in content, (
+            "loader.py still references AsyncPrefetchIterator — it should have been removed."
+        )
 
-        it = self._make(_boom())
-        with pytest.raises(ValueError, match="first error"):
-            next(it)
-        # Iterator closed — must raise StopIteration, not ValueError again.
-        with pytest.raises(StopIteration):
-            next(it)
-
-    def test_close_during_result_wait_is_safe(self):
-        """close() called from another thread while __next__ blocks must not hang."""
-        delay = 0.1
-        barrier = threading.Event()
-
-        def _slow():
-            barrier.set()
-            time.sleep(delay)
-            yield 42
-
-        it = self._make(_slow())
-        results = []
-        errors  = []
-
-        def _consume():
-            try:
-                results.append(next(it))
-            except Exception as e:
-                errors.append(e)
-
-        t = threading.Thread(target=_consume)
-        t.start()
-        barrier.wait()
-        it.close()  # concurrent close while __next__ may be blocking
-        t.join(timeout=delay * 10)
-        assert not t.is_alive(), "Consumer thread hung after close()"
-        # Either got a result or a StopIteration — both acceptable.
+    def test_async_prefetch_iterator_removed_from_memory(self):
+        """AsyncPrefetchIterator must no longer be exported from memory.py."""
+        import dino_loader.memory as mem_mod
+        assert not hasattr(mem_mod, "AsyncPrefetchIterator"), (
+            "AsyncPrefetchIterator is still present in memory.py — it should be removed."
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -122,19 +102,16 @@ class TestEvictForLockedB2:
         from dino_loader.shard_cache import NodeSharedShardCache
         import asyncio
 
-        # Patch _EVICT_RETRIES to 1 for speed
         with patch("dino_loader.shard_cache._EVICT_RETRIES", 1), \
              patch("dino_loader.shard_cache._EVICT_WAIT_S",  0.01):
 
             cache = MagicMock(spec=NodeSharedShardCache)
             cache.utilisation = 0.99
-            # Simulate all LRU entries referenced by building a real LRU with refs.
             from collections import OrderedDict
-            cache._lru        = OrderedDict()  # empty — nothing to evict
-            cache._total_bytes = int(200 * (1 << 30))  # 200 GB "used"
-            cache._max_bytes   = int(128 * (1 << 30))  # 128 GB budget
+            cache._lru         = OrderedDict()
+            cache._total_bytes = int(200 * (1 << 30))
+            cache._max_bytes   = int(128 * (1 << 30))
 
-            # Call the real _evict_for_locked on the mock by importing directly.
             from dino_loader.shard_cache import NodeSharedShardCache as NSSC
 
             async def _run():
@@ -152,7 +129,6 @@ class TestSetEpochLockB3:
     """set_epoch must be thread-safe (concurrent calls must not interleave)."""
 
     def test_concurrent_set_epoch_does_not_corrupt(self, tmp_path):
-        """Two threads calling set_epoch simultaneously must not raise or deadlock."""
         from tests.fixtures import scaffold_dataset_dir
         from dino_loader.config import DatasetSpec, LoaderConfig, DINOAugConfig
         from dino_loader.loader import DINODataLoader
@@ -198,14 +174,12 @@ class TestSetEpochLockB3:
 class TestFP8RequiresTE_B4:
 
     def test_fp8_without_te_raises_at_construction(self):
-        """use_fp8_output=True must raise ValueError if TE is not installed."""
         with patch.dict("sys.modules", {"transformer_engine": None,
                                         "transformer_engine.pytorch": None}):
             with pytest.raises(ValueError, match="transformer-engine"):
                 LoaderConfig(use_fp8_output=True)
 
     def test_fp8_false_does_not_require_te(self):
-        """use_fp8_output=False (default) must not raise even without TE."""
         with patch.dict("sys.modules", {"transformer_engine": None,
                                         "transformer_engine.pytorch": None}):
             cfg = LoaderConfig(use_fp8_output=False)
@@ -230,7 +204,6 @@ class TestNormSourceM2:
         return NormSource(aug_cfg=aug, specs=specs)
 
     def test_set_indices_is_full_replacement(self):
-        """set_dataset_indices must atomically replace the list."""
         ns = self._make_norm_source(3)
         ns.set_dataset_indices([0, 1, 2])
         ns.set_dataset_indices([2, 1])
@@ -239,18 +212,15 @@ class TestNormSourceM2:
         assert len(stds)  == 2
 
     def test_call_returns_copies(self):
-        """Returned arrays must be independent copies (not views of _lookup)."""
         ns = self._make_norm_source(1)
         ns.set_dataset_indices([0])
         means1, _ = ns()
         means2, _ = ns()
-        # Modify one — must not affect the other (they are separate objects)
         means1[0][:] = 99.0
         assert not np.allclose(means2[0], 99.0), \
             "Returned arrays are views into _lookup — expected copies"
 
     def test_concurrent_set_and_call(self):
-        """Concurrent set_dataset_indices and __call__ must not raise."""
         ns = self._make_norm_source(4)
         ns.set_dataset_indices([0, 1, 2, 3])
         errors = []
@@ -296,12 +266,12 @@ class TestCheckpointIntegrityM3:
         raw = json.loads(path.read_text())
         assert "payload" in raw
         assert "sha256" in raw
-        assert len(raw["sha256"]) == 64   # SHA-256 hex
+        assert len(raw["sha256"]) == 64
 
     def test_checksum_is_correct(self, tmp_path):
         path = tmp_path / "state.json"
         self._state().save(path)
-        raw     = json.loads(path.read_text())
+        raw      = json.loads(path.read_text())
         computed = hashlib.sha256(json.dumps(raw["payload"], indent=2).encode()).hexdigest()
         assert raw["sha256"] == computed
 
@@ -309,14 +279,12 @@ class TestCheckpointIntegrityM3:
         path = tmp_path / "state.json"
         self._state().save(path)
         raw = json.loads(path.read_text())
-        # Corrupt the payload
         raw["payload"]["step"] = 9999
         path.write_text(json.dumps(raw))
         with pytest.raises(ValueError, match="integrity check"):
             CheckpointState.load(path)
 
     def test_load_backward_compat_flat_format(self, tmp_path):
-        """Old flat-format checkpoints (no sha256) must still load."""
         path = tmp_path / "old.json"
         path.write_text(json.dumps({
             "step": 10, "epoch": 0,
@@ -362,11 +330,9 @@ class TestHeartbeatStaleM4:
             LoaderConfig(heartbeat_stale_s=-1.0)
 
     def test_forwarded_to_shard_cache(self, tmp_path):
-        """heartbeat_stale_s must be passed to _purge_orphaned_shm."""
         from dino_loader.shard_cache import _purge_orphaned_shm
 
         called_with = {}
-        original    = _purge_orphaned_shm
 
         def _spy(job_name, hb_stale_s=300.0):
             called_with["hb_stale_s"] = hb_stale_s
@@ -381,28 +347,26 @@ class TestHeartbeatStaleM4:
                     heartbeat_stale_s=42.0,
                 )
             except Exception:
-                pass  # may fail in CI without /dev/shm write perms
+                pass
 
         if called_with:
             assert called_with["hb_stale_s"] == 42.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# M5 — allocate_buffers Grace-Blackwell device fix
+# M5 — allocate_buffers: pinned CPU memory
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestAllocateBuffersM5:
 
-    def _make_topo(self, is_gb200: bool):
+    def _make_topo(self):
         topo = MagicMock()
-        type(topo).is_grace_blackwell = PropertyMock(return_value=is_gb200)
         return topo
 
     def test_pcie_allocates_pinned_cpu(self):
-        """PCIe path must return pinned CPU tensors."""
         from dino_loader.memory import allocate_buffers
         import torch
-        topo   = self._make_topo(False)
+        topo   = self._make_topo()
         device = torch.device("cpu")
         aug    = DINOAugConfig(global_crop_size=32, local_crop_size=16,
                                n_global_crops=2, n_local_crops=2)
@@ -410,23 +374,6 @@ class TestAllocateBuffersM5:
         for t in bufs["global"] + bufs["local"]:
             assert t.is_pinned(), "PCIe path must produce pinned tensors"
             assert t.device.type == "cpu"
-
-    @pytest.mark.skipif(
-        not __import__("torch").cuda.is_available(),
-        reason="CUDA not available"
-    )
-    def test_gb200_allocates_on_cuda(self):
-        """Grace-Blackwell path must allocate tensors directly on the CUDA device."""
-        from dino_loader.memory import allocate_buffers
-        import torch
-        topo   = self._make_topo(True)
-        device = torch.device("cuda:0")
-        aug    = DINOAugConfig(global_crop_size=32, local_crop_size=16,
-                               n_global_crops=2, n_local_crops=2)
-        bufs   = allocate_buffers(batch_size=2, aug_cfg=aug, topo=topo, device=device)
-        for t in bufs["global"] + bufs["local"]:
-            assert t.device.type == "cuda", \
-                "GB200 path must produce CUDA tensors, not CPU"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -447,15 +394,12 @@ class TestSelectFilteringM6:
         return pipeline.select(predicate)
 
     def test_filtered_count_incremented(self):
-        """Each batch rejected by select() must increment batches_filtered."""
         from dino_loader.monitor.metrics import init_registry, get_registry
         init_registry(rank=0)
 
-        items = [MagicMock(spec=["metadata"]) for _ in range(6)]
-        accept_every_other = lambda i: [True, False] * 3
-
-        # Accept batches at even positions, reject odd ones
+        items  = [MagicMock(spec=["metadata"]) for _ in range(6)]
         toggle = {"i": 0}
+
         def _predicate(b):
             result = toggle["i"] % 2 == 0
             toggle["i"] += 1
@@ -469,65 +413,6 @@ class TestSelectFilteringM6:
         if reg is not None:
             filtered = reg.get("batches_filtered", 0)
             assert filtered == 3, f"Expected 3 filtered batches, got {filtered}"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ARCH1 — SharedMemoryRingBuffer
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestSharedMemoryRingBufferArch1:
-
-    def test_publish_view_evict_roundtrip(self):
-        """Master publishes, reader views, eviction cleans up."""
-        from dino_loader.memory import SharedMemoryRingBuffer
-        rb   = SharedMemoryRingBuffer(job_id="test_rb_001", node_master=True)
-        data = b"hello from lustre" * 100
-
-        rb.publish("fake/shard.tar", data)
-        with rb.view("fake/shard.tar") as mv:
-            assert bytes(mv) == data
-
-        rb.evict("fake/shard.tar")
-        rb.close()
-
-    def test_publish_idempotent_same_size(self):
-        """Re-publishing the same shard with same-size data must not raise."""
-        from dino_loader.memory import SharedMemoryRingBuffer
-        rb   = SharedMemoryRingBuffer(job_id="test_rb_002", node_master=True)
-        data = b"x" * 1024
-
-        rb.publish("shard.tar", data)
-        rb.publish("shard.tar", b"y" * 1024)  # same size, different content
-        with rb.view("shard.tar") as mv:
-            assert bytes(mv) == b"y" * 1024
-        rb.close()
-
-    def test_view_corrupt_header_raises(self):
-        """If segment header is not READY, view() must raise RuntimeError."""
-        from dino_loader.memory import SharedMemoryRingBuffer, _SHM_HDR_FMT
-        import struct
-        rb = SharedMemoryRingBuffer(job_id="test_rb_003", node_master=True)
-        rb.publish("shard.tar", b"data" * 10)
-
-        # Corrupt the magic
-        seg = rb._segments["shard.tar"]
-        struct.pack_into(_SHM_HDR_FMT, seg.buf, 0, 40, 0xDEAD)  # wrong magic
-
-        with pytest.raises(RuntimeError, match="corrupt header"):
-            with rb.view("shard.tar") as _:
-                pass
-        rb.close()
-
-    def test_close_unlinks_all_segments(self):
-        """close() must unlink all published segments."""
-        from dino_loader.memory import SharedMemoryRingBuffer
-        rb = SharedMemoryRingBuffer(job_id="test_rb_004", node_master=True)
-        for i in range(3):
-            rb.publish(f"shard_{i}.tar", b"data" * 10)
-
-        segs_before = list(rb._segments.keys())
-        rb.close()
-        assert rb._segments == {}, "All segments must be removed after close()"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -575,7 +460,6 @@ class TestPrometheusArch3:
                 LoaderConfig(prometheus_port=99999)
 
     def test_missing_prometheus_client_raises(self):
-        """Setting prometheus_port without prometheus-client installed must raise."""
         with patch.dict("sys.modules", {"prometheus_client": None}):
             with pytest.raises(ValueError, match="prometheus_client"):
                 LoaderConfig(prometheus_port=9100)

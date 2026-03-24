@@ -13,8 +13,18 @@ DINODataLoader: the single public entry point for training code.
 [FIX-ENV]  DINODataLoader now asserts dino_env.init() has been called before
            construction when running in DALI mode, preventing silent NCCL
            misconfiguration.
-[FIX-ITER] _active_iter is now protected by a threading.Lock to prevent a TOCTOU
+[FIX-ITER] _active_iter is protected by a threading.Lock to prevent a TOCTOU
            race when two threads call __iter__() simultaneously.
+
+AsyncPrefetchIterator removal
+------------------------------
+_raw_iter now iterates directly over self._dali_iter.  DALI's own prefetch
+queues (controlled by LoaderConfig.dali_cpu_queue / dali_gpu_queue, defaulting
+to 16 / 6) provide equivalent or better double-buffering natively — inside the
+C++ runtime, without the GIL overhead that our Python-level Future threading
+introduced.  The previous AsyncPrefetchIterator was also the source of the B1
+race condition that required a dedicated fix; removing it eliminates the class
+of bugs entirely.
 """
 
 import logging
@@ -114,28 +124,36 @@ class PostProcessPipeline:
         )
 
     def set_epoch(self, epoch: int) -> None:
+        """Delegate to the underlying loader."""
         self._loader.set_epoch(epoch)
 
     def checkpoint(self, step: int) -> None:
+        """Delegate to the underlying loader."""
         self._loader.checkpoint(step)
 
     def set_weights(self, weights: Sequence[float]) -> None:
+        """Delegate to the underlying loader."""
         self._loader.set_weights(weights)
 
     def set_weight_by_name(self, name: str, weight: float) -> None:
+        """Delegate to the underlying loader."""
         self._loader.set_weight_by_name(name, weight)
 
     def set_resolution(self, global_size: int, local_size: int) -> None:
+        """Delegate to the underlying loader."""
         self._loader.set_resolution(global_size, local_size)
 
     @property
     def current_resolution(self) -> tuple[int, int]:
+        """Return the current (global_size, local_size)."""
         return self._loader.current_resolution
 
     def state_dict(self) -> dict:
+        """Delegate to the underlying loader."""
         return self._loader.state_dict()
 
     def load_state_dict(self, sd: dict) -> None:
+        """Delegate to the underlying loader."""
         self._loader.load_state_dict(sd)
 
     def __iter__(self) -> Iterator[Batch]:
@@ -153,6 +171,7 @@ class PostProcessPipeline:
                 step += 1
 
     def __len__(self) -> int:
+        """Return max_steps if set, else delegate to the underlying loader."""
         if self._max_steps is not None:
             return self._max_steps
         return len(self._loader)
@@ -167,19 +186,23 @@ class DINODataLoader:
     constructing this loader. The loader asserts this to prevent silent NCCL
     misconfiguration.
 
+    Pipeline stages
+    ---------------
+    Stage 1 — NodeSharedShardCache: one rank reads Lustre, others read /dev/shm.
+    Stage 2 — MixingSource: weighted multi-dataset ExternalSource for DALI.
+    Stage 3 — DALI pipeline: HW JPEG decode + augmentation on GPU.
+              DALI's prefetch queues (dali_cpu_queue, dali_gpu_queue) overlap
+              I/O and compute natively — no application-level threading needed.
+    Stage 4 — H2DStream: dedicated CUDA stream for pinned→GPU transfer.
+    Stage 5 — FP8Formatter: optional BF16→FP8 E4M3 quantisation.
+
     Augmentation strategies
     -----------------------
     Pass an AugmentationSpec to aug_spec:
-    - DinoV2AugSpec(aug_cfg)  — DINOv2 multi-crop (default).
-    - EvalAugSpec(crop_size)  — deterministic resize + centre-crop.
-    - LeJEPAAugSpec(...)      — one context + N target crops.
+    - DinoV2AugSpec(aug_cfg)   — DINOv2 multi-crop (default).
+    - EvalAugSpec(crop_size)   — deterministic resize + centre-crop.
+    - LeJEPAAugSpec(...)       — one context + N target crops.
     - UserAugSpec(aug_fn, ...) — custom function on GPU tensors.
-
-    Early sample filtering
-    ----------------------
-    sample_predicate accepts any SamplePredicate callable evaluated before JPEG
-    decoding. For post-decode filtering (blank-image detection etc.), use the
-    fluid API: loader.select(lambda batch: ...).
 
     Args:
         specs: List of DatasetSpec objects.
@@ -219,8 +242,8 @@ class DINODataLoader:
     ) -> None:
         # Backward-compat: wrap legacy aug_cfg in DinoV2AugSpec.
         if aug_spec is None:
-            effective_aug_cfg    = aug_cfg if aug_cfg is not None else DINOAugConfig()
-            self._aug_spec: AugmentationSpec = DinoV2AugSpec(aug_cfg=effective_aug_cfg)
+            effective_aug_cfg: DINOAugConfig     = aug_cfg if aug_cfg is not None else DINOAugConfig()
+            self._aug_spec: AugmentationSpec     = DinoV2AugSpec(aug_cfg=effective_aug_cfg)
         else:
             if aug_cfg is not None:
                 log.warning(
@@ -229,8 +252,7 @@ class DINODataLoader:
                 )
             self._aug_spec = aug_spec
 
-        # Keep a reference to DINOAugConfig for resolution scheduling
-        # (only relevant for DinoV2AugSpec).
+        # Keep a reference to DINOAugConfig for resolution scheduling.
         self._aug_cfg: DINOAugConfig = (
             self._aug_spec.aug_cfg  # type: ignore[attr-defined]
             if isinstance(self._aug_spec, DinoV2AugSpec)
@@ -243,9 +265,9 @@ class DINODataLoader:
         self._steps_per_epoch  = steps_per_epoch
 
         # [FIX-ITER] Lock prevents TOCTOU race when __iter__ called concurrently.
-        self._active_iter      = False
-        self._iter_lock        = threading.Lock()
-        self._epoch_lock       = threading.Lock()  # [B3-FIX]
+        self._active_iter = False
+        self._iter_lock   = threading.Lock()
+        self._epoch_lock  = threading.Lock()  # [B3-FIX]
 
         # Backend
         if isinstance(backend, str):
@@ -253,17 +275,15 @@ class DINODataLoader:
         else:
             self._backend = backend
 
-        # [FIX-ENV] For the DALI backend, require dino_env.init() to have been
-        # called so that NCCL is configured before init_process_group.
+        # [FIX-ENV] For the DALI backend, require dino_env.init() before construction.
         if self._backend.name == "dali":
             try:
-                import dino_env
+                import dino_env  # noqa: PLC0415
                 dino_env.get_env()
             except RuntimeError:
                 msg = (
                     "DINODataLoader with the DALI backend requires dino_env.init() "
-                    "to be called before constructing the loader. "
-                    "Call dino_env.init() at the start of your training script."
+                    "to be called before constructing the loader."
                 )
                 raise RuntimeError(msg) from None
 
@@ -376,15 +396,16 @@ class DINODataLoader:
 
         log.info(
             "DINODataLoader ready: backend=%s rank=%d/%d batch=%d "
-            "aug=%s resolution=%dx%d sample_predicate=%s",
+            "aug=%s resolution=%dx%d dali_queues=cpu%d/gpu%d sample_predicate=%s",
             self._backend.name,
             self._rank, self._world_size, batch_size,
             type(self._aug_spec).__name__,
             self._current_global_size, self._current_local_size,
+            self._cfg.dali_cpu_queue, self._cfg.dali_gpu_queue,
             "yes" if sample_predicate is not None else "no",
         )
 
-    # Augmentation spec helpers
+    # ── Augmentation spec helpers ─────────────────────────────────────────────
 
     def _initial_global_size(self) -> int:
         if isinstance(self._aug_spec, DinoV2AugSpec):
@@ -408,7 +429,7 @@ class DINODataLoader:
             return self._aug_spec.decode_size
         return 96
 
-    # Fluid API
+    # ── Fluid API ─────────────────────────────────────────────────────────────
 
     def map(self, fn: Callable[[Batch], Batch]) -> PostProcessPipeline:
         """Chain a transform on every Batch."""
@@ -447,7 +468,7 @@ class DINODataLoader:
             max_steps  = n_steps,
         )
 
-    # Epoch / weight / resolution control
+    # ── Epoch / weight / resolution control ───────────────────────────────────
 
     def set_epoch(self, epoch: int) -> None:
         """Prepare for a new epoch. [B3-FIX] Thread-safe."""
@@ -494,19 +515,23 @@ class DINODataLoader:
 
     @property
     def aug_spec(self) -> AugmentationSpec:
+        """The active augmentation spec."""
         return self._aug_spec
 
     @property
     def current_weights(self) -> list[float]:
+        """Current normalised mixing weights."""
         return self._source.current_weights
 
     def set_weights(self, weights: Sequence[float]) -> None:
+        """Update mixing weights (re-normalised automatically)."""
         self._source.set_weights(weights)
 
     def set_weight_by_name(self, name: str, weight: float) -> None:
+        """Update one dataset's weight by name."""
         self._source.set_weight_by_name(name, weight)
 
-    # Checkpointing
+    # ── Checkpointing ─────────────────────────────────────────────────────────
 
     def checkpoint(self, step: int) -> None:
         """Save a checkpoint (rank 0 only, every N steps)."""
@@ -521,19 +546,20 @@ class DINODataLoader:
         self._ckpt.save(state)
 
     def state_dict(self) -> dict:
+        """Return checkpoint state as a plain dict."""
         if not self._cfg.stateful_dataloader:
             msg = "state_dict() requires stateful_dataloader=True in LoaderConfig."
             raise RuntimeError(msg)
         return self._ckpt.state_dict()
 
     def load_state_dict(self, sd: dict) -> None:
+        """Restore from a state dict produced by state_dict()."""
         self._ckpt.load_state_dict(sd)
 
-    # Iteration protocol
+    # ── Iteration protocol ────────────────────────────────────────────────────
 
     def __iter__(self) -> Iterator[Batch]:
-        # [FIX-ITER] Lock prevents TOCTOU: two concurrent calls both pass the
-        # check and both set _active_iter = True.
+        # [FIX-ITER] Lock prevents TOCTOU race when __iter__ called concurrently.
         with self._iter_lock:
             if self._active_iter:
                 msg = (
@@ -550,6 +576,13 @@ class DINODataLoader:
                 self._active_iter = False
 
     def _raw_iter(self) -> Iterator[Batch]:
+        """Core iteration loop — iterates directly over the DALI iterator.
+
+        DALI's internal prefetch queues (cpu_queue / gpu_queue) overlap I/O and
+        GPU decode behind this loop naturally, without any application-level
+        threading.  Set dali_cpu_queue ≥ 16 in LoaderConfig to ensure the
+        queue is deep enough to hide Lustre / extraction latency.
+        """
         metrics       = get_registry()
         stall_timeout = self._cfg.stall_timeout_s
         got_first     = False
@@ -592,7 +625,7 @@ class DINODataLoader:
         views:    list[Any],
         metadata: list[dict | None],
     ) -> Batch:
-        """Build a Batch from pipeline output views, routing to H2D and FP8."""
+        """Build a Batch from pipeline output views, routing through H2D and FP8."""
         if isinstance(self._aug_spec, DinoV2AugSpec):
             n_global     = self._aug_spec.aug_cfg.n_global_crops
             global_views = views[:n_global]
@@ -632,12 +665,13 @@ class DINODataLoader:
         )
 
     def __len__(self) -> int:
+        """Return steps_per_epoch if set; raises TypeError otherwise."""
         if self._steps_per_epoch is None:
             msg = "len(loader) requires steps_per_epoch to be set at construction."
             raise TypeError(msg)
         return self._steps_per_epoch
 
-    # Internal helpers
+    # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _validate_shard_coverage(self, specs: list[DatasetSpec]) -> None:
         for spec in specs:
@@ -669,7 +703,7 @@ class DINODataLoader:
 
     def _start_prometheus(self, port: int) -> None:
         try:
-            import prometheus_client
+            import prometheus_client  # noqa: PLC0415
             t = threading.Thread(
                 target  = prometheus_client.start_http_server,
                 args    = (port,),
