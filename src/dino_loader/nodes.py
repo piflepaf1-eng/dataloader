@@ -441,7 +441,7 @@ class MaskMapNode:
     def next(self):
         """Return the next batch with ``Batch.masks`` populated."""
         import torch  # noqa: PLC0415 — torch is an optional dep of this node
-        batch: "Batch" = self._source.next()
+        batch: Batch = self._source.next()
         n_mask = self._n_mask if self._n_mask is not None else self._gen.num_masking_patches
         mask   = self._gen(flat=True)                  # shape (H*W,)
         masks  = torch.from_numpy(mask).unsqueeze(0)   # (1, H*W) bool

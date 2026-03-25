@@ -210,8 +210,7 @@ class MaskingGenerator:
             return mask
 
         unmasked_indices = np.where(~flat)[0]
-        if shortfall > len(unmasked_indices):
-            shortfall = len(unmasked_indices)
+        shortfall = min(shortfall, len(unmasked_indices))
 
         chosen = np.random.choice(unmasked_indices, size=shortfall, replace=False)
         flat[chosen] = True

@@ -58,10 +58,10 @@ from dino_loader.loader import DINODataLoader
 from dino_loader.memory import Batch
 from dino_loader.mixing_source import ResolutionSource
 from dino_loader.nodes import (
+    MaskMapNode,
     MetadataNode,
     ShardReaderNode,
     build_reader_graph,
-    MaskMapNode,
 )
 from dino_loader.pipeline_graph import (  # noqa: F401
     BatchFilterNode,
@@ -79,10 +79,10 @@ __all__ = [
     "DINOAugConfig",
     "DINODataLoader",
     "LoaderConfig",
+    "MaskMapNode",
     "MetadataNode",
     "NodePipeline",
     "ResolutionSource",
     "ShardReaderNode",
     "build_reader_graph",
-    "MaskMapNode",
 ]
