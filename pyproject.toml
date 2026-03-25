@@ -25,6 +25,7 @@ dependencies = [
     "dino-datasets",
     "dino-env",
     "nvidia-dali-cuda120>=2.0.0",
+    "torchdata>=0.11.0",
 ]
 
 [dependency-groups]
