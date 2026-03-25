@@ -37,9 +37,8 @@ import hashlib
 import json
 import sys
 import threading
-import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -72,8 +71,6 @@ class TestDALIQueueDepth:
 
     def test_raw_iter_does_not_wrap_in_thread(self, tmp_path):
         """_raw_iter must not use any Future/ThreadPoolExecutor layer."""
-        import inspect
-        from dino_loader.loader import DINODataLoader
 
         # Verify AsyncPrefetchIterator is not imported anywhere in loader.py.
         loader_src = Path(_SRC) / "dino_loader" / "loader.py"
@@ -330,7 +327,6 @@ class TestHeartbeatStaleM4:
             LoaderConfig(heartbeat_stale_s=-1.0)
 
     def test_forwarded_to_shard_cache(self, tmp_path):
-        from dino_loader.shard_cache import _purge_orphaned_shm
 
         called_with = {}
 

@@ -560,7 +560,6 @@ def build_dynamic_pipeline(
                     dtype=types.FLOAT16, output_layout="CHW",
                     mean=mean_arr, std=std_arr,
                 )
-                import torch  # noqa: PLC0415
                 torch_tensor = normalised.as_tensor()
                 return aug_spec.aug_fn(torch_tensor)
 
