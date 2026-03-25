@@ -72,6 +72,7 @@ Notes
   sample position is *not* restored (matching existing dino_loader semantics).
 - ``torchdata`` is listed as an optional dependency; a clear ``ImportError``
   is raised on import if it is absent.
+
 """
 
 from __future__ import annotations
@@ -80,8 +81,8 @@ import logging
 from typing import Any
 
 import numpy as np
-
 from dino_datasets import DatasetSpec
+
 from dino_loader.mixing_source import MixingSource, SamplePredicate
 
 log = logging.getLogger(__name__)
@@ -162,6 +163,7 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         Normalised mixing weight vector.
     ``dataset_names``
         Ordered list of dataset names (sanity-check on restore).
+
     """
 
     # Keys used in get_state / reset(initial_state=...)
@@ -356,6 +358,7 @@ class MetadataNode(BaseNode):  # type: ignore[misc]
         for augmented_batch in loader:
             meta = splitter.pop_last_metadata()
             ...
+
     """
 
     def __init__(self, source: BaseNode) -> None:  # type: ignore[type-arg]
@@ -402,7 +405,7 @@ def build_reader_graph(
     debug_log_keys:      str | None             = None,
     sample_predicate:    SamplePredicate | None = None,
     prefetch_factor:     int                    = 2,
-) -> tuple["tn.Loader[ReaderBatch]", ShardReaderNode]:
+) -> tuple[tn.Loader[ReaderBatch], ShardReaderNode]:
     """Build a ready-to-use ``tn.Loader`` over the shard reader pipeline.
 
     Returns both the ``Loader`` (for iteration) and the ``ShardReaderNode``

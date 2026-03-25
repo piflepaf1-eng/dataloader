@@ -68,6 +68,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from dino_datasets import DatasetSpec
 
 from dino_loader.augmentation import (
     AugmentationSpec,
@@ -77,7 +78,6 @@ from dino_loader.augmentation import (
     UserAugSpec,
 )
 from dino_loader.config import DINOAugConfig
-from dino_datasets import DatasetSpec
 
 log = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ log = logging.getLogger(__name__)
 
 try:
     import nvidia.dali.experimental.dynamic as ndd
-    import nvidia.dali.types as types
+    from nvidia.dali import types
 
     _HAS_DYNAMIC_DALI = True
 except ImportError:
@@ -135,6 +135,7 @@ def _build_norm_table(
     Returns:
         List of ``_NormStats`` aligned with ``specs`` (index ``i`` →
         ``specs[i]``).
+
     """
     global_mean = np.array(aug_cfg.mean, dtype=np.float32) * 255.0
     global_std  = np.array(aug_cfg.std,  dtype=np.float32) * 255.0
@@ -163,6 +164,7 @@ class _ResolutionHolder:
     Args:
         global_size: Initial global crop size in pixels.
         local_size: Initial local crop size in pixels.
+
     """
 
     def __init__(self, global_size: int, local_size: int) -> None:
@@ -198,7 +200,7 @@ def _make_dinov2_aug_fn(
     aug_cfg:    DINOAugConfig,
     resolution: _ResolutionHolder,
     norm_table: list[_NormStats],
-) -> "Any":
+) -> Any:
     """Return a dynamic-mode batch function implementing DINOv2 multi-crop.
 
     The returned callable takes a ``ndd.Batch`` of raw JPEG bytes and the
@@ -211,13 +213,14 @@ def _make_dinov2_aug_fn(
 
     Returns:
         Callable compatible with ``ndd.pytorch.nodes.DictMapper``.
+
     """
     _require_dynamic_dali()
 
     n_global = aug_cfg.n_global_crops
     n_local  = aug_cfg.n_local_crops
 
-    def _aug_fn(jpegs: "ndd.Batch", ds_indices: list[int]) -> dict[str, "ndd.Batch"]:
+    def _aug_fn(jpegs: ndd.Batch, ds_indices: list[int]) -> dict[str, ndd.Batch]:
         global_size = resolution.global_size
         local_size  = resolution.local_size
 
@@ -231,7 +234,7 @@ def _make_dinov2_aug_fn(
         primary_idx = ds_indices[0] if ds_indices else 0
         norm        = norm_table[min(primary_idx, len(norm_table) - 1)]
 
-        views: dict[str, "ndd.Batch"] = {}
+        views: dict[str, ndd.Batch] = {}
         view_idx = 0
 
         for i in range(n_global):
@@ -310,7 +313,7 @@ def _make_dinov2_aug_fn(
     return _aug_fn
 
 
-def _make_eval_aug_fn(aug_spec: EvalAugSpec) -> "Any":
+def _make_eval_aug_fn(aug_spec: EvalAugSpec) -> Any:
     """Return a dynamic-mode batch function for evaluation (resize + centre-crop).
 
     Args:
@@ -318,6 +321,7 @@ def _make_eval_aug_fn(aug_spec: EvalAugSpec) -> "Any":
 
     Returns:
         Callable compatible with ``ndd.pytorch.nodes.DictMapper``.
+
     """
     _require_dynamic_dali()
 
@@ -326,7 +330,7 @@ def _make_eval_aug_fn(aug_spec: EvalAugSpec) -> "Any":
     mean_arr    = (np.array(aug_spec.mean, dtype=np.float32) * 255.0).tolist()
     std_arr     = (np.array(aug_spec.std,  dtype=np.float32) * 255.0).tolist()
 
-    def _aug_fn(jpegs: "ndd.Batch", ds_indices: list[int]) -> dict[str, "ndd.Batch"]:  # noqa: ARG001
+    def _aug_fn(jpegs: ndd.Batch, ds_indices: list[int]) -> dict[str, ndd.Batch]:  # noqa: ARG001
         decoded = ndd.decoders.image(jpegs, device="gpu", output_type=types.RGB)
         resized = ndd.resize(decoded, resize_shorter=resize_size, device="gpu")
         cropped = ndd.crop_mirror_normalize(
@@ -345,7 +349,7 @@ def _make_eval_aug_fn(aug_spec: EvalAugSpec) -> "Any":
     return _aug_fn
 
 
-def _make_lejpa_aug_fn(aug_spec: LeJEPAAugSpec) -> "Any":
+def _make_lejpa_aug_fn(aug_spec: LeJEPAAugSpec) -> Any:
     """Return a dynamic-mode batch function for LeJEPA (context + target crops).
 
     Args:
@@ -353,13 +357,14 @@ def _make_lejpa_aug_fn(aug_spec: LeJEPAAugSpec) -> "Any":
 
     Returns:
         Callable compatible with ``ndd.pytorch.nodes.DictMapper``.
+
     """
     _require_dynamic_dali()
 
     mean_arr = (np.array(aug_spec.mean, dtype=np.float32) * 255.0).tolist()
     std_arr  = (np.array(aug_spec.std,  dtype=np.float32) * 255.0).tolist()
 
-    def _aug_fn(jpegs: "ndd.Batch", ds_indices: list[int]) -> dict[str, "ndd.Batch"]:  # noqa: ARG001
+    def _aug_fn(jpegs: ndd.Batch, ds_indices: list[int]) -> dict[str, ndd.Batch]:  # noqa: ARG001
         decoded = ndd.decoders.image(jpegs, device="gpu", output_type=types.RGB)
 
         context = ndd.random_resized_crop(
@@ -382,7 +387,7 @@ def _make_lejpa_aug_fn(aug_spec: LeJEPAAugSpec) -> "Any":
             mean=mean_arr, std=std_arr,
         )
 
-        views: dict[str, "ndd.Batch"] = {"context": context}
+        views: dict[str, ndd.Batch] = {"context": context}
 
         for i in range(aug_spec.n_target_views):
             target = ndd.random_resized_crop(
@@ -422,12 +427,13 @@ class DynamicDINOPipeline:
         batch_size: Samples per batch.
         device_id: GPU index.
         resolution: Thread-safe resolution holder (for ``DinoV2AugSpec`` only).
+
     """
 
     def __init__(
         self,
-        aug_fn:     "Any",
-        source:     "Any",
+        aug_fn:     Any,
+        source:     Any,
         output_map: list[str],
         batch_size:  int,
         device_id:   int,
@@ -441,7 +447,7 @@ class DynamicDINOPipeline:
         self._device_id  = device_id
         self._resolution = resolution
 
-    def __iter__(self) -> "DynamicDINOPipeline":
+    def __iter__(self) -> DynamicDINOPipeline:
         return self
 
     def __next__(self) -> list[dict[str, Any]]:
@@ -475,13 +481,14 @@ class DynamicDINOPipeline:
         Args:
             global_size: New global crop size in pixels.
             local_size: New local crop size in pixels.
+
         """
         if self._resolution is not None:
             self._resolution.set(global_size, local_size)
         else:
             log.warning(
                 "DynamicDINOPipeline.set_resolution called but no "
-                "_ResolutionHolder is configured (non-DinoV2 aug spec)."
+                "_ResolutionHolder is configured (non-DinoV2 aug spec).",
             )
 
 
@@ -521,6 +528,7 @@ def build_dynamic_pipeline(
     Raises:
         ImportError: If DALI dynamic mode is unavailable.
         TypeError: If ``aug_spec`` is not a recognised type.
+
     """
     _require_dynamic_dali()
 

@@ -90,3 +90,43 @@ dino-env = { git = "https://github.com/sebastienwood/dino_env" }
 [build-system]
 requires      = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "ANN003",
+    "D100",
+    "D101",
+    "D103",
+    "D203",
+    "D213",
+    "INP001",
+    "D105",
+    "D400",
+    "FBT001",
+    "FBT002",
+    "D415",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"*test*.py" = [
+    "PLR2004",
+    "S101",
+    "ANN204",
+    "ANN201",
+    "ANN202",
+    "ERA001",
+    "D102",
+    "ANN001",
+    "PLC0415",
+    "SLF001",
+    "PT011",
+    "D205",
+    "ANN002",
+    "D104",
+    "PLR0913",
+]
+"*scripts/*.py" = ["ALL"]

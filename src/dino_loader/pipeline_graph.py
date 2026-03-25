@@ -47,6 +47,7 @@ Notes
   rejected batches are simply skipped.
 - ``state_dict`` / ``load_state_dict`` are delegated to the underlying
   ``tn.Loader`` which recursively serialises the whole node graph.
+
 """
 
 from __future__ import annotations
@@ -94,6 +95,7 @@ class BatchMapNode(BaseNode):  # type: ignore[misc]
         source: Upstream node yielding ``Batch`` objects.
         fn: Transform function ``(Batch) -> Batch``.
         label: Human-readable label shown in logs/repr.
+
     """
 
     def __init__(
@@ -135,6 +137,7 @@ class BatchFilterNode(BaseNode):  # type: ignore[misc]
         source: Upstream node yielding ``Batch`` objects.
         predicate: ``(Batch) -> bool`` — return ``True`` to keep, ``False`` to skip.
         label: Human-readable label for logs.
+
     """
 
     def __init__(
@@ -240,6 +243,7 @@ class NodePipeline:
         Delegate to the underlying ``DINODataLoader``.
     state_dict() / load_state_dict(sd)
         Full graph state via ``tn.Loader``.
+
     """
 
     def __init__(
@@ -258,7 +262,7 @@ class NodePipeline:
     # Fluent composition API
     # ------------------------------------------------------------------
 
-    def map(self, fn: Callable[[Batch], Batch], *, label: str = "<map>") -> "NodePipeline":
+    def map(self, fn: Callable[[Batch], Batch], *, label: str = "<map>") -> NodePipeline:
         """Append a ``Batch → Batch`` transform.
 
         Args:
@@ -267,6 +271,7 @@ class NodePipeline:
 
         Returns:
             A new ``NodePipeline`` with ``fn`` appended.
+
         """
         return NodePipeline(
             root_node   = BatchMapNode(self._root, fn, label=label),
@@ -279,7 +284,7 @@ class NodePipeline:
         predicate: Callable[[Batch], bool],
         *,
         label: str = "<filter>",
-    ) -> "NodePipeline":
+    ) -> NodePipeline:
         """Drop batches for which ``predicate(batch)`` is ``False``.
 
         Args:
@@ -288,6 +293,7 @@ class NodePipeline:
 
         Returns:
             A new ``NodePipeline`` with the filter appended.
+
         """
         return NodePipeline(
             root_node   = BatchFilterNode(self._root, predicate, label=label),
@@ -295,7 +301,7 @@ class NodePipeline:
             max_steps   = self._max_steps,
         )
 
-    def with_epoch(self, n_steps: int) -> "NodePipeline":
+    def with_epoch(self, n_steps: int) -> NodePipeline:
         """Limit iteration to ``n_steps`` batches per epoch.
 
         Args:
@@ -303,6 +309,7 @@ class NodePipeline:
 
         Returns:
             A new ``NodePipeline`` bounded to ``n_steps``.
+
         """
         return NodePipeline(
             root_node   = self._root,
@@ -314,7 +321,7 @@ class NodePipeline:
     # Iteration
     # ------------------------------------------------------------------
 
-    def _build_tn_loader(self) -> "tn.Loader":
+    def _build_tn_loader(self) -> tn.Loader:
         root = self._root
         if self._max_steps is not None:
             root = _LimitNode(root, self._max_steps)
@@ -352,6 +359,7 @@ class NodePipeline:
 
         Args:
             sd: State dict previously produced by :meth:`state_dict`.
+
         """
         if "loader" in sd:
             self._loader.load_state_dict(sd["loader"])
@@ -477,6 +485,7 @@ def wrap_loader(dino_loader: Any) -> NodePipeline:
                 train_step(batch)
             # Save full graph state
             sd = pipeline.state_dict()
+
     """
     _require_torchdata()
     root = _DINOLoaderNode(dino_loader)

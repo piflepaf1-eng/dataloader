@@ -1,5 +1,4 @@
-"""
-tests/test_mixing_source.py
+"""tests/test_mixing_source.py
 ===========================
 Unit tests for the mixing_source.py layer, independent of DALI.
 
@@ -18,17 +17,17 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from tests.fixtures import scaffold_dataset_dir, write_shard
-from dino_loader.backends.cpu import InProcessShardCache
 from dino_datasets import DatasetSpec
+
+from dino_loader.backends.cpu import InProcessShardCache
 from dino_loader.mixing_source import (
     MixingSource,
     MixingWeights,
     ResolutionSource,
-    ShardIterator,
     SampleRecord,
+    ShardIterator,
 )
-
+from tests.fixtures import scaffold_dataset_dir, write_shard
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ResolutionSource
@@ -122,7 +121,7 @@ class TestMixingWeights:
 
 class TestShardIterator:
 
-    @pytest.fixture()
+    @pytest.fixture
     def shard_iter(self, tmp_path):
         """A ShardIterator backed by two small synthetic shards."""
         tar_paths = scaffold_dataset_dir(
@@ -238,7 +237,7 @@ class TestShardIterator:
 
 class TestMixingSource:
 
-    @pytest.fixture()
+    @pytest.fixture
     def mixing_source(self, tmp_path):
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2, n_samples_per_shard=8)
         spec  = DatasetSpec(name="ds", shards=tar_paths, weight=1.0)

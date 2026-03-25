@@ -51,35 +51,36 @@ New in this version
 - wrap_loader / NodePipeline — composable stateful pipeline (Phase 3)
 """
 
+import logging
+
 from dino_loader.config import DINOAugConfig, LoaderConfig
-from dino_loader.loader        import DINODataLoader
-from dino_loader.memory        import Batch
+from dino_loader.loader import DINODataLoader
+from dino_loader.memory import Batch
 from dino_loader.mixing_source import ResolutionSource
-from dino_loader.nodes import (  # noqa: F401
-    ShardReaderNode,
+from dino_loader.nodes import (
     MetadataNode,
+    ShardReaderNode,
     build_reader_graph,
 )
 from dino_loader.pipeline_graph import (  # noqa: F401
-    NodePipeline,
-    BatchMapNode,
     BatchFilterNode,
+    BatchMapNode,
+    NodePipeline,
     wrap_loader,
 )
 
-import logging
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "DINOAugConfig",
-    "LoaderConfig",
-    "DINODataLoader",
     "Batch",
-    "ResolutionSource", 
-    "ShardReaderNode",
-    "MetadataNode",
-    "build_reader_graph",
-    "NodePipeline",
-    "BatchMapNode",
     "BatchFilterNode",
+    "BatchMapNode",
+    "DINOAugConfig",
+    "DINODataLoader",
+    "LoaderConfig",
+    "MetadataNode",
+    "NodePipeline",
+    "ResolutionSource",
+    "ShardReaderNode",
+    "build_reader_graph",
 ]

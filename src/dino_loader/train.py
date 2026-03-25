@@ -1,5 +1,4 @@
-"""
-train.py — Reference DINOv3 training script using dino_loader.
+"""train.py — Reference DINOv3 training script using dino_loader.
 
 Demonstrates all improvements introduced in this version:
 
@@ -45,15 +44,14 @@ import logging
 import os
 
 import torch
+from dino_datasets import DatasetSpec
+from dino_env import slurm_init
 
 from dino_loader import (
     DINOAugConfig,
     DINODataLoader,
     LoaderConfig,
 )
-
-from dino_datasets import DatasetSpec
-from dino_env import slurm_init
 
 try:
     from dinov3.data.masking import MaskingGenerator
