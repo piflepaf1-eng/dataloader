@@ -70,8 +70,6 @@ Notes
   **not** safe to share one instance across processes.
 - ``state_dict`` persists epoch number and mixing weights; within-epoch
   sample position is *not* restored (matching existing dino_loader semantics).
-- ``torchdata`` is listed as an optional dependency; a clear ``ImportError``
-  is raised on import if it is absent.
 
 """
 
@@ -81,37 +79,15 @@ import logging
 from typing import Any
 
 import numpy as np
+import torch 
+import torchdata.nodes as tn
+from torchdata.nodes import BaseNode
 from dino_datasets import DatasetSpec
 
 from dino_loader.mixing_source import MixingSource, SamplePredicate
+from dino_loader.memory import Batch 
 
 log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Optional dependency guard — torchdata is not required at import time of the
-# rest of dino_loader.
-# ---------------------------------------------------------------------------
-try:
-    import torchdata.nodes as tn
-    from torchdata.nodes import BaseNode
-
-    _HAS_TORCHDATA = True
-except ImportError:
-    _HAS_TORCHDATA = False
-    # Provide a stub so the module is still importable; the error surfaces only
-    # when a Node is actually instantiated.
-    tn = None  # type: ignore[assignment]
-    BaseNode = object  # type: ignore[assignment,misc]
-
-
-def _require_torchdata() -> None:
-    if not _HAS_TORCHDATA:
-        msg = (
-            "torchdata is required for dino_loader.nodes.  "
-            "Install it with:  pip install torchdata"
-        )
-        raise ImportError(msg)
-
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -186,7 +162,6 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         debug_log_keys:      str | None             = None,
         sample_predicate:    SamplePredicate | None = None,
     ) -> None:
-        _require_torchdata()
         super().__init__()
 
         self._specs       = specs
@@ -362,7 +337,6 @@ class MetadataNode(BaseNode):  # type: ignore[misc]
     """
 
     def __init__(self, source: BaseNode) -> None:  # type: ignore[type-arg]
-        _require_torchdata()
         super().__init__()
         self._source            = source
         self._last_meta: list[dict[str, Any] | None] = []
@@ -427,7 +401,6 @@ class MaskMapNode:
         num_masking_patches: int | None = None,
     ) -> None:
         """Initialise the node."""
-        _require_torchdata()
         super().__init__()
         self._source = source
         self._gen    = mask_generator
@@ -440,7 +413,6 @@ class MaskMapNode:
 
     def next(self):
         """Return the next batch with ``Batch.masks`` populated."""
-        import torch  # noqa: PLC0415 — torch is an optional dep of this node
         batch: Batch = self._source.next()
         n_mask = self._n_mask if self._n_mask is not None else self._gen.num_masking_patches
         mask   = self._gen(flat=True)                  # shape (H*W,)
@@ -486,10 +458,8 @@ class MaskMapNode:
             )
 
         """
-        import torch  # noqa: PLC0415
 
         def _apply(batch):
-            from dino_loader.memory import Batch  # noqa: PLC0415
             n_mask = num_masking_patches if num_masking_patches is not None else mask_generator.num_masking_patches
             mask   = mask_generator(flat=True)
             masks  = torch.from_numpy(mask).unsqueeze(0)
@@ -558,7 +528,6 @@ def build_reader_graph(
                 my_augment(jpegs)
 
     """
-    _require_torchdata()
 
     reader: ShardReaderNode = ShardReaderNode(
         specs               = specs,
