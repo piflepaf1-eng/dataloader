@@ -20,7 +20,7 @@ if _SRC not in sys.path:
 
 from tests.fixtures import scaffold_dataset_dir, write_shard
 from dino_loader.backends.cpu import InProcessShardCache
-from dino_loader.config import DatasetSpec
+from dino_datasets import DatasetSpec
 from dino_loader.mixing_source import (
     MixingSource,
     MixingWeights,

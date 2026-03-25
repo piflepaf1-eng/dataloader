@@ -36,9 +36,10 @@ if _SRC not in sys.path:
 from tests.conftest import make_spec
 from dino_loader.backends import get_backend
 from dino_loader.backends.cpu import CPUBackend
-from dino_loader.config import DatasetSpec, DINOAugConfig, LoaderConfig
+from dino_loader.config import DINOAugConfig, LoaderConfig
 from dino_loader.loader import DINODataLoader
 from dino_loader.memory import Batch
+from dino_datasets import DatasetSpec
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

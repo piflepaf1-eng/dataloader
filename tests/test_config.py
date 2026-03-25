@@ -20,76 +20,9 @@ if _SRC not in sys.path:
 
 from dino_loader.config import (
     CheckpointState,
-    DatasetSpec,
     DINOAugConfig,
     LoaderConfig,
 )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DatasetSpec
-# ══════════════════════════════════════════════════════════════════════════════
-
-class TestDatasetSpec:
-
-    def test_basic_construction(self):
-        spec = DatasetSpec(name="laion", shards=["/path/a.tar", "/path/b.tar"], weight=0.5)
-        assert spec.name == "laion"
-        assert len(spec.shards) == 2
-        assert spec.weight == 0.5
-
-    def test_empty_shards_raises(self):
-        with pytest.raises(ValueError, match="no shards"):
-            DatasetSpec(name="empty", shards=[], weight=1.0)
-
-    def test_negative_weight_raises(self):
-        with pytest.raises(ValueError, match="weight"):
-            DatasetSpec(name="ds", shards=["x.tar"], weight=-1.0)
-
-    def test_shard_quality_scores_length_mismatch(self):
-        with pytest.raises(ValueError, match="shard_quality_scores"):
-            DatasetSpec(
-                name                 = "ds",
-                shards               = ["a.tar", "b.tar"],
-                shard_quality_scores = [0.5],    # wrong length
-            )
-
-    def test_negative_quality_score_raises(self):
-        with pytest.raises(ValueError, match="shard_quality_scores"):
-            DatasetSpec(
-                name                 = "ds",
-                shards               = ["a.tar"],
-                shard_quality_scores = [-0.1],
-            )
-
-    def test_min_sample_quality_out_of_range(self):
-        with pytest.raises(ValueError, match="min_sample_quality"):
-            DatasetSpec(name="ds", shards=["x.tar"], min_sample_quality=1.5)
-
-    def test_min_sample_quality_zero_is_valid(self):
-        spec = DatasetSpec(name="ds", shards=["x.tar"], min_sample_quality=0.0)
-        assert spec.min_sample_quality == 0.0
-
-    def test_default_metadata_key_is_json(self):
-        spec = DatasetSpec(name="ds", shards=["x.tar"])
-        assert spec.metadata_key == "json"
-
-    def test_mean_std_per_dataset(self):
-        spec = DatasetSpec(
-            name  = "ds",
-            shards= ["x.tar"],
-            mean  = (0.4, 0.3, 0.2),
-            std   = (0.1, 0.1, 0.1),
-        )
-        assert spec.mean == (0.4, 0.3, 0.2)
-
-    def test_shard_quality_scores_valid(self):
-        spec = DatasetSpec(
-            name                 = "ds",
-            shards               = ["a.tar", "b.tar"],
-            shard_quality_scores = [0.8, 0.3],
-        )
-        assert spec.shard_quality_scores[0] == 0.8
 
 
 # ══════════════════════════════════════════════════════════════════════════════
