@@ -192,8 +192,8 @@ def main() -> None:
     # The empty_check watchdog [LD-10] fires inside _raw_iter() if no batch
     # is produced within 120s, giving a diagnostic message instead of hanging.
     #
-    def quality_filter(batch):
-        """Example: skip batches where all metadata is None (no quality signal)."""
+    def quality_filter(batch) -> bool:
+        """Example: skip batches where all metadata is None (no quality signal)."""  # noqa: D401
         if not batch.metadata:
             return True
         return any(m is not None for m in batch.metadata)

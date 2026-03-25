@@ -31,10 +31,9 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from dino_datasets import DatasetSpec
 
 from dino_loader.augmentation import (
     AugmentationSpec,
@@ -43,7 +42,11 @@ from dino_loader.augmentation import (
     LeJEPAAugSpec,
     UserAugSpec,
 )
-from dino_loader.config import DINOAugConfig
+
+if TYPE_CHECKING:
+    from dino_datasets import DatasetSpec
+
+    from dino_loader.config import DINOAugConfig
 
 log = logging.getLogger(__name__)
 
