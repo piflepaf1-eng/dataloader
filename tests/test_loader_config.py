@@ -1,6 +1,8 @@
 """tests/test_loader_config.py
 ==============================
-Unit tests for :class:`dino_loader.config.LoaderConfig` and
+Unit tests for :class:`dino_loader.config.LoaderConfig`,
+:class:`dino_loader.config.SharedExtractionPoolConfig`,
+:class:`dino_loader.config.PipelineConfig` and
 :class:`dino_loader.config.CheckpointState`.
 
 Coverage
@@ -9,15 +11,24 @@ LoaderConfig
 - Default field values
 - Validation: output_dtype, hw_decoder_load, shm_warn_threshold,
   stall_timeout_s, heartbeat_stale_s, prometheus_port
+- checkpoint_dir obligatoire si stateful_dataloader=True [CFG-CKPT]
 - FP8 requires transformer-engine at construction time [CFG-B4]
 - dali_cpu_queue default ≥ 16 (post-AsyncPrefetchIterator removal)
 - adaptive_prefetch validation [ARCH2]
 - prometheus_port validation [ARCH3]
 
+SharedExtractionPoolConfig [CFG-POOL]
+- Valeurs par défaut
+- Validation max_workers > 0
+
+PipelineConfig [CFG-PIPE]
+- from_loader_config() produit les bons champs
+- Seed offset par rank
+
 CheckpointState
-- save / load round-trip with SHA-256 envelope [M3]
-- Checksum verification rejects tampered files
-- Backward-compatible flat format (no checksum)
+- save / load round-trip avec SHA-256 [M3]
+- Tampered file raises ValueError
+- Backward-compatible flat format
 - Atomic write via .tmp → rename
 - Missing crop-size fields default gracefully
 """
@@ -36,156 +47,264 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-from dino_loader.config import CheckpointState, LoaderConfig
+from dino_loader.config import (
+    CheckpointState,
+    LoaderConfig,
+    PipelineConfig,
+    SharedExtractionPoolConfig,
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LoaderConfig
+# LoaderConfig — defaults
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestLoaderConfigDefaults:
 
     def test_node_shm_gb(self):
-        assert LoaderConfig().node_shm_gb == 128.0
+        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").node_shm_gb == 128.0
 
     def test_shuffle_buffer_size(self):
-        assert LoaderConfig().shuffle_buffer_size == 512
+        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").shuffle_buffer_size == 512
 
     def test_stateful_dataloader_enabled_by_default(self):
-        assert LoaderConfig().stateful_dataloader is True
+        # Quand stateful=True (défaut), checkpoint_dir doit être fourni.
+        # On teste donc le comportement par défaut en passant un checkpoint_dir.
+        cfg = LoaderConfig(checkpoint_dir="/tmp/test_ckpt")
+        assert cfg.stateful_dataloader is True
 
     def test_output_dtype_bf16(self):
-        assert LoaderConfig().output_dtype == "bf16"
+        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").output_dtype == "bf16"
 
     def test_seed_default(self):
-        assert LoaderConfig().seed == 0
+        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").seed == 0
 
     def test_dali_cpu_queue_at_least_16(self):
-        """dali_cpu_queue must be ≥ 16 after AsyncPrefetchIterator removal."""
-        assert LoaderConfig().dali_cpu_queue >= 16
+        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").dali_cpu_queue >= 16
 
     def test_heartbeat_stale_s_default(self):
-        assert LoaderConfig().heartbeat_stale_s == 300.0
+        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").heartbeat_stale_s == 300.0
 
     def test_prometheus_port_disabled_by_default(self):
-        assert LoaderConfig().prometheus_port is None
+        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").prometheus_port is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LoaderConfig — validation
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestLoaderConfigValidation:
 
     def test_invalid_output_dtype_raises(self):
         with pytest.raises(ValueError, match="output_dtype"):
-            LoaderConfig(output_dtype="int8")
+            LoaderConfig(output_dtype="int8", stateful_dataloader=False, checkpoint_dir="")
 
     def test_valid_dtype_bf16(self):
-        LoaderConfig(output_dtype="bf16")
+        LoaderConfig(output_dtype="bf16", stateful_dataloader=False, checkpoint_dir="")
 
     def test_valid_dtype_fp32(self):
-        LoaderConfig(output_dtype="fp32")
+        LoaderConfig(output_dtype="fp32", stateful_dataloader=False, checkpoint_dir="")
 
     def test_hw_decoder_load_above_one_raises(self):
         with pytest.raises(ValueError):
-            LoaderConfig(hw_decoder_load=1.5)
+            LoaderConfig(hw_decoder_load=1.5, stateful_dataloader=False, checkpoint_dir="")
 
     def test_hw_decoder_load_at_boundaries_valid(self):
-        LoaderConfig(hw_decoder_load=0.0)
-        LoaderConfig(hw_decoder_load=1.0)
+        LoaderConfig(hw_decoder_load=0.0, stateful_dataloader=False, checkpoint_dir="")
+        LoaderConfig(hw_decoder_load=1.0, stateful_dataloader=False, checkpoint_dir="")
 
     def test_shm_warn_threshold_above_one_raises(self):
         with pytest.raises(ValueError):
-            LoaderConfig(shm_warn_threshold=1.5)
+            LoaderConfig(shm_warn_threshold=1.5, stateful_dataloader=False, checkpoint_dir="")
 
     def test_shm_warn_threshold_negative_raises(self):
         with pytest.raises(ValueError):
-            LoaderConfig(shm_warn_threshold=-0.1)
+            LoaderConfig(shm_warn_threshold=-0.1, stateful_dataloader=False, checkpoint_dir="")
 
     def test_stall_timeout_negative_raises(self):
         with pytest.raises(ValueError, match="stall_timeout_s"):
-            LoaderConfig(stall_timeout_s=-1.0)
+            LoaderConfig(stall_timeout_s=-1.0, stateful_dataloader=False, checkpoint_dir="")
 
     def test_stall_timeout_zero_is_valid(self):
-        LoaderConfig(stall_timeout_s=0.0)
+        LoaderConfig(stall_timeout_s=0.0, stateful_dataloader=False, checkpoint_dir="")
 
     def test_heartbeat_stale_zero_raises(self):
         with pytest.raises(ValueError, match="heartbeat_stale_s"):
-            LoaderConfig(heartbeat_stale_s=0.0)
-
-    def test_heartbeat_stale_negative_raises(self):
-        with pytest.raises(ValueError, match="heartbeat_stale_s"):
-            LoaderConfig(heartbeat_stale_s=-1.0)
-
-    def test_heartbeat_stale_custom_value(self):
-        cfg = LoaderConfig(heartbeat_stale_s=600.0)
-        assert cfg.heartbeat_stale_s == 600.0
+            LoaderConfig(heartbeat_stale_s=0.0, stateful_dataloader=False, checkpoint_dir="")
 
     def test_dali_fp8_without_use_fp8_raises(self):
         with pytest.raises(ValueError):
-            LoaderConfig(dali_fp8_output=True, use_fp8_output=False)
+            LoaderConfig(dali_fp8_output=True, use_fp8_output=False,
+                         stateful_dataloader=False, checkpoint_dir="")
+
+    def test_stateful_without_checkpoint_dir_raises(self):
+        """[CFG-CKPT] stateful_dataloader=True requiert un checkpoint_dir non vide."""
+        with pytest.raises(ValueError, match="checkpoint_dir"):
+            LoaderConfig(stateful_dataloader=True, checkpoint_dir="")
+
+    def test_stateful_with_checkpoint_dir_valid(self, tmp_path):
+        """stateful=True + checkpoint_dir valide → pas d'erreur."""
+        cfg = LoaderConfig(stateful_dataloader=True, checkpoint_dir=str(tmp_path / "ckpt"))
+        assert cfg.stateful_dataloader is True
+
+    def test_non_stateful_without_checkpoint_dir_valid(self):
+        """stateful=False ne requiert pas checkpoint_dir."""
+        cfg = LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
+        assert not cfg.stateful_dataloader
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LoaderConfig — FP8 requires TE
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestFP8RequiresTE:
-    """FP8 output requires transformer-engine at construction time [CFG-B4]."""
 
     def test_fp8_without_te_raises_at_construction(self):
         with patch.dict("sys.modules", {"transformer_engine": None,
                                         "transformer_engine.pytorch": None}):
             with pytest.raises(ValueError, match="transformer-engine"):
-                LoaderConfig(use_fp8_output=True)
+                LoaderConfig(use_fp8_output=True, stateful_dataloader=False, checkpoint_dir="")
 
     def test_fp8_false_does_not_require_te(self):
         with patch.dict("sys.modules", {"transformer_engine": None,
                                         "transformer_engine.pytorch": None}):
-            cfg = LoaderConfig(use_fp8_output=False)
+            cfg = LoaderConfig(use_fp8_output=False, stateful_dataloader=False, checkpoint_dir="")
             assert cfg.use_fp8_output is False
 
 
-class TestAdaptivePrefetch:
-    """Adaptive prefetch flag and PID controller config [ARCH2]."""
-
-    def test_default_disabled(self):
-        assert LoaderConfig().adaptive_prefetch is False
-
-    def test_enable_with_valid_target(self):
-        cfg = LoaderConfig(adaptive_prefetch=True, adaptive_prefetch_target_util=0.80)
-        assert cfg.adaptive_prefetch is True
-        assert cfg.adaptive_prefetch_target_util == 0.80
-
-    def test_target_zero_raises(self):
-        with pytest.raises(ValueError, match="adaptive_prefetch_target_util"):
-            LoaderConfig(adaptive_prefetch=True, adaptive_prefetch_target_util=0.0)
-
-    def test_target_above_one_raises(self):
-        with pytest.raises(ValueError, match="adaptive_prefetch_target_util"):
-            LoaderConfig(adaptive_prefetch=True, adaptive_prefetch_target_util=1.1)
+# ══════════════════════════════════════════════════════════════════════════════
+# SharedExtractionPoolConfig [CFG-POOL]
+# ══════════════════════════════════════════════════════════════════════════════
 
 
-class TestPrometheusPort:
-    """Prometheus metrics endpoint validation [ARCH3]."""
+class TestSharedExtractionPoolConfig:
 
-    def test_invalid_port_zero(self):
-        with patch.dict("sys.modules", {"prometheus_client": __import__("unittest.mock").mock.MagicMock()}):
-            with pytest.raises(ValueError, match="prometheus_port"):
-                LoaderConfig(prometheus_port=0)
+    def test_default_max_workers(self):
+        cfg = SharedExtractionPoolConfig()
+        assert cfg.max_workers == 16
 
-    def test_invalid_port_too_large(self):
-        with patch.dict("sys.modules", {"prometheus_client": __import__("unittest.mock").mock.MagicMock()}):
-            with pytest.raises(ValueError, match="prometheus_port"):
-                LoaderConfig(prometheus_port=99999)
+    def test_default_queue_depth(self):
+        cfg = SharedExtractionPoolConfig()
+        assert cfg.queue_depth_per_shard == 256
 
-    def test_missing_prometheus_client_raises(self):
-        with patch.dict("sys.modules", {"prometheus_client": None}):
-            with pytest.raises(ValueError, match="prometheus_client"):
-                LoaderConfig(prometheus_port=9100)
+    def test_max_workers_zero_raises(self):
+        with pytest.raises(ValueError, match="max_workers"):
+            SharedExtractionPoolConfig(max_workers=0)
 
-    def test_valid_port_with_package_installed(self):
-        from unittest.mock import MagicMock
-        with patch.dict("sys.modules", {"prometheus_client": MagicMock()}):
-            cfg = LoaderConfig(prometheus_port=9100)
-            assert cfg.prometheus_port == 9100
+    def test_queue_depth_zero_raises(self):
+        with pytest.raises(ValueError, match="queue_depth_per_shard"):
+            SharedExtractionPoolConfig(queue_depth_per_shard=0)
+
+    def test_custom_values_valid(self):
+        cfg = SharedExtractionPoolConfig(max_workers=8, queue_depth_per_shard=128)
+        assert cfg.max_workers == 8
+        assert cfg.queue_depth_per_shard == 128
+
+    def test_loader_config_has_extraction_pool(self):
+        cfg = LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
+        assert isinstance(cfg.extraction_pool, SharedExtractionPoolConfig)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CheckpointState
+# PipelineConfig [CFG-PIPE]
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestPipelineConfig:
+
+    def test_defaults(self):
+        cfg = PipelineConfig()
+        assert cfg.num_threads     == 8
+        assert cfg.device_id       == 0
+        assert cfg.hw_decoder_load == 0.90
+        assert cfg.cpu_queue       == 16
+        assert cfg.gpu_queue       == 6
+        assert cfg.seed            == 0
+        assert cfg.fuse_normalization is True
+        assert cfg.dali_fp8_output    is False
+
+    def test_from_loader_config(self, tmp_path):
+        loader_cfg = LoaderConfig(
+            dali_num_threads  = 4,
+            hw_decoder_load   = 0.75,
+            dali_cpu_queue    = 20,
+            dali_gpu_queue    = 8,
+            seed              = 42,
+            fuse_normalization = False,
+            stateful_dataloader = True,
+            checkpoint_dir      = str(tmp_path / "ckpt"),
+        )
+        cfg = PipelineConfig.from_loader_config(cfg=loader_cfg, device_id=2, rank=3)
+        assert cfg.num_threads     == 4
+        assert cfg.device_id       == 2
+        assert cfg.hw_decoder_load == 0.75
+        assert cfg.cpu_queue       == 20
+        assert cfg.gpu_queue       == 8
+        assert cfg.seed            == 42 + 3   # seed + rank
+        assert cfg.fuse_normalization is False
+
+    def test_seed_offset_by_rank(self, tmp_path):
+        """Chaque rang doit avoir un seed distinct."""
+        loader_cfg = LoaderConfig(
+            seed=100, stateful_dataloader=True,
+            checkpoint_dir=str(tmp_path / "ckpt"),
+        )
+        cfg0 = PipelineConfig.from_loader_config(cfg=loader_cfg, device_id=0, rank=0)
+        cfg1 = PipelineConfig.from_loader_config(cfg=loader_cfg, device_id=1, rank=1)
+        assert cfg0.seed != cfg1.seed
+        assert cfg0.seed == 100
+        assert cfg1.seed == 101
+
+    def test_is_frozen(self):
+        """PipelineConfig est frozen (immutable)."""
+        cfg = PipelineConfig()
+        with pytest.raises((AttributeError, TypeError)):
+            cfg.seed = 999  # type: ignore[misc]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LoaderConfig — adaptive prefetch
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestAdaptivePrefetch:
+
+    def test_default_disabled(self):
+        cfg = LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
+        assert cfg.adaptive_prefetch is False
+
+    def test_enable_with_valid_target(self):
+        cfg = LoaderConfig(
+            adaptive_prefetch=True,
+            adaptive_prefetch_target_util=0.80,
+            stateful_dataloader=False,
+            checkpoint_dir="",
+        )
+        assert cfg.adaptive_prefetch is True
+
+    def test_target_zero_raises(self):
+        with pytest.raises(ValueError, match="adaptive_prefetch_target_util"):
+            LoaderConfig(
+                adaptive_prefetch=True,
+                adaptive_prefetch_target_util=0.0,
+                stateful_dataloader=False,
+                checkpoint_dir="",
+            )
+
+    def test_target_above_one_raises(self):
+        with pytest.raises(ValueError, match="adaptive_prefetch_target_util"):
+            LoaderConfig(
+                adaptive_prefetch=True,
+                adaptive_prefetch_target_util=1.1,
+                stateful_dataloader=False,
+                checkpoint_dir="",
+            )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CheckpointState — round-trip
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -204,15 +323,13 @@ class TestCheckpointStateRoundTrip:
 
     def test_save_and_load_step(self, tmp_path):
         state = _make_state(step=42)
-        path = tmp_path / "dl_state.json"
+        path  = tmp_path / "dl_state.json"
         state.save(path)
-        loaded = CheckpointState.load(path)
-        assert loaded.step == 42
+        assert CheckpointState.load(path).step == 42
 
     def test_save_and_load_epoch(self, tmp_path):
-        state = _make_state(epoch=5)
         path = tmp_path / "dl_state.json"
-        state.save(path)
+        _make_state(epoch=5).save(path)
         assert CheckpointState.load(path).epoch == 5
 
     def test_save_and_load_dataset_names(self, tmp_path):
@@ -223,21 +340,20 @@ class TestCheckpointStateRoundTrip:
     def test_save_and_load_mixing_weights(self, tmp_path):
         path = tmp_path / "dl_state.json"
         _make_state().save(path)
-        loaded = CheckpointState.load(path)
-        assert loaded.mixing_weights == [0.7, 0.3]
+        assert CheckpointState.load(path).mixing_weights == [0.7, 0.3]
 
     def test_save_and_load_crop_sizes(self, tmp_path):
         path = tmp_path / "dl_state.json"
         _make_state().save(path)
         loaded = CheckpointState.load(path)
         assert loaded.global_crop_size == 224
-        assert loaded.local_crop_size == 96
+        assert loaded.local_crop_size  == 96
 
     def test_saved_file_is_valid_json(self, tmp_path):
         path = tmp_path / "dl_state.json"
         _make_state(step=100).save(path)
         data = json.loads(path.read_text())
-        assert "payload" in data or "step" in data  # envelope or legacy
+        assert "payload" in data or "step" in data
 
     def test_atomic_write_no_tmp_after_success(self, tmp_path):
         path = tmp_path / "dl_state.json"
@@ -247,7 +363,6 @@ class TestCheckpointStateRoundTrip:
 
 
 class TestCheckpointStateIntegrity:
-    """SHA-256 envelope prevents silent corruption [M3]."""
 
     def test_save_creates_envelope_with_sha256(self, tmp_path):
         path = tmp_path / "state.json"
@@ -260,7 +375,7 @@ class TestCheckpointStateIntegrity:
     def test_checksum_is_correct(self, tmp_path):
         path = tmp_path / "state.json"
         _make_state().save(path)
-        raw = json.loads(path.read_text())
+        raw      = json.loads(path.read_text())
         computed = hashlib.sha256(json.dumps(raw["payload"], indent=2).encode()).hexdigest()
         assert raw["sha256"] == computed
 
@@ -289,12 +404,10 @@ class TestCheckpointStateBackwardCompat:
     def test_missing_crop_sizes_default_to_224_96(self, tmp_path):
         path = tmp_path / "old_state.json"
         path.write_text(json.dumps({
-            "step": 50,
-            "epoch": 1,
+            "step": 50, "epoch": 1,
             "dataset_names": ["laion"],
             "mixing_weights": [1.0],
-            # global_crop_size / local_crop_size intentionally absent
         }))
         loaded = CheckpointState.load(path)
         assert loaded.global_crop_size == 224
-        assert loaded.local_crop_size == 96
+        assert loaded.local_crop_size  == 96

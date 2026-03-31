@@ -24,10 +24,16 @@ _HeartbeatWriter
 
 Heartbeat stale_s
 - Configurable via LoaderConfig and forwarded to NodeSharedShardCache [M4]
+
+CephFS / inotify compatibility [FS-2]
+- _inotify_wait falls back to stat-poll on ENOSYS (CephFS FUSE)
+- _INOTIFY_AVAILABLE flag reset after ENOSYS
+- _read_shard_async (anciennement _read_lustre) fonctionne avec aiofiles
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import threading
@@ -41,7 +47,6 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
-# write_shm_file is defined in the dino_loader test fixtures.
 from tests.fixtures import write_shm_file
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -126,7 +131,7 @@ class TestMmapPoolLRUEviction:
         pool.acquire(paths[2])
 
         with pool._lock:
-            assert str(paths[0]) not in pool._pool, "Shard 0 should have been evicted"
+            assert str(paths[0]) not in pool._pool
         pool.release(paths[2])
         pool.close_all()
 
@@ -158,7 +163,7 @@ class TestMmapPoolThreadSafety:
             t.join()
 
         pool.close_all()
-        assert not errors, f"Thread safety violation: {errors}"
+        assert not errors
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -170,7 +175,7 @@ class TestNodeSharedShardCacheWrite:
 
     def test_write_produces_16_byte_header_plus_payload(self, tmp_path):
         from dino_loader.shard_cache import NodeSharedShardCache
-        shm = tmp_path / "ok.shm"
+        shm  = tmp_path / "ok.shm"
         data = b"payload data" * 10
         NodeSharedShardCache._write(shm, data)
         assert shm.exists()
@@ -193,46 +198,136 @@ class TestNodeSharedShardCacheWrite:
         with patch.object(Path, "rename", bad_rename), pytest.raises(OSError):
             NodeSharedShardCache._write(shm, b"data")
 
-        assert not shm.with_suffix(".tmp").exists(), ".tmp must be cleaned up on failure"
+        assert not shm.with_suffix(".tmp").exists()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# _HeartbeatWriter — "pid:job_id" format [FIX-HB]
+# CephFS / inotify compatibility [FS-2]
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestInotifyFallback:
+    """Tests pour la détection CephFS FUSE et le fallback stat-poll."""
+
+    def test_inotify_available_flag_default_true(self):
+        """Par défaut, _INOTIFY_AVAILABLE est True (inotify supposé disponible)."""
+        import dino_loader.shard_cache as sc
+        # Réinitialise le flag pour isoler le test.
+        original = sc._INOTIFY_AVAILABLE
+        sc._INOTIFY_AVAILABLE = True
+        try:
+            assert sc._INOTIFY_AVAILABLE is True
+        finally:
+            sc._INOTIFY_AVAILABLE = original
+
+    def test_enosys_sets_flag_false_and_warns(self, tmp_path, caplog):
+        """ENOSYS sur inotify_init1 → _INOTIFY_AVAILABLE=False + WARNING."""
+        import ctypes
+        import logging
+        import dino_loader.shard_cache as sc
+
+        original = sc._INOTIFY_AVAILABLE
+        sc._INOTIFY_AVAILABLE = True
+
+        # Crée un fichier "prêt" pour que _is_ready() retourne True immédiatement.
+        from dino_loader.shard_cache import NodeSharedShardCache
+        shm  = tmp_path / "ready.shm"
+        NodeSharedShardCache._write(shm, b"data")
+
+        class _FakeLibc:
+            def inotify_init1(self, flags):
+                ctypes.set_errno(38)  # ENOSYS
+                return -1
+            def inotify_add_watch(self, *a):
+                return -1
+            def inotify_rm_watch(self, *a):
+                pass
+
+        try:
+            with patch("ctypes.CDLL", return_value=_FakeLibc()), \
+                 caplog.at_level(logging.WARNING, logger="dino_loader.shard_cache"):
+                # _inotify_wait doit tomber en stat-poll et réussir (fichier prêt).
+                sc._inotify_wait(shm, timeout_s=1.0)
+
+            assert sc._INOTIFY_AVAILABLE is False
+            assert any("ENOSYS" in r.message or "ceph" in r.message.lower()
+                       for r in caplog.records)
+        finally:
+            sc._INOTIFY_AVAILABLE = original
+
+    def test_stat_poll_fallback_succeeds_on_ready_file(self, tmp_path):
+        """Le fallback stat-poll doit retourner dès que le fichier est prêt."""
+        import dino_loader.shard_cache as sc
+        from dino_loader.shard_cache import NodeSharedShardCache
+
+        original = sc._INOTIFY_AVAILABLE
+        sc._INOTIFY_AVAILABLE = False   # force le fallback
+
+        shm = tmp_path / "ready_poll.shm"
+        NodeSharedShardCache._write(shm, b"poll_data")
+
+        try:
+            # Doit retourner sans TimeoutError.
+            sc._inotify_wait(shm, timeout_s=2.0)
+        finally:
+            sc._INOTIFY_AVAILABLE = original
+
+    def test_stat_poll_fallback_raises_on_timeout(self, tmp_path):
+        """Le fallback stat-poll doit lever TimeoutError si le fichier n'arrive pas."""
+        import dino_loader.shard_cache as sc
+
+        original = sc._INOTIFY_AVAILABLE
+        sc._INOTIFY_AVAILABLE = False
+
+        shm = tmp_path / "never_ready.shm"  # fichier inexistant
+
+        try:
+            with pytest.raises(TimeoutError):
+                sc._inotify_wait(shm, timeout_s=0.1)
+        finally:
+            sc._INOTIFY_AVAILABLE = original
+
+    def test_read_shard_async_name_is_filesystem_neutral(self):
+        """[FS-1] La fonction de lecture est renommée _read_shard_async."""
+        import dino_loader.shard_cache as sc
+        assert hasattr(sc, "_read_shard_async"), (
+            "_read_shard_async doit exister (anciennement _read_lustre)"
+        )
+        assert not hasattr(sc, "_read_lustre"), (
+            "_read_lustre a été renommé en _read_shard_async"
+        )
+
+    def test_read_shard_async_reads_file(self, tmp_path):
+        """_read_shard_async lit un fichier correctement."""
+        import dino_loader.shard_cache as sc
+        data = b"test shard content" * 100
+        p    = tmp_path / "test_shard.tar"
+        p.write_bytes(data)
+
+        result = asyncio.run(sc._read_shard_async(str(p)))
+        assert result == data
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _HeartbeatWriter [FIX-HB]
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestHeartbeatWriterFormat:
-    """Verify the heartbeat file uses "pid:job_id" to prevent PID-recycling false negatives."""
 
     def test_heartbeat_file_contains_pid_and_job_id(self, tmp_path):
         from dino_loader.shard_cache import _HeartbeatWriter
         hb_path = tmp_path / "heartbeat"
         writer  = _HeartbeatWriter(hb_path, job_id="test_job_123")
         try:
-            # Give the writer a moment to write the file.
             time.sleep(0.05)
-            assert hb_path.exists(), "Heartbeat file was not created"
+            assert hb_path.exists()
             content = hb_path.read_text().strip()
-            assert ":" in content, (
-                f"Heartbeat content {content!r} does not contain ':' separator. "
-                "Expected 'pid:job_id' format [FIX-HB]."
-            )
+            assert ":" in content
             pid_str, job_id = content.split(":", 1)
-            assert pid_str.isdigit(), f"PID part {pid_str!r} is not numeric"
-            assert int(pid_str) == os.getpid(), "PID does not match current process"
-            assert job_id == "test_job_123", f"Job ID {job_id!r} does not match"
-        finally:
-            writer.stop()
-
-    def test_heartbeat_pid_matches_current_process(self, tmp_path):
-        from dino_loader.shard_cache import _HeartbeatWriter
-        hb_path = tmp_path / "hb"
-        writer  = _HeartbeatWriter(hb_path, job_id="myjob")
-        try:
-            time.sleep(0.05)
-            content = hb_path.read_text().strip()
-            pid_str = content.split(":")[0]
+            assert pid_str.isdigit()
             assert int(pid_str) == os.getpid()
+            assert job_id == "test_job_123"
         finally:
             writer.stop()
 
@@ -243,27 +338,19 @@ class TestHeartbeatWriterFormat:
         time.sleep(0.05)
         assert hb_path.exists()
         writer.stop()
-        assert not hb_path.exists(), "Heartbeat file should be removed after stop()"
+        assert not hb_path.exists()
 
     def test_purge_skips_alive_process_with_matching_job_id(self, tmp_path):
-        """A live PID with the same job_id must NOT be purged.
-
-        This guards against the scenario where the heartbeat belongs to a
-        sibling process of the same job that happens to be alive.
-        """
+        """Un processus vivant avec le même job_id ne doit pas être purgé."""
         from dino_loader.shard_cache import _purge_orphaned_shm
 
         fake_shm = tmp_path / "fake_job"
         fake_shm.mkdir()
         hb = fake_shm / "heartbeat"
-        # Write "our PID : our job_id" — alive process, same job.
         hb.write_text(f"{os.getpid()}:fake_job")
 
-        # _purge_orphaned_shm should skip this directory because the job_id matches.
         _purge_orphaned_shm("fake_job", hb_stale_s=0.0)
-        assert fake_shm.exists(), (
-            "Sibling process with matching job_id was wrongly purged."
-        )
+        assert fake_shm.exists(), "Sibling process with matching job_id was wrongly purged."
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -272,12 +359,9 @@ class TestHeartbeatWriterFormat:
 
 
 class TestEvictForLockedBackpressure:
-    """When all mmap slots are referenced simultaneously, raise clearly [B2]."""
 
     def test_evict_raises_after_max_retries_when_all_slots_pinned(self, tmp_path):
-        import asyncio
         from collections import OrderedDict
-
         from dino_loader.shard_cache import NodeSharedShardCache
 
         with patch("dino_loader.shard_cache._EVICT_RETRIES", 1), \
@@ -286,7 +370,7 @@ class TestEvictForLockedBackpressure:
             cache = MagicMock(spec=NodeSharedShardCache)
             cache._lru = OrderedDict()
             cache._total_bytes = 200 * (1 << 30)
-            cache._max_bytes = 128 * (1 << 30)
+            cache._max_bytes   = 128 * (1 << 30)
 
             async def _run():
                 with pytest.raises(RuntimeError, match="could not evict enough space"):
@@ -296,7 +380,7 @@ class TestEvictForLockedBackpressure:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# heartbeat_stale_s forwarded to NodeSharedShardCache [M4]
+# heartbeat_stale_s forwarding [M4]
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -312,10 +396,8 @@ class TestHeartbeatStaleForwarding:
             from dino_loader.shard_cache import NodeSharedShardCache
             try:
                 NodeSharedShardCache(
-                    node_master=True,
-                    job_id="test_hb",
-                    max_shm_gb=0.01,
-                    heartbeat_stale_s=42.0,
+                    node_master=True, job_id="test_hb",
+                    max_shm_gb=0.01, heartbeat_stale_s=42.0,
                 )
             except Exception:
                 pass

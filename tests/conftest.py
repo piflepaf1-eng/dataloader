@@ -17,7 +17,7 @@ Fixture overview
 Scope         Fixture                    Rationale
 ============= ========================== ==========================================
 session       small_aug_cfg              Stateless dataclass — safe to share.
-session       small_loader_cfg           Same; checkpoint dir is session-scoped.
+session       small_loader_cfg           Stateful; checkpoint dir session-scoped.
 module        cpu_backend                Constructing CPUBackend is cheap.
 function      tmp_dataset_dir            Writes files to disk — must be isolated.
 function      multi_dataset_dirs         Same.
@@ -85,9 +85,9 @@ def small_aug_cfg() -> DINOAugConfig:
 def small_loader_cfg(tmp_path_factory) -> LoaderConfig:
     """LoaderConfig suited for CPU / no-SLURM testing.
 
-    - SHM budget: 100 MB.
-    - Stateful dataloader enabled for checkpoint round-trip tests.
-    - Checkpoint directory is session-scoped.
+    [CFG-CKPT] checkpoint_dir est maintenant obligatoire quand
+    stateful_dataloader=True.  On utilise un répertoire temporaire
+    session-scoped pour ne pas écrire sur Lustre/CEPH pendant les tests.
     """
     ckpt_dir = str(tmp_path_factory.mktemp("checkpoints"))
     return LoaderConfig(

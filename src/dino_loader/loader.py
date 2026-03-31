@@ -2,39 +2,59 @@
 ==================
 DINODataLoader: the single public entry point for training code.
 
-[LD-AUG-1] aug_spec parameter accepts any AugmentationSpec subclass.
-           The legacy aug_cfg kwarg is accepted and silently wrapped in
-           DinoV2AugSpec(aug_cfg=aug_cfg) for backward compatibility.
-[LD-AUG-2] sample_predicate: early filtering before DALI decode.
-[B3-FIX]   set_epoch() is protected by threading.Lock.
-[LD-13]    current_resolution public property.
-[FIX-ENV]  DINODataLoader asserts dino_env.init() before construction in DALI mode.
-[FIX-ITER] _active_iter is protected by a threading.Lock.
-[CFG-PIPE] PipelineConfig utilisé pour transmettre les paramètres de pipeline.
-[CFG-POOL] SharedExtractionPoolConfig transmis à MixingSource.
-[FIX-CKPT] state_dict() utilise l'état en mémoire (plus de re-lecture disque).
-[FIX-BUILD] _build_batch délégue le split views à AugmentationSpec pour
-            éviter les isinstance chains à chaque batch.
+Architecture finale (Phase 1/3 + wrap_loader implicite)
+---------------------------------------------------------
+DINODataLoader délègue entièrement à ``NodePipeline`` pour l'itération.
+Toute la logique de boucle, métriques et stall detection vit dans
+``_DALINode`` (``pipeline_graph.py``).
 
-Post-processing API
--------------------
-Utiliser ``wrap_loader()`` depuis ``dino_loader.pipeline_graph``::
+Flux de construction :
 
-    from dino_loader.pipeline_graph import wrap_loader
+    DINODataLoader.__init__
+        → ShardReaderNode           (stage 1-2 : I/O + mixing)
+        → _ReaderAdapter            (bridge ShardReaderNode → callable DALI)
+        → BackendProtocol.build_*   (stage 3-5 : DALI/CPU + H2D + FP8)
+        → _DALINode                 (BaseNode : pilote DALI, assemble Batch)
+        → NodePipeline              (self._pipeline = wrap_loader(self))
 
+Flux d'itération :
+
+    for batch in loader:          # délègue à self._pipeline
+        ...
+
+    # Ou avec composition :
     pipeline = (
-        wrap_loader(DINODataLoader(...))
+        loader.as_pipeline()
         .map(apply_ibot_masks)
         .select(quality_ok)
         .with_epoch(steps_per_epoch)
     )
+
+API publique
+------------
+``DINODataLoader`` conserve toute son API publique (set_epoch, checkpoint,
+set_weights, set_resolution, state_dict, load_state_dict, current_resolution,
+current_weights, backend, aug_spec).
+
+``__iter__`` délègue désormais à ``self._pipeline``.
+
+Méthodes de composition (``map``, ``select``, ``with_epoch``) retournent un
+nouveau ``NodePipeline`` sans modifier le loader.
+
+Changements
+-----------
+[PHASE-1-3]   ShardReaderNode est l'unique source.
+[WRAP-LOADER] __iter__ délègue à NodePipeline.
+[DALI-NODE]   _DALINode encapsule DALI + métriques + stall watchdog.
+[AS-PIPELINE] as_pipeline() expose le NodePipeline pour composition.
+[CFG-PIPE]    PipelineConfig utilisé.
+[FIX-CKPT]    state_dict() utilise l'état en mémoire.
 """
 
 import logging
 import os
 import threading
-import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import torch
@@ -59,8 +79,10 @@ from dino_loader.config import (
     PipelineConfig,
 )
 from dino_loader.memory import Batch
-from dino_loader.mixing_source import MixingSource, ResolutionSource
-from dino_loader.monitor.metrics import get_registry, init_registry
+from dino_loader.mixing_source import ResolutionSource
+from dino_loader.monitor.metrics import init_registry
+from dino_loader.nodes import ShardReaderNode
+from dino_loader.pipeline_graph import NodePipeline, _DALINode, wrap_loader
 
 log = logging.getLogger(__name__)
 
@@ -68,8 +90,28 @@ log = logging.getLogger(__name__)
 class DINODataLoader:
     """HPC-grade data loader for DINO-style self-supervised training.
 
-    Pour la post-processing pipeline, utiliser ``wrap_loader()`` depuis
-    ``dino_loader.pipeline_graph``.
+    L'itération est entièrement déléguée à un ``NodePipeline`` interne.
+
+    Usage minimal::
+
+        loader = DINODataLoader(specs, batch_size=512, ...)
+        for epoch in range(100):
+            loader.set_epoch(epoch)
+            for batch in loader:
+                train_step(batch)
+
+    Usage avec composition::
+
+        pipeline = (
+            loader.as_pipeline()
+            .map(apply_ibot_masks)
+            .select(quality_ok)
+            .with_epoch(steps_per_epoch)
+        )
+        for epoch in range(100):
+            pipeline.set_epoch(epoch)
+            for batch in pipeline:
+                train_step(batch)
 
     Args:
         specs: List of DatasetSpec objects.
@@ -109,6 +151,7 @@ class DINODataLoader:
         backend:          Any                      = "auto",
     ) -> None:
         """Construct a DINODataLoader."""
+        # Rétrocompat : wrapping du legacy aug_cfg.
         if aug_spec is None:
             effective_aug_cfg: DINOAugConfig  = aug_cfg if aug_cfg is not None else DINOAugConfig()
             self._aug_spec: AugmentationSpec  = DinoV2AugSpec(aug_cfg=effective_aug_cfg)
@@ -126,21 +169,15 @@ class DINODataLoader:
             else DINOAugConfig()
         )
 
-        self._cfg              = config or LoaderConfig(checkpoint_dir="/tmp/dino_loader_ckpt")
-        self._mask_generator   = mask_generator
-        self._sample_predicate = sample_predicate
-        self._steps_per_epoch  = steps_per_epoch
+        self._cfg = config or LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
+        self._mask_generator  = mask_generator
+        self._steps_per_epoch = steps_per_epoch
 
         self._step:  int = 0
         self._epoch: int = 0
-
-        # [FIX-CKPT] État checkpoint maintenu en mémoire — évite les I/O disque
-        # à chaque appel à state_dict().
         self._last_ckpt_state: CheckpointState | None = None
 
-        self._active_iter = False
-        self._iter_lock   = threading.Lock()
-        self._epoch_lock  = threading.Lock()
+        self._epoch_lock = threading.Lock()
 
         # Backend
         if isinstance(backend, str):
@@ -173,7 +210,6 @@ class DINODataLoader:
         self._local_world_size = env.local_world_size
         self._topo             = env.topology
 
-        # Metrics
         init_registry(
             job_id     = os.environ.get("SLURM_JOB_ID", "dino_local"),
             create     = (self._local_rank == 0),
@@ -191,7 +227,7 @@ class DINODataLoader:
             self._current_local_size,
         )
 
-        # Stage 1–2: shard cache + mixing source
+        # Stage 1 : shard cache
         node_master = (self._local_rank == 0)
         job_id      = os.environ.get("SLURM_JOB_ID", "dino_local")
 
@@ -207,7 +243,8 @@ class DINODataLoader:
 
         self._validate_shard_coverage(specs)
 
-        self._source = MixingSource(
+        # Stage 1-2 : ShardReaderNode (source unique)
+        self._reader = ShardReaderNode(
             specs               = specs,
             batch_size          = batch_size,
             cache               = shard_cache,
@@ -220,48 +257,61 @@ class DINODataLoader:
             debug_log_keys      = self._cfg.debug_log_keys,
             sample_predicate    = sample_predicate,
         )
-        # Expose la resolution_src sur la source pour que le backend puisse y accéder.
-        self._source._resolution_src = self._resolution_src  # type: ignore[attr-defined]
-        self._source._batch_size     = batch_size            # type: ignore[attr-defined]
+        self._reader.reset()
 
-        # Stage 3: augmentation pipeline — [CFG-PIPE]
+        # Adaptateur ShardReaderNode → callable DALI/CPU
+        self._dali_source = _ReaderAdapter(
+            reader         = self._reader,
+            resolution_src = self._resolution_src,
+            batch_size     = batch_size,
+        )
+
+        # Stage 3 : pipeline d'augmentation
         pipeline_cfg = PipelineConfig.from_loader_config(
             cfg       = self._cfg,
             device_id = device_id,
             rank      = self._rank,
         )
-
-        pipeline = self._backend.build_pipeline(
-            source       = self._source,
+        dali_pipeline = self._backend.build_pipeline(
+            source       = self._dali_source,
             aug_spec     = self._aug_spec,
             pipeline_cfg = pipeline_cfg,
             specs        = specs,
         )
-
-        self._dali_iter = self._backend.build_pipeline_iterator(
-            pipeline   = pipeline,
+        dali_iter = self._backend.build_pipeline_iterator(
+            pipeline   = dali_pipeline,
             aug_spec   = self._aug_spec,
             output_map = self._aug_spec.output_map,
             batch_size = batch_size,
         )
 
-        # Stage 4 & 5: H2D + FP8
-        device = (
-            torch.device(f"cuda:{device_id}")
-            if self._backend.supports_gpu
-            else torch.device("cpu")
-        )
-        dali_fp8     = self._cfg.use_fp8_output and self._cfg.dali_fp8_output
-        self._h2d    = self._backend.build_h2d_stream(device=device, topo=self._topo)
-        self._fp8    = (
+        # Stage 4-5 : H2D + FP8
+        device    = torch.device(f"cuda:{device_id}") if self._backend.supports_gpu else torch.device("cpu")
+        dali_fp8  = self._cfg.use_fp8_output and self._cfg.dali_fp8_output
+        self._h2d = self._backend.build_h2d_stream(device=device, topo=self._topo)
+        self._fp8 = (
             self._backend.build_fp8_formatter()
             if self._cfg.use_fp8_output and not dali_fp8
             else None
         )
 
+        # _DALINode : pilote DALI, assemble Batch, métriques, stall watchdog
+        self._dali_node = _DALINode(
+            dali_iter_factory = lambda: dali_iter,
+            pop_metadata_fn   = self._dali_source.pop_last_metadata,
+            build_batch_fn    = self._build_batch,
+            output_map        = self._aug_spec.output_map,
+            stall_timeout_s   = self._cfg.stall_timeout_s,
+            rank              = self._rank,
+        )
+
+        # NodePipeline interne : c'est ce que __iter__ utilise.
+        self._pipeline: NodePipeline = wrap_loader(self)
+
         # Checkpointing
+        ckpt_dir   = self._cfg.checkpoint_dir if self._cfg.stateful_dataloader else "/tmp"
         self._ckpt = DataLoaderCheckpointer(
-            ckpt_dir      = self._cfg.checkpoint_dir,
+            ckpt_dir      = ckpt_dir,
             every_n_steps = self._cfg.checkpoint_every_steps,
             rank          = self._rank,
         )
@@ -299,7 +349,47 @@ class DINODataLoader:
     @property
     def current_weights(self) -> list[float]:
         """Current normalised mixing weights."""
-        return self._source.current_weights
+        return self._reader.current_weights
+
+    # ── Composition API ───────────────────────────────────────────────────────
+
+    def as_pipeline(self) -> NodePipeline:
+        """Return the internal NodePipeline for composition.
+
+        Exemple::
+
+            pipeline = (
+                loader.as_pipeline()
+                .map(apply_ibot_masks)
+                .select(quality_ok)
+                .with_epoch(steps_per_epoch)
+            )
+
+        Chaque appel à ``map/select/with_epoch`` retourne un nouveau
+        ``NodePipeline`` sans modifier le loader.
+
+        Returns:
+            Le ``NodePipeline`` interne du loader, prêt à être composé.
+
+        """
+        return self._pipeline
+
+    def map(self, fn: Callable[[Batch], Batch], *, label: str = "<map>") -> NodePipeline:
+        """Shortcut : ``loader.map(fn)`` équivaut à ``loader.as_pipeline().map(fn)``."""
+        return self._pipeline.map(fn, label=label)
+
+    def select(
+        self,
+        predicate: Callable[[Batch], bool],
+        *,
+        label: str = "<filter>",
+    ) -> NodePipeline:
+        """Shortcut : ``loader.select(pred)`` équivaut à ``loader.as_pipeline().select(pred)``."""
+        return self._pipeline.select(predicate, label=label)
+
+    def with_epoch(self, n_steps: int) -> NodePipeline:
+        """Shortcut : ``loader.with_epoch(n)`` équivaut à ``loader.as_pipeline().with_epoch(n)``."""
+        return self._pipeline.with_epoch(n_steps)
 
     # ── Augmentation spec helpers ─────────────────────────────────────────────
 
@@ -330,7 +420,7 @@ class DINODataLoader:
     # ── Epoch / weight / resolution control ───────────────────────────────────
 
     def set_epoch(self, epoch: int) -> None:
-        """Prepare for a new epoch. Thread-safe.
+        """Prepare for a new epoch.
 
         Args:
             epoch: New epoch number (0-indexed).
@@ -342,12 +432,12 @@ class DINODataLoader:
                 new_global = self._aug_spec.aug_cfg.crop_size_at_epoch(epoch)
                 if new_global != self._current_global_size:
                     self.set_resolution(new_global, self._current_local_size)
-
-            self._source.set_epoch(epoch)
-            self._dali_iter.reset()
+            self._reader.set_epoch(epoch)
+            # Réinitialise l'itérateur DALI pour la nouvelle époque.
+            self._dali_node._iter = None  # type: ignore[attr-defined]
 
     def set_resolution(self, global_size: int, local_size: int) -> None:
-        """Update crop resolution (only meaningful for DinoV2AugSpec).
+        """Update crop resolution.
 
         Args:
             global_size: New global crop size in pixels.
@@ -373,8 +463,7 @@ class DINODataLoader:
                 raise ValueError(msg)
         else:
             log.warning(
-                "set_resolution called on a %s — resolution changes have no effect "
-                "for non-DinoV2 augmentation specs.",
+                "set_resolution called on a %s — no effect for non-DinoV2 specs.",
                 type(self._aug_spec).__name__,
             )
         self._current_global_size = global_size
@@ -383,41 +472,30 @@ class DINODataLoader:
 
     def set_weights(self, weights: Sequence[float]) -> None:
         """Update mixing weights (re-normalised automatically)."""
-        self._source.set_weights(weights)
+        self._reader.set_weights(list(weights))
 
     def set_weight_by_name(self, name: str, weight: float) -> None:
         """Update one dataset's weight by name."""
-        self._source.set_weight_by_name(name, weight)
+        self._reader.set_weight_by_name(name, weight)
 
     # ── Checkpointing ─────────────────────────────────────────────────────────
 
     def checkpoint(self, step: int) -> None:
-        """Save a checkpoint (rank 0 only, every N steps).
-
-        Maintient également l'état en mémoire pour que state_dict() n'ait
-        pas à relire le fichier depuis le disque.
-
-        Args:
-            step: Current training step.
-
-        """
+        """Save a checkpoint (rank 0 only, every N steps)."""
         self._step = step
         state = CheckpointState(
             step             = step,
             epoch            = self._epoch,
-            dataset_names    = self._source.dataset_names,
-            mixing_weights   = self._source.current_weights,
+            dataset_names    = self._reader.dataset_names,
+            mixing_weights   = self._reader.current_weights,
             global_crop_size = self._current_global_size,
             local_crop_size  = self._current_local_size,
         )
-        # [FIX-CKPT] Met à jour l'état en mémoire avant l'écriture disque.
         self._last_ckpt_state = state
         self._ckpt.save(state)
 
     def state_dict(self) -> dict:
-        """Return checkpoint state as a plain dict.
-
-        [FIX-CKPT] Utilise l'état en mémoire — pas de re-lecture disque.
+        """Return checkpoint state as a plain dict (from memory, no disk I/O).
 
         Raises:
             RuntimeError: If ``stateful_dataloader=False`` in ``LoaderConfig``.
@@ -430,23 +508,17 @@ class DINODataLoader:
         if self._last_ckpt_state is not None:
             return self._last_ckpt_state.to_dict()
 
-        # Pas encore de checkpoint sauvegardé — retourne l'état courant.
         return CheckpointState(
             step             = self._step,
             epoch            = self._epoch,
-            dataset_names    = self._source.dataset_names,
-            mixing_weights   = self._source.current_weights,
+            dataset_names    = self._reader.dataset_names,
+            mixing_weights   = self._reader.current_weights,
             global_crop_size = self._current_global_size,
             local_crop_size  = self._current_local_size,
         ).to_dict()
 
     def load_state_dict(self, sd: dict) -> None:
-        """Restore from a state dict produced by state_dict().
-
-        Args:
-            sd: State dict from a prior :meth:`state_dict` call.
-
-        """
+        """Restore from a state dict produced by state_dict()."""
         if "epoch" in sd:
             self._epoch = sd["epoch"]
         if "step" in sd:
@@ -457,71 +529,23 @@ class DINODataLoader:
                 sd.get("local_crop_size", self._current_local_size),
             )
         if "mixing_weights" in sd and "dataset_names" in sd:
-            if sd["dataset_names"] == self._source.dataset_names:
-                self._source.set_weights(sd["mixing_weights"])
+            if sd["dataset_names"] == self._reader.dataset_names:
+                self._reader.set_weights(sd["mixing_weights"])
 
-    # ── Iteration protocol ────────────────────────────────────────────────────
+    # ── Iteration — délégué au NodePipeline interne ───────────────────────────
 
     def __iter__(self) -> Iterator[Batch]:
-        """Iterate over training batches.
+        """Iterate over training batches via the internal NodePipeline."""
+        return iter(self._pipeline)
 
-        Raises:
-            RuntimeError: If called while already iterating.
+    def __len__(self) -> int:
+        """Return steps_per_epoch if set; raises TypeError otherwise."""
+        if self._steps_per_epoch is None:
+            msg = "len(loader) requires steps_per_epoch to be set at construction."
+            raise TypeError(msg)
+        return self._steps_per_epoch
 
-        """
-        with self._iter_lock:
-            if self._active_iter:
-                msg = (
-                    "DINODataLoader: __iter__ called while already iterating. "
-                    "Call set_epoch() before starting a new epoch loop."
-                )
-                raise RuntimeError(msg)
-            self._active_iter = True
-
-        try:
-            yield from self._raw_iter()
-        finally:
-            with self._iter_lock:
-                self._active_iter = False
-
-    def _raw_iter(self) -> Iterator[Batch]:
-        """Core iteration loop — drives the DALI/CPU iterator directly."""
-        metrics       = get_registry()
-        stall_timeout = self._cfg.stall_timeout_s
-        got_first     = False
-
-        for dali_out in self._dali_iter:
-            got_first = True
-            t0        = time.perf_counter()
-
-            views    = [dali_out[0][name] for name in self._aug_spec.output_map]
-            metadata = self._source.pop_last_metadata()
-
-            batch = self._build_batch(views, metadata)
-
-            elapsed_ms = int((time.perf_counter() - t0) * 1000)
-            if metrics:
-                metrics.inc("loader_batches_yielded", 1)
-                metrics.inc("pipeline_yield_time_ms", elapsed_ms)
-                metrics.heartbeat()
-
-            yield batch
-
-        if not got_first and stall_timeout > 0:
-            if os.environ.get("DINO_DISABLE_EMPTY_CHECK"):
-                log.warning(
-                    "DINODataLoader rank %d: no batch produced but "
-                    "DINO_DISABLE_EMPTY_CHECK is set — continuing silently.",
-                    self._rank,
-                )
-            else:
-                msg = (
-                    f"DINODataLoader (rank {self._rank}): no batch produced. "
-                    "Possible causes: corrupted shards, /dev/shm full, "
-                    "sample_predicate rejected every sample, Lustre MDS slow start. "
-                    "Disable: DINO_DISABLE_EMPTY_CHECK=1 or stall_timeout_s=0."
-                )
-                raise RuntimeError(msg)
+    # ── Batch assembly ────────────────────────────────────────────────────────
 
     def _build_batch(
         self,
@@ -530,18 +554,17 @@ class DINODataLoader:
     ) -> Batch:
         """Build a Batch from pipeline output views.
 
-        [FIX-BUILD] Le split views→global/local est délégué à aug_spec pour
-        éviter les isinstance chains répétées à chaque batch dans le hot path.
+        Appelé par ``_DALINode.next()`` à chaque step.
 
         Args:
-            views: List of tensors from the augmentation pipeline.
-            metadata: Per-sample sidecar dicts from MixingSource.
+            views: Flat list of tensors from the augmentation pipeline.
+            metadata: Per-sample sidecar dicts.
 
         Returns:
             A fully assembled ``Batch`` on the target device.
 
         """
-        global_views, local_views = self._aug_spec_split_views(views)
+        global_views, local_views = self._split_views(views)
 
         with self._h2d.transfer({"global": global_views, "local": local_views}) as gpu:
             g_gpu = gpu["global"]
@@ -563,23 +586,8 @@ class DINODataLoader:
             masks        = masks,
         )
 
-    def _aug_spec_split_views(
-        self,
-        views: list[Any],
-    ) -> tuple[list[Any], list[Any]]:
-        """Split the flat views list into (global_crops, local_crops).
-
-        Chaque sous-type d'AugmentationSpec a une convention différente.
-        Cette méthode centralise la logique pour éviter de la répéter dans
-        _build_batch avec des isinstance à chaque batch.
-
-        Args:
-            views: Flat list of tensors from the augmentation pipeline.
-
-        Returns:
-            ``(global_views, local_views)`` — two lists of tensors.
-
-        """
+    def _split_views(self, views: list[Any]) -> tuple[list[Any], list[Any]]:
+        """Split the flat views list into (global_crops, local_crops)."""
         if isinstance(self._aug_spec, DinoV2AugSpec):
             n_global = self._aug_spec.aug_cfg.n_global_crops
             return views[:n_global], views[n_global:]
@@ -591,13 +599,6 @@ class DINODataLoader:
             mid = max(1, len(views) // 2)
             return views[:mid], views[mid:]
         return views, []
-
-    def __len__(self) -> int:
-        """Return steps_per_epoch if set; raises TypeError otherwise."""
-        if self._steps_per_epoch is None:
-            msg = "len(loader) requires steps_per_epoch to be set at construction."
-            raise TypeError(msg)
-        return self._steps_per_epoch
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -618,15 +619,14 @@ class DINODataLoader:
         if state is None:
             return
         self._last_ckpt_state = state
-        if state.dataset_names != self._source.dataset_names:
+        if state.dataset_names != self._reader.dataset_names:
             log.warning(
                 "Checkpoint dataset names %s do not match current specs %s — "
                 "skipping mixing weight restore.",
-                state.dataset_names,
-                self._source.dataset_names,
+                state.dataset_names, self._reader.dataset_names,
             )
         else:
-            self._source.set_weights(state.mixing_weights)
+            self._reader.set_weights(state.mixing_weights)
         if state.global_crop_size != self._current_global_size:
             self.set_resolution(state.global_crop_size, state.local_crop_size)
         self._epoch = state.epoch
@@ -677,3 +677,59 @@ class DINODataLoader:
             if v is not None:
                 return int(v)
         return 1
+
+
+# ---------------------------------------------------------------------------
+# _ReaderAdapter — bridge ShardReaderNode → callable DALI/CPU ExternalSource
+# ---------------------------------------------------------------------------
+
+
+class _ReaderAdapter:
+    """Adaptateur exposant ShardReaderNode comme callable DALI/CPU source.
+
+    Attributs exposés pour les backends :
+    - ``_resolution_src`` : ResolutionSource pour DALI ExternalSource.
+    - ``_batch_size``     : taille de batch.
+
+    Méthodes exposées pour les backends :
+    - ``register_dataset_index_callback`` : pour NormSource (DALI fused norm).
+    - ``pop_last_metadata``               : pour _DALINode.
+
+    """
+
+    def __init__(
+        self,
+        reader:         ShardReaderNode,
+        resolution_src: ResolutionSource,
+        batch_size:     int,
+    ) -> None:
+        """Initialise the reader adapter."""
+        self._reader         = reader
+        self._resolution_src = resolution_src
+        self._batch_size     = batch_size
+        self._last_metadata: list[dict | None] = []
+        self._lock = threading.Lock()
+
+    def __call__(self) -> list:
+        """Return one batch of JPEG arrays (called by DALI per step)."""
+        jpegs, metadata = self._reader.next()
+        with self._lock:
+            self._last_metadata = metadata
+        return jpegs
+
+    def pop_last_metadata(self) -> list[dict | None]:
+        """Return metadata from the last __call__ and clear the buffer."""
+        with self._lock:
+            meta, self._last_metadata = self._last_metadata, []
+            return meta
+
+    def register_dataset_index_callback(self, cb: Any) -> None:
+        """Propagate NormSource callbacks to the inner MixingSource."""
+        source = self._reader._source  # type: ignore[attr-defined]
+        if source is not None and hasattr(source, "register_dataset_index_callback"):
+            source.register_dataset_index_callback(cb)
+        else:
+            log.warning(
+                "_ReaderAdapter: register_dataset_index_callback called before "
+                "ShardReaderNode.reset() — callback will not be registered.",
+            )

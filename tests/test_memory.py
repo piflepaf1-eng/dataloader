@@ -9,15 +9,17 @@ Batch
 - __iter__ unpacks as (global_crops, local_crops)
 - metadata and masks default correctly
 
-allocate_buffers [M5]
-- Returns pinned CPU tensors sized to max crop dimensions
+allocate_buffers [FIX-BUF]
+- Returns a single pinned CPU tensor per crop type (not a list of two).
+  The previous list-of-two was a leftover from AsyncPrefetchIterator.
 - Shape matches (batch_size, 3, max_size, max_size)
 - Tensors are pinned (is_pinned())
 - topo parameter accepted for API compatibility
 
-FP8Formatter (NullFP8Formatter used in CPU path)
+FP8Formatter [FIX-FP8]
 - quantise returns the same tensor unchanged when TE absent
 - quantise does not modify values
+- quantise raises AssertionError on already-FP8 tensor (assert instead of warn)
 """
 
 from __future__ import annotations
@@ -73,7 +75,7 @@ class TestBatch:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# allocate_buffers [M5]
+# allocate_buffers [FIX-BUF]
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -86,60 +88,63 @@ class TestAllocateBuffers:
     def test_returns_global_and_local_keys(self):
         aug_cfg = DINOAugConfig(global_crop_size=32, local_crop_size=16)
         bufs = allocate_buffers(
-            batch_size=4,
-            aug_cfg=aug_cfg,
-            topo=self._make_topo(),
-            device=torch.device("cpu"),
+            batch_size=4, aug_cfg=aug_cfg,
+            topo=self._make_topo(), device=torch.device("cpu"),
         )
         assert "global" in bufs
         assert "local" in bufs
 
+    def test_returns_single_tensor_not_list(self):
+        """[FIX-BUF] allocate_buffers retourne un tenseur par type, pas une liste."""
+        aug_cfg = DINOAugConfig(global_crop_size=32, local_crop_size=16)
+        bufs = allocate_buffers(
+            batch_size=4, aug_cfg=aug_cfg,
+            topo=self._make_topo(), device=torch.device("cpu"),
+        )
+        # Les valeurs doivent être des Tensor, pas des list[Tensor].
+        assert isinstance(bufs["global"], torch.Tensor), (
+            "allocate_buffers['global'] doit être un Tensor, pas une list."
+        )
+        assert isinstance(bufs["local"], torch.Tensor), (
+            "allocate_buffers['local'] doit être un Tensor, pas une list."
+        )
+
     def test_global_tensor_shape(self):
         aug_cfg = DINOAugConfig(global_crop_size=32, max_global_crop_size=64)
         bufs = allocate_buffers(
-            batch_size=4,
-            aug_cfg=aug_cfg,
-            topo=self._make_topo(),
-            device=torch.device("cpu"),
+            batch_size=4, aug_cfg=aug_cfg,
+            topo=self._make_topo(), device=torch.device("cpu"),
         )
-        for t in bufs["global"]:
-            assert t.shape == (4, 3, 64, 64)
+        assert bufs["global"].shape == (4, 3, 64, 64)
 
     def test_local_tensor_shape(self):
         aug_cfg = DINOAugConfig(local_crop_size=16, max_local_crop_size=32)
         bufs = allocate_buffers(
-            batch_size=4,
-            aug_cfg=aug_cfg,
-            topo=self._make_topo(),
-            device=torch.device("cpu"),
+            batch_size=4, aug_cfg=aug_cfg,
+            topo=self._make_topo(), device=torch.device("cpu"),
         )
-        for t in bufs["local"]:
-            assert t.shape == (4, 3, 32, 32)
+        assert bufs["local"].shape == (4, 3, 32, 32)
 
     def test_tensors_are_pinned_on_cpu(self):
-        """PCIe path must produce pinned tensors for efficient H2D DMA [M5]."""
+        """PCIe path must produce pinned tensors for efficient H2D DMA."""
         aug_cfg = DINOAugConfig(global_crop_size=32, local_crop_size=16)
-        device = torch.device("cpu")
-        bufs = allocate_buffers(
-            batch_size=4,
-            aug_cfg=aug_cfg,
-            topo=self._make_topo(),
-            device=device,
+        device  = torch.device("cpu")
+        bufs    = allocate_buffers(
+            batch_size=4, aug_cfg=aug_cfg,
+            topo=self._make_topo(), device=device,
         )
-        for t in bufs["global"] + bufs["local"]:
-            assert t.is_pinned(), "PCIe path must produce pinned tensors"
+        for key in ("global", "local"):
+            t = bufs[key]
+            assert t.is_pinned(), f"bufs['{key}'] must be pinned memory"
             assert t.device.type == "cpu"
 
     def test_topo_parameter_accepted(self):
-        """Topo is accepted for API compatibility even though all paths are PCIe."""
+        """topo is accepted for API compatibility even though all paths are PCIe."""
         from unittest.mock import MagicMock
         aug_cfg = DINOAugConfig(global_crop_size=32, local_crop_size=16)
-        topo = MagicMock()
         allocate_buffers(
-            batch_size=2,
-            aug_cfg=aug_cfg,
-            topo=topo,
-            device=torch.device("cpu"),
+            batch_size=2, aug_cfg=aug_cfg,
+            topo=MagicMock(), device=torch.device("cpu"),
         )  # must not raise
 
 
@@ -153,13 +158,31 @@ class TestNullFP8Formatter:
     def test_quantise_returns_same_tensor(self):
         from dino_loader.backends.cpu import NullFP8Formatter
         fmt = NullFP8Formatter()
-        t = torch.randn(4, 3, 32, 32)
+        t   = torch.randn(4, 3, 32, 32)
         out = fmt.quantise(t)
         assert out is t
 
     def test_quantise_does_not_modify_values(self):
         from dino_loader.backends.cpu import NullFP8Formatter
         fmt = NullFP8Formatter()
-        t = torch.arange(12, dtype=torch.float32).reshape(1, 3, 2, 2)
+        t   = torch.arange(12, dtype=torch.float32).reshape(1, 3, 2, 2)
         out = fmt.quantise(t)
         assert torch.equal(out, t)
+
+
+class TestFP8FormatterAssert:
+    """[FIX-FP8] La garde sur tenseur déjà FP8 est un assert (pas un warning)."""
+
+    def test_quantise_already_fp8_raises_assertion(self):
+        """Passer un tenseur FP8 à quantise() doit lever AssertionError."""
+        from dino_loader.memory import FP8Formatter, HAS_TE
+
+        fmt = FP8Formatter()
+        # On ne peut créer un tenseur FP8 que si torch le supporte.
+        if not hasattr(torch, "float8_e4m3fn"):
+            import pytest
+            pytest.skip("torch.float8_e4m3fn not available in this torch version")
+
+        t_fp8 = torch.zeros(1, 3, 4, 4).to(torch.float8_e4m3fn)
+        with pytest.raises(AssertionError, match="already-FP8"):
+            fmt.quantise(t_fp8)

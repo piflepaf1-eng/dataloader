@@ -6,31 +6,42 @@ Node-local shared-memory shard cache.
 Design
 ------
 - One backing file per shard per node in /dev/shm/<job_id>/.
-- Local rank 0 ("node master") reads from Lustre/NVMe and writes.
+- Local rank 0 ("node master") reads from the parallel filesystem and writes.
 - Other local ranks wait via inotify (Linux) or stat-poll fallback —
   not a busy-spin, so waiting ranks cost near-zero CPU.
 - LRU eviction at file granularity.
 - Header encodes (data_len, ready_flag) so readers can detect partial writes.
-- asyncio + aiofiles for concurrent shard prefetch (hides Lustre latency).
+- asyncio + aiofiles for concurrent shard prefetch (hides filesystem latency).
+
+Filesystem compatibility
+------------------------
+This cache is filesystem-agnostic: the shards can live on Lustre, CephFS
+(kernel client), NFS, or any other POSIX-compatible parallel filesystem.
+
+inotify support:
+  - Lustre (lnet/llite)        : supported
+  - CephFS kernel client        : supported (kernel ≥ 4.14)
+  - CephFS FUSE (ceph-fuse)     : NOT supported (ENOSYS on inotify_init1)
+  - NFS (kernel client)         : supported on recent kernels with CONFIG_NFS_V4_2
+
+When inotify is unavailable (e.g. FUSE mount), _inotify_wait() detects the
+failure and falls back to stat-polling automatically.  A WARNING is logged
+once per process to alert operators that the efficient path is unavailable.
+
+For optimal performance on CephFS:
+  - Use the kernel client (ceph.ko), not ceph-fuse.
+  - Mount options: rw,relatime,name=...,noatime
+  - Avoid FUSE mounts for the shard data path (data path only; metadata
+    paths and checkpoints can use FUSE without performance impact).
 
 [B2-FIX]  _evict_for_locked: backpressure instead of grow-and-proceed.
-          If all mmap pool entries are referenced simultaneously, _load_one()
-          waits up to _EVICT_WAIT_S seconds between retries, then raises a
-          clear RuntimeError with actionable advice.
-
-[FIX-EVICT] _evict_for_locked accounting drift fix: _total_bytes is only
-            decremented after a successful unlink. If unlink fails, the entry
-            is still removed from _lru but bytes are not decremented, so the
-            accounting remains conservative (over-reports usage) rather than
-            going negative and breaking future eviction decisions.
-
-[FIX-HB]  Heartbeat file now stores "pid:job_id" rather than just PID, so
-          that OS PID recycling cannot cause a live unrelated process to be
-          mistaken for a live dataloader heartbeat.
-
+[FIX-EVICT] _evict_for_locked accounting drift fix.
+[FIX-HB]  Heartbeat file now stores "pid:job_id".
 [PERF-1]  No fsync on tmpfs.
 [PERF-2]  Persistent mmap pool.
 [LOG-1]   INFO→DEBUG demotion for per-shard logs.
+[FS-1]    _read_lustre renamed to _read_shard (filesystem-neutral).
+[FS-2]    _inotify_wait detects FUSE mounts and falls back gracefully.
 """
 
 import asyncio
@@ -75,6 +86,10 @@ _HB_FILENAME   = "heartbeat"
 _EVICT_WAIT_S  = 2.0
 _EVICT_RETRIES = 10
 
+# Whether inotify is available on this process's filesystem.
+# Set to False on first ENOSYS/failure to avoid repeated syscall attempts.
+_INOTIFY_AVAILABLE: bool = True
+
 
 class _MmapEntry:
     __slots__ = ("data_len", "fd", "mm", "refs")
@@ -95,6 +110,7 @@ class _MmapPool:
         self._lock  = threading.Lock()
 
     def acquire(self, path: Path) -> _MmapEntry:
+        """Acquire a memory-mapped entry for *path*, opening it if necessary."""
         key = str(path)
         with self._lock:
             if key in self._pool:
@@ -122,12 +138,14 @@ class _MmapPool:
                 raise
 
     def release(self, path: Path) -> None:
+        """Decrement the reference count for *path*."""
         key = str(path)
         with self._lock:
             if key in self._pool:
                 self._pool[key].refs = max(0, self._pool[key].refs - 1)
 
     def invalidate(self, path: Path) -> None:
+        """Remove *path* from the pool and close its file descriptors."""
         key = str(path)
         with self._lock:
             entry = self._pool.pop(key, None)
@@ -135,6 +153,7 @@ class _MmapPool:
             self._close_entry(entry)
 
     def close_all(self) -> None:
+        """Close all entries in the pool."""
         with self._lock:
             entries = list(self._pool.values())
             self._pool.clear()
@@ -156,6 +175,7 @@ class _MmapPool:
 
     @staticmethod
     def _close_entry(entry: _MmapEntry) -> None:
+        """Close a single pool entry, suppressing all errors."""
         with contextlib.suppress(Exception):
             entry.mm.close()
         with contextlib.suppress(Exception):
@@ -182,6 +202,7 @@ class _HeartbeatWriter:
         log.debug("HeartbeatWriter started: %s (pid=%d)", hb_path, os.getpid())
 
     def _write(self) -> None:
+        """Write the heartbeat file atomically."""
         tmp = self._path.with_suffix(".tmp")
         try:
             tmp.write_text(f"{os.getpid()}:{self._job_id}")
@@ -190,10 +211,12 @@ class _HeartbeatWriter:
             log.warning("HeartbeatWriter: could not write %s: %s", self._path, exc)
 
     def _run(self) -> None:
+        """Heartbeat loop — runs until stop() is called."""
         while not self._stop.wait(timeout=_HB_INTERVAL_S):
             self._write()
 
     def stop(self) -> None:
+        """Stop the heartbeat thread and remove the heartbeat file."""
         self._stop.set()
         self._thread.join(timeout=5)
         with contextlib.suppress(Exception):
@@ -203,8 +226,7 @@ class _HeartbeatWriter:
 def _purge_orphaned_shm(job_name: str, hb_stale_s: float = _HB_STALE_S) -> None:
     """Remove /dev/shm directories from dead jobs.
 
-    [FIX-HB] Validates both PID liveness and job_id from the "pid:job_id"
-    heartbeat format to prevent PID-recycling false negatives.
+    [FIX-HB] Validates both PID liveness and job_id.
     """
     base = Path("/dev/shm")
     for d in base.iterdir():
@@ -218,10 +240,8 @@ def _purge_orphaned_shm(job_name: str, hb_stale_s: float = _HB_STALE_S) -> None:
                 if age < hb_stale_s:
                     continue
                 content = hb.read_text().strip()
-                # [FIX-HB] Parse "pid:job_id" format.
                 if ":" in content:
                     pid_str, hb_job_id = content.split(":", 1)
-                    # If job_id matches ours, this is a sibling process — skip.
                     if hb_job_id == job_name:
                         continue
                 else:
@@ -230,18 +250,15 @@ def _purge_orphaned_shm(job_name: str, hb_stale_s: float = _HB_STALE_S) -> None:
                 pid = int(pid_str)
                 try:
                     os.kill(pid, 0)
-                    # PID is alive. With new format, we also verified job_id above.
-                    # With legacy format (no job_id), we conservatively skip.
                     continue
                 except ProcessLookupError:
-                    pass  # process dead → proceed with purge
+                    pass
             except Exception:
-                pass  # unreadable → treat as orphaned
+                pass
 
             log.info("Purging orphaned /dev/shm dir (stale heartbeat): %s", d)
             shutil.rmtree(d, ignore_errors=True)
         else:
-            # No heartbeat file — try squeue (legacy dirs from pre-patch jobs).
             try:
                 result = subprocess.run(
                     ["squeue", "--job", d.name, "--noheader"],
@@ -284,7 +301,7 @@ def _check_shm_headroom(incoming: int) -> None:
 
 
 def _read_file_sync(path: str) -> bytes:
-    """Synchronous fallback for Lustre reads when aiofiles is unavailable."""
+    """Synchronous fallback for shard reads when aiofiles is unavailable."""
     try:
         fd = os.open(path, os.O_RDONLY)
         try:
@@ -296,39 +313,72 @@ def _read_file_sync(path: str) -> bytes:
 
 
 def _inotify_wait(shm: Path, timeout_s: float) -> None:
-    """Block until shm is ready, using inotify on Linux or stat-poll elsewhere."""
+    """Block until shm is ready, using inotify on Linux or stat-poll elsewhere.
+
+    [FS-2] Détection automatique de la disponibilité d'inotify.
+
+    inotify est supporté sur :
+    - tmpfs (/dev/shm)                   → toujours OK
+    - Lustre (llite)                     → OK
+    - CephFS kernel client (ceph.ko)     → OK (kernel ≥ 4.14)
+    - CephFS FUSE (ceph-fuse)            → ENOSYS → fallback stat-poll
+    - NFS                                → généralement OK
+
+    Sur la première défaillance ENOSYS, _INOTIFY_AVAILABLE est positionné à
+    False et un WARNING est émis une seule fois pour informer l'opérateur.
+    """
+    global _INOTIFY_AVAILABLE  # noqa: PLW0603
+
     deadline = time.monotonic() + timeout_s
-    try:
-        import ctypes
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        ifd  = libc.inotify_init1(0o4000)  # IN_NONBLOCK
-        if ifd < 0:
-            raise OSError("inotify_init1 failed")
-        wd = libc.inotify_add_watch(
-            ifd,
-            str(shm.parent).encode(),
-            _IN_CLOSE_WRITE | _IN_MOVED_TO,
-        )
-        if wd < 0:
-            os.close(ifd)
-            raise OSError("inotify_add_watch failed")
+
+    if _INOTIFY_AVAILABLE:
         try:
-            while not _is_ready(shm):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"Timed out ({timeout_s:.0f}s) waiting for shard: {shm}",
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            ifd  = libc.inotify_init1(0o4000)  # IN_NONBLOCK
+            if ifd < 0:
+                errno = ctypes.get_errno()
+                if errno == 38:  # ENOSYS — inotify not supported (e.g. CephFS FUSE)
+                    _INOTIFY_AVAILABLE = False
+                    log.warning(
+                        "inotify_init1 returned ENOSYS — filesystem does not support "
+                        "inotify (possibly CephFS FUSE mount). "
+                        "Falling back to stat-polling. "
+                        "For optimal performance, use the CephFS kernel client (ceph.ko) "
+                        "instead of ceph-fuse for the shard data path.",
                     )
-                r, _, _ = select.select([ifd], [], [], min(remaining, 1.0))
-                if r:
-                    os.read(ifd, 4096)  # drain event buffer
-        finally:
-            libc.inotify_rm_watch(ifd, wd)
-            os.close(ifd)
-        return
-    except Exception:
-        pass
-    # Stat-poll fallback
+                else:
+                    raise OSError(f"inotify_init1 failed (errno={errno})")
+            else:
+                wd = libc.inotify_add_watch(
+                    ifd,
+                    str(shm.parent).encode(),
+                    _IN_CLOSE_WRITE | _IN_MOVED_TO,
+                )
+                if wd < 0:
+                    os.close(ifd)
+                    raise OSError("inotify_add_watch failed")
+                try:
+                    while not _is_ready(shm):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError(
+                                f"Timed out ({timeout_s:.0f}s) waiting for shard: {shm}",
+                            )
+                        r, _, _ = select.select([ifd], [], [], min(remaining, 1.0))
+                        if r:
+                            os.read(ifd, 4096)
+                finally:
+                    libc.inotify_rm_watch(ifd, wd)
+                    os.close(ifd)
+                return
+        except (TimeoutError, OSError):
+            raise
+        except Exception:
+            # Toute autre erreur inattendue → fallback stat-poll.
+            pass
+
+    # Stat-poll fallback (CephFS FUSE, NFS sans inotify, autres).
     while not _is_ready(shm):
         if time.monotonic() >= deadline:
             raise TimeoutError(
@@ -337,17 +387,45 @@ def _inotify_wait(shm: Path, timeout_s: float) -> None:
         time.sleep(0.05)
 
 
+async def _read_shard_async(shard_path: str) -> bytes:
+    """Lire un shard depuis le filesystem de manière asynchrone.
+
+    Supporte Lustre, CephFS (kernel ou FUSE), et tout filesystem POSIX.
+    Le nom _read_shard est filesystem-neutre (anciennement _read_lustre).
+
+    Args:
+        shard_path: Chemin absolu vers le fichier .tar du shard.
+
+    Returns:
+        Contenu brut du shard en bytes.
+
+    Raises:
+        RuntimeError: En cas d'échec de lecture.
+
+    """
+    try:
+        import aiofiles  # noqa: PLC0415
+        async with aiofiles.open(shard_path, "rb") as f:
+            return await f.read()
+    except ImportError:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _read_file_sync, shard_path)
+
+
 class NodeSharedShardCache:
     """Node-local /dev/shm shard cache.
 
     One instance per process; all processes on the same node share the same
     /dev/shm directory.
 
+    Compatible avec Lustre, CephFS kernel client, et CephFS FUSE (avec
+    dégradation automatique de inotify → stat-poll pour CephFS FUSE).
+
     Args:
         node_master: True for local rank 0 — this process fills the cache.
         job_id: Namespace for /dev/shm files (use SLURM_JOB_ID).
         max_shm_gb: RAM budget in /dev/shm for this node.
-        prefetch_window: Max concurrent Lustre → /dev/shm downloads.
+        prefetch_window: Max concurrent filesystem → /dev/shm downloads.
         shard_timeout_s: How long non-master ranks wait for a shard.
         shm_warn_threshold: Fraction (0–1) at which to emit a utilisation warning.
         heartbeat_stale_s: Seconds of no heartbeat before a dir is orphaned.
@@ -459,20 +537,28 @@ class NodeSharedShardCache:
 
     @property
     def utilisation(self) -> float:
+        """Current cache utilisation as a fraction in [0, 1]."""
         if self._max_bytes == 0:
             return 0.0
         with self._lru_lock:
             return self._total_bytes / self._max_bytes
 
     def _shm_path(self, shard_path: str) -> Path:
+        """Derive the /dev/shm path for a given shard path."""
         digest = hashlib.sha1(shard_path.encode()).hexdigest()[:16]
         return self._base / digest
 
     async def _load_one(self, shard_path: str, shm: Path) -> None:
-        """Fetch one shard from Lustre, write to /dev/shm."""
+        """Fetch one shard from the filesystem, write to /dev/shm."""
         async with self._sem:
             try:
-                data = await self._read_lustre(shard_path)
+                t0   = time.perf_counter()
+                data = await _read_shard_async(shard_path)
+                elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+                if self._metrics is not None:
+                    self._metrics.inc(MetricField.LUSTRE_READ_TIME_MS, elapsed_ms)
+                    self._metrics.inc(MetricField.LUSTRE_BYTES_READ, len(data))
 
                 # [B2-FIX] Wait for eviction headroom with bounded retries.
                 for attempt in range(_EVICT_RETRIES):
@@ -501,28 +587,10 @@ class NodeSharedShardCache:
                     self._total_bytes     += len(data)
 
                 self._update_utilisation_metric()
-
-                if self._metrics is not None:
-                    self._metrics.inc(MetricField.LUSTRE_BYTES_READ, len(data))
                 log.debug("Shard cached: %s (%d MB)", shard_path, len(data) >> 20)
             finally:
                 with self._lru_lock:
                     self._in_flight.discard(shard_path)
-
-    async def _read_lustre(self, shard_path: str) -> bytes:
-        t0 = time.perf_counter()
-        try:
-            import aiofiles
-            async with aiofiles.open(shard_path, "rb") as f:
-                data = await f.read()
-        except ImportError:
-            loop = asyncio.get_running_loop()
-            data = await loop.run_in_executor(None, _read_file_sync, shard_path)
-
-        elapsed_ms = int((time.perf_counter() - t0) * 1000)
-        if self._metrics is not None:
-            self._metrics.inc(MetricField.LUSTRE_READ_TIME_MS, elapsed_ms)
-        return data
 
     @staticmethod
     def _write(shm: Path, data: bytes) -> None:
@@ -542,6 +610,7 @@ class NodeSharedShardCache:
 
     @staticmethod
     def _read(shm: Path) -> bytes:
+        """Read shard bytes from a /dev/shm backing file."""
         with open(shm, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
             data_len, magic = struct.unpack_from(_HDR_FMT, mm, 0)
             if magic != _READY_MAGIC:
@@ -552,9 +621,6 @@ class NodeSharedShardCache:
         """Evict LRU shards to make room. Caller must hold _lru_lock.
 
         [FIX-EVICT] _total_bytes is only decremented after a successful unlink.
-        If unlink fails, the shard is still removed from the LRU index (it
-        cannot be re-served anyway) but bytes are not decremented, keeping the
-        accounting conservative rather than going negative.
         """
         while self._total_bytes + incoming > self._max_bytes and self._lru:
             path_str, sz = self._lru.popitem(last=False)
@@ -563,16 +629,16 @@ class NodeSharedShardCache:
             try:
                 p.unlink(missing_ok=True)
                 p.with_suffix(".tmp").unlink(missing_ok=True)
-                self._total_bytes -= sz  # decrement only on success
+                self._total_bytes -= sz
             except Exception as exc:
                 log.warning(
                     "Eviction failed for %s: %s — bytes NOT decremented to "
                     "preserve accounting integrity.",
                     path_str, exc,
                 )
-                # Do not decrement: conservatively over-report usage.
 
     def _update_utilisation_metric(self) -> None:
+        """Update the shard cache utilisation metric and emit a warning if high."""
         util = self.utilisation
         if self._metrics is not None:
             self._metrics.set_float(MetricField.SHARD_CACHE_UTIL_PCT, util * 100.0)
@@ -589,6 +655,7 @@ class NodeSharedShardCache:
                 )
 
     def _init_shm(self) -> None:
+        """Initialise the /dev/shm directory for this job."""
         _purge_orphaned_shm(self._base.name, hb_stale_s=_HB_STALE_S)
         if self._base.exists():
             log.info("Removing stale shard cache at %s", self._base)
@@ -596,6 +663,7 @@ class NodeSharedShardCache:
         self._base.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def _register_signals(self) -> None:
+        """Register SIGTERM/SIGINT handlers to trigger a clean shutdown."""
         def _handler(signum: int, frame: object) -> None:
             self._shutdown_event.set()
 

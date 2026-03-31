@@ -26,7 +26,6 @@ import numpy as np
 import pytest
 import torch
 
-# Ensure src is importable
 _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
@@ -41,12 +40,14 @@ from dino_loader.backends.cpu import (
     StubDistribEnv,
     _augment_one,
 )
+from dino_loader.config import DINOAugConfig, PipelineConfig
 from dino_loader.mixing_source import ResolutionSource
 from tests.fixtures import write_shard
 
 # ══════════════════════════════════════════════════════════════════════════════
 # InProcessShardCache
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestInProcessShardCache:
 
@@ -86,20 +87,17 @@ class TestInProcessShardCache:
         tar_path1, _ = write_shard(tmp_path, shard_idx=0, n_samples=8)
         tar_path2, _ = write_shard(tmp_path, shard_idx=1, n_samples=8)
 
-        # Budget just large enough for one shard at a time
         cache = InProcessShardCache(max_gb=1e-4)  # ~100 KB
         cache.get(tar_path1)
         assert len(cache._lru) == 1
 
         cache.get(tar_path2)
-        # With a tiny budget, the first shard should have been evicted
         assert tar_path1 not in cache._lru or cache._total <= cache._max_bytes
 
     def test_prefetch_is_noop(self, tmp_path):
         tar_path, _ = write_shard(tmp_path, n_samples=4)
         cache = InProcessShardCache(max_gb=1.0)
-        # Should not raise
-        cache.prefetch(tar_path)
+        cache.prefetch(tar_path)   # must not raise
 
     def test_max_bytes_zero_utilisation(self):
         cache = InProcessShardCache(max_gb=0.0)
@@ -109,6 +107,7 @@ class TestInProcessShardCache:
 # ══════════════════════════════════════════════════════════════════════════════
 # _augment_one
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestAugmentOne:
 
@@ -145,23 +144,8 @@ class TestAugmentOne:
         assert t.shape == (3, 32, 32)
         assert torch.all(t == 0)
 
-    def test_different_seeds_produce_different_crops(self):
-        import random
-        jpeg = self._sample_jpeg()
-        random.seed(0)
-        t1 = _augment_one(jpeg, self.cfg, crop_size=32, scale=(0.5, 1.0),
-                          blur_prob=0.0, sol_prob=0.0)
-        random.seed(99)
-        t2 = _augment_one(jpeg, self.cfg, crop_size=32, scale=(0.5, 1.0),
-                          blur_prob=0.0, sol_prob=0.0)
-        # Not guaranteed to differ on every run, but almost certainly will
-        # for different seeds and non-trivial images.
-        # Just verify both are valid tensors.
-        assert t1.shape == t2.shape
-
     def test_solarize_enabled(self):
         jpeg = self._sample_jpeg()
-        # High solarize prob — just verify no crash
         t = _augment_one(jpeg, self.cfg, crop_size=32, scale=(0.5, 1.0),
                          blur_prob=0.0, sol_prob=1.0)
         assert t.shape == (3, 32, 32)
@@ -179,18 +163,17 @@ class TestAugmentOne:
 # CPUAugPipeline
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestCPUAugPipeline:
 
-    def _make_source(self, batch_size: int, n_samples_per_call: int = None):
+    def _make_source(self, batch_size: int):
         """A minimal MixingSource-compatible callable."""
-        if n_samples_per_call is None:
-            n_samples_per_call = batch_size
         from tests.fixtures import make_jpeg_bytes
 
         def _source(info=None):
             return [
                 np.frombuffer(make_jpeg_bytes(64, 64), dtype=np.uint8)
-                for _ in range(n_samples_per_call)
+                for _ in range(batch_size)
             ]
         return _source
 
@@ -215,13 +198,11 @@ class TestCPUAugPipeline:
             assert t.shape == (batch_size, 3, 16, 16), f"view_{i}: {t.shape}"
 
     def test_dynamic_resolution(self, small_aug_cfg):
-        """set() on ResolutionSource takes effect on the next run_one_batch()."""
         batch_size = 2
         res_src    = ResolutionSource(32, 16)
         source     = self._make_source(batch_size)
         pipe       = CPUAugPipeline(source, small_aug_cfg, batch_size, res_src, seed=0)
 
-        # Change resolution mid-stream
         res_src.set(64, 32)
         result = pipe.run_one_batch()
 
@@ -253,10 +234,10 @@ class TestCPUAugPipeline:
 # CPUPipelineIterator
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 class TestCPUPipelineIterator:
 
     def _make_iterator(self, small_aug_cfg, batch_size=2, n_batches=3):
-        """Create an iterator backed by a counter-limited source."""
         from tests.fixtures import make_jpeg_bytes
         res_src = ResolutionSource(32, 16)
 
@@ -279,7 +260,7 @@ class TestCPUPipelineIterator:
         it = self._make_iterator(small_aug_cfg)
         out = next(it)
         assert isinstance(out, list)
-        assert len(out) == 1           # one "pipeline" output
+        assert len(out) == 1
         assert isinstance(out[0], dict)
 
     def test_dict_has_view_keys(self, small_aug_cfg):
@@ -292,14 +273,13 @@ class TestCPUPipelineIterator:
         it  = self._make_iterator(small_aug_cfg, n_batches=1)
         next(it)
         it.reset()
-        # After reset, the underlying source has been exhausted but the
-        # iterator is no longer flagged as exhausted
         assert not it._exhausted
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NullH2DStream
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestNullH2DStream:
 
@@ -326,15 +306,14 @@ class TestNullH2DStream:
         assert out is batch
 
     def test_wait_is_noop(self):
-        device = torch.device("cpu")
-        topo   = StubClusterTopology()
-        h2d    = NullH2DStream(device=device, topo=topo)
-        h2d.wait()  # must not raise
+        h2d = NullH2DStream(device=torch.device("cpu"), topo=StubClusterTopology())
+        h2d.wait()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # NullFP8Formatter
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestNullFP8Formatter:
 
@@ -354,6 +333,7 @@ class TestNullFP8Formatter:
 # ══════════════════════════════════════════════════════════════════════════════
 # StubDistribEnv / StubClusterTopology
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestStubDistribEnv:
 
@@ -383,8 +363,9 @@ class TestStubDistribEnv:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CPUBackend factory
+# CPUBackend factory — utilise PipelineConfig [CFG-PIPE]
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 class TestCPUBackend:
 
@@ -405,26 +386,11 @@ class TestCPUBackend:
         )
         assert isinstance(cache, InProcessShardCache)
 
-    def test_build_pipeline(self, cpu_backend, small_aug_cfg, tmp_path):
+    def test_build_pipeline_with_pipeline_cfg(self, cpu_backend, small_aug_cfg, tmp_path):
+        """build_pipeline accepte désormais PipelineConfig au lieu de kwargs individuels."""
         from tests.fixtures import make_jpeg_bytes
-        res_src = ResolutionSource(32, 16)
-        batch_size = 2
+        from dino_loader.augmentation import DinoV2AugSpec
 
-        def _source(info=None):
-            return [
-                np.frombuffer(make_jpeg_bytes(64, 64), dtype=np.uint8)
-                for _ in range(batch_size)
-            ]
-
-        pipe = cpu_backend.build_pipeline(
-            source=_source, aug_cfg=small_aug_cfg,
-            batch_size=batch_size, num_threads=1, device_id=0,
-            resolution_src=res_src,
-        )
-        assert isinstance(pipe, CPUAugPipeline)
-
-    def test_build_pipeline_iterator(self, cpu_backend, small_aug_cfg):
-        from tests.fixtures import make_jpeg_bytes
         res_src    = ResolutionSource(32, 16)
         batch_size = 2
 
@@ -433,14 +399,44 @@ class TestCPUBackend:
                 np.frombuffer(make_jpeg_bytes(64, 64), dtype=np.uint8)
                 for _ in range(batch_size)
             ]
+        # Expose les attributs attendus par CPUBackend.build_pipeline.
+        _source._resolution_src = res_src
+        _source._batch_size     = batch_size
+
+        aug_spec     = DinoV2AugSpec(aug_cfg=small_aug_cfg)
+        pipeline_cfg = PipelineConfig(device_id=0, seed=0)
 
         pipe = cpu_backend.build_pipeline(
-            source=_source, aug_cfg=small_aug_cfg,
-            batch_size=batch_size, num_threads=1, device_id=0,
-            resolution_src=res_src,
+            source       = _source,
+            aug_spec     = aug_spec,
+            pipeline_cfg = pipeline_cfg,
+        )
+        assert isinstance(pipe, CPUAugPipeline)
+
+    def test_build_pipeline_iterator(self, cpu_backend, small_aug_cfg):
+        from tests.fixtures import make_jpeg_bytes
+        from dino_loader.augmentation import DinoV2AugSpec
+
+        res_src    = ResolutionSource(32, 16)
+        batch_size = 2
+
+        def _source(info=None):
+            return [
+                np.frombuffer(make_jpeg_bytes(64, 64), dtype=np.uint8)
+                for _ in range(batch_size)
+            ]
+        _source._resolution_src = res_src
+        _source._batch_size     = batch_size
+
+        aug_spec     = DinoV2AugSpec(aug_cfg=small_aug_cfg)
+        pipeline_cfg = PipelineConfig(device_id=0, seed=0)
+
+        pipe = cpu_backend.build_pipeline(
+            source=_source, aug_spec=aug_spec, pipeline_cfg=pipeline_cfg,
         )
         it = cpu_backend.build_pipeline_iterator(
             pipeline   = pipe,
+            aug_spec   = aug_spec,
             output_map = [f"view_{i}" for i in range(small_aug_cfg.n_views)],
             batch_size = batch_size,
         )
