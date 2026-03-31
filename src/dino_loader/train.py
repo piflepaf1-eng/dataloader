@@ -45,7 +45,7 @@ import os
 
 import torch
 from dino_datasets import DatasetSpec
-from dino_env import slurm_init
+from dino_env import init
 
 from dino_loader import (
     DINOAugConfig,
@@ -67,7 +67,7 @@ _TOTAL_IMAGES = 50_000 * 10_000 + 30_000 * 10_000 + 5_000 * 10_000  # ~850 M
 
 def main() -> None:
     # ── 1. Distributed init ────────────────────────────────────────────────────
-    env    = slurm_init()
+    env    = init()
     device = torch.device(f"cuda:{env.local_rank % torch.cuda.device_count()}")  # noqa: F841
 
     # ── 2. Dataset catalogue ──────────────────────────────────────────────────
