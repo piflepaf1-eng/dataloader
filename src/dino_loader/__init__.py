@@ -23,10 +23,6 @@ Public API
     for epoch in range(100):
         pipeline.set_epoch(epoch)
         for batch in pipeline:
-            # batch.global_crops : list[Tensor]  — BF16 on GPU (or FP8+meta with TE)
-            # batch.local_crops  : list[Tensor]
-            # batch.metadata     : list[Optional[dict]]  — .json sidecar per sample
-            # batch.masks        : Optional[Tensor]      — iBOT token masks
             ...
 
 Phase 1 — torchdata.nodes integration
@@ -39,29 +35,12 @@ Phase 1 — torchdata.nodes integration
         for jpegs, meta in loader:
             my_augment(jpegs)
 
-Phase 3 — NodePipeline (torchdata-backed stateful post-processing)
-------------------------------------------------------------------
-    from dino_loader.pipeline_graph import wrap_loader
+Sources alternatives
+---------------------
+    from dino_loader.sources import MixingSource, WDSSource
 
-    pipeline = (
-        wrap_loader(DINODataLoader(...))
-        .map(apply_ibot_masks)
-        .select(quality_ok)
-        .with_epoch(steps_per_epoch)
-    )
-
-New in this version
---------------------
-- NormStats dataclass — canonical [0,1] normalisation stats with
-  to_dali_scale() / to_numpy() helpers; eliminates ad-hoc ×255 conversions.
-- MixingWeights — stable __init__(names, weights) + from_specs() classmethod.
-- AugmentationSpec.norm_stats — all spec subclasses expose a NormStats property.
-- PostProcessPipeline removed — wrap_loader() is the single post-processing
-  entry point, backed by torchdata.nodes with full state_dict support.
-- DINODataLoader.backend public property.
-- DINODataLoader._step / ._epoch explicitly initialised and maintained.
-- MaskMapNode now properly subclasses BaseNode; raises ValueError on empty
-  global_crops instead of silently producing wrong-shaped masks.
+    # MixingSource : optimisée HPC, cache /dev/shm, multi-nœuds (défaut)
+    # WDSSource    : basée webdataset, plus simple, NVMe / Lustre rapide
 """
 
 import logging
@@ -69,7 +48,6 @@ import logging
 from dino_loader.config import DINOAugConfig, LoaderConfig, NormStats
 from dino_loader.loader import DINODataLoader
 from dino_loader.memory import Batch
-from dino_loader.mixing_source import ResolutionSource
 from dino_loader.nodes import (
     MaskMapNode,
     MetadataNode,
@@ -82,6 +60,8 @@ from dino_loader.pipeline_graph import (  # noqa: F401
     NodePipeline,
     wrap_loader,
 )
+from dino_loader.sources import MixingSource, WDSSource
+from dino_loader.sources.resolution import ResolutionSource
 
 log = logging.getLogger(__name__)
 
@@ -94,10 +74,12 @@ __all__ = [
     "LoaderConfig",
     "MaskMapNode",
     "MetadataNode",
+    "MixingSource",
     "NodePipeline",
     "NormStats",
     "ResolutionSource",
     "ShardReaderNode",
+    "WDSSource",
     "build_reader_graph",
     "wrap_loader",
 ]

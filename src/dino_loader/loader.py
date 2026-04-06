@@ -70,7 +70,7 @@ from dino_loader.config import (
     PipelineConfig,
 )
 from dino_loader.memory import Batch
-from dino_loader.mixing_source import ResolutionSource
+from dino_loader.sources.resolution import ResolutionSource
 from dino_loader.monitor.metrics import init_registry
 from dino_loader.nodes import ShardReaderNode
 from dino_loader.pipeline_graph import NodePipeline, _DALINode, wrap_loader

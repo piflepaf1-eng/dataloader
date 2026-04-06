@@ -1,6 +1,6 @@
 """tests/test_mixing_source.py
 ================================
-Unit tests for mixing_source.py.
+Unit tests for hpc_source.py (ex-mixing_source.py).
 
 [POOL] MixingSource accepte pool_cfg (SharedExtractionPoolConfig).
        ShardIterator requiert un executor injecté par MixingSource.
@@ -32,13 +32,8 @@ from dino_datasets import DatasetSpec
 
 from dino_loader.backends.cpu import InProcessShardCache
 from dino_loader.config import SharedExtractionPoolConfig
-from dino_loader.mixing_source import (
-    MixingSource,
-    MixingWeights,
-    ResolutionSource,
-    SampleRecord,
-    ShardIterator,
-)
+from dino_loader.sources import MixingSource, MixingWeights, ResolutionSource
+from dino_loader.sources.hpc_source import SampleRecord, ShardIterator
 from tests.fixtures import scaffold_dataset_dir, write_shard
 
 

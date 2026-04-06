@@ -5,8 +5,7 @@ Pure-Python / PyTorch CPU backend.
 Used for unit tests, CI, and rapid iteration on laptops. All DALI-specific
 logic lives in DALIBackend; this backend replaces it with PIL + torchvision.
 
-[CPU-AUG-1] build_pipeline dispatches on AugmentationSpec subtype via
-            isinstance chains.
+[CPU-AUG-1] build_pipeline dispatches on AugmentationSpec subtype via isinstance.
 [CPU-AUG-2] EvalAugSpec → CPUEvalPipeline: deterministic resize + centre-crop.
 [CPU-AUG-3] LeJEPAAugSpec → CPULeJEPAPipeline: context + N target crops.
 [CPU-AUG-4] UserAugSpec → CPUUserAugPipeline: decodes JPEG with PIL,
@@ -15,10 +14,7 @@ logic lives in DALIBackend; this backend replaces it with PIL + torchvision.
 [NORM]      All normalisation conversions go through NormStats.to_dali_scale()
             or NormStats.to_numpy() — no ad-hoc ×255 multiplications.
 [FIX-DTYPE] All CPU pipelines now read ``pipeline_cfg.output_dtype`` and cast
-            the output tensor to the corresponding torch dtype (``bfloat16`` or
-            ``float32``).  Previously the CPU path always returned
-            ``torch.float32`` regardless of the configured dtype, creating a
-            silent mismatch with the DALI path on production runs.
+            the output tensor to the corresponding torch dtype.
 """
 
 import contextlib
@@ -43,6 +39,7 @@ from dino_loader.augmentation import (
     UserAugSpec,
 )
 from dino_loader.config import DINOAugConfig, NormStats, PipelineConfig
+from dino_loader.sources.resolution import ResolutionSource
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +54,6 @@ except ImportError:
         "Install torchvision for higher-fidelity transforms.",
     )
 
-# Map config dtype strings to torch dtypes.
 _DTYPE_MAP: dict[str, torch.dtype] = {
     "bf16": torch.bfloat16,
     "fp32": torch.float32,
@@ -257,8 +253,7 @@ def _to_tensor_normalized(
     Args:
         img: PIL image to convert.
         stats: Normalisation statistics in [0, 1] scale.
-        out_dtype: Output tensor dtype.  Defaults to ``bfloat16`` to match
-            the DALI pipeline default.
+        out_dtype: Output tensor dtype.
 
     Returns:
         Tensor of shape ``(3, H, W)`` in *out_dtype*.
@@ -266,14 +261,12 @@ def _to_tensor_normalized(
     """
     mean_arr, std_arr = stats.to_numpy()
     if HAS_TV:
-        t = TF.to_tensor(img)  # float32 in [0, 1]
+        t = TF.to_tensor(img)
         t = TF.normalize(t, mean=mean_arr.tolist(), std=std_arr.tolist())
     else:
         arr = np.asarray(img, dtype=np.float32) / 255.0
         arr = (arr - mean_arr) / std_arr
         t   = torch.from_numpy(arr.transpose(2, 0, 1))
-
-    # [FIX-DTYPE] Cast to the configured dtype so the CPU and DALI paths match.
     return t.to(out_dtype)
 
 
@@ -303,7 +296,7 @@ def _augment_one(
     """
     try:
         img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return torch.zeros(3, crop_size, crop_size, dtype=out_dtype)
 
     img = _random_resized_crop(img, crop_size, scale)
@@ -334,7 +327,7 @@ class CPUAugPipeline:
         source:         Any,
         aug_cfg:        DINOAugConfig,
         batch_size:     int,
-        resolution_src: Any,
+        resolution_src: ResolutionSource,
         seed:           int = 0,
         out_dtype:      torch.dtype = torch.bfloat16,
     ) -> None:
@@ -418,7 +411,7 @@ class CPUEvalPipeline:
                 img = _resize_shorter(img, resize_size)
                 img = _center_crop(img, spec.crop_size)
                 t   = _to_tensor_normalized(img, spec.norm_stats, out_dtype=self._out_dtype)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 t = torch.zeros(3, spec.crop_size, spec.crop_size, dtype=self._out_dtype)
             tensors.append(t)
 
@@ -456,7 +449,7 @@ class CPULeJEPAPipeline:
             jpeg_bytes = bytes(jpeg_arr)
             try:
                 img = Image.open(io.BytesIO(jpeg_bytes)).convert("RGB")
-            except Exception:
+            except Exception:  # noqa: BLE001
                 img = Image.new("RGB", (224, 224))
 
             ctx = _random_resized_crop(img, spec.context_crop_size, spec.context_scale)
@@ -466,7 +459,6 @@ class CPULeJEPAPipeline:
             output["context"].append(
                 _to_tensor_normalized(ctx, spec.norm_stats, out_dtype=self._out_dtype)
             )
-
             for i in range(spec.n_target_views):
                 tgt = _random_resized_crop(img, spec.target_crop_size, spec.target_scale)
                 output[f"target_{i}"].append(
@@ -505,7 +497,7 @@ class CPUUserAugPipeline:
                 img = Image.open(io.BytesIO(bytes(jpeg_arr))).convert("RGB")
                 img = _resize_shorter(img, spec.decode_size)
                 t   = _to_tensor_normalized(img, spec.norm_stats, out_dtype=self._out_dtype)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 t = torch.zeros(3, spec.decode_size, spec.decode_size, dtype=self._out_dtype)
             tensors.append(t)
 
@@ -695,8 +687,6 @@ class CPUBackend:
 
         """
         resolution_src = getattr(source, "_resolution_src", None)
-        # [FIX-DTYPE] Resolve the output dtype from the pipeline config so that
-        # the CPU path honours LoaderConfig.output_dtype.
         out_dtype = _resolve_torch_dtype(pipeline_cfg)
 
         if isinstance(aug_spec, DinoV2AugSpec):

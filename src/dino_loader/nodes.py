@@ -31,17 +31,13 @@ Public API
         build_reader_graph, # convenience factory → tn.Loader
     )
 
-Corrections apportées
----------------------
-[FIX-RESET] ShardReaderNode.reset() ne recrée plus MixingSource à chaque
-            appel.  ``tn.Loader(restart_on_stop_iteration=True)`` appelle
-            reset() à chaque époque, recréer tous les threads ShardIterator
-            était donc coûteux et inutile.  reset() appelle désormais
-            set_epoch() sur la source existante, comme le fait DINODataLoader.
-            La source n'est créée qu'une seule fois à la première construction.
-[FIX-POOL]  Le pool d'extraction partagé (SharedExtractionPoolConfig) est
-            transmis à MixingSource afin que le budget de threads soit borné
-            même via le chemin torchdata.nodes.
+Note sur reset()
+----------------
+ShardReaderNode.reset() ne recrée pas MixingSource à chaque appel.
+``tn.Loader(restart_on_stop_iteration=True)`` appelle reset() à chaque époque ;
+recréer tous les threads ShardIterator serait coûteux et inutile. reset()
+appelle set_epoch() sur la source existante. La source n'est créée qu'une
+seule fois à la première construction.
 """
 
 from __future__ import annotations
@@ -57,11 +53,11 @@ from dino_datasets import DatasetSpec
 
 from dino_loader.config import SharedExtractionPoolConfig
 from dino_loader.memory import Batch
-from dino_loader.mixing_source import MixingSource, SamplePredicate
+from dino_loader.sources.hpc_source import MixingSource, SamplePredicate
 
 log = logging.getLogger(__name__)
 
-# Type alias: un batch brut retourné par ShardReaderNode.
+# Type alias : un batch brut retourné par ShardReaderNode.
 ReaderBatch = tuple[list[np.ndarray], list[dict[str, Any] | None]]
 
 
@@ -82,13 +78,6 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
     Each call to ``next()`` returns a ``ReaderBatch``:
     ``(list[np.ndarray], list[dict | None])`` — raw JPEG bytes and optional
     JSON metadata, both of length ``batch_size``.
-
-    Note on reset()
-    ---------------
-    ``reset()`` ne recrée **pas** ``MixingSource`` à chaque appel.  Cela
-    évite la reconstruction de tous les threads d'extraction à chaque époque.
-    La source est construite une seule fois dans ``reset()`` lors de la
-    première invocation, puis ``set_epoch()`` est appelé pour les suivantes.
 
     Args:
         specs: Dataset specifications (shards, weights, quality filters, …).
@@ -149,9 +138,9 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
         """Prépare la source pour une nouvelle époque.
 
-        [FIX-RESET] La source n'est créée qu'à la première invocation.
-        Pour les époques suivantes, set_epoch() est appelé sur la source
-        existante, ce qui évite de recréer tous les threads d'extraction.
+        La source n'est créée qu'à la première invocation. Pour les époques
+        suivantes, set_epoch() est appelé sur la source existante, ce qui
+        évite de recréer tous les threads d'extraction.
 
         Args:
             initial_state: Optional state dict from a prior :meth:`get_state` call.
@@ -160,7 +149,6 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         super().reset(initial_state)
 
         if self._source is None:
-            # Première construction : crée la source et son pool.
             self._source = MixingSource(
                 specs               = self._specs,
                 batch_size          = self._batch_size,
@@ -183,7 +171,6 @@ class ShardReaderNode(BaseNode):  # type: ignore[misc]
         if initial_state is not None:
             self._restore_state(initial_state)
         else:
-            # Réinitialise l'époque sur la source existante sans recréer de threads.
             self._source.set_epoch(self._epoch)
             log.debug("ShardReaderNode.reset: set_epoch(%d)", self._epoch)
 
