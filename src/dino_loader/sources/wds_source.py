@@ -248,6 +248,62 @@ class WDSSource:
             metadata.append(meta if isinstance(meta, dict) else None)
             # Note : avec wds.RandomMix, l'index de dataset n'est pas exposé
             # par l'API publique. On utilise 0 comme approximation.
+            # TODO: Fix this
+            # Here is the reference implementation of wds.RandomMix, maybe a small reimpl. is sufficient to get the dataset index while remaining true to the objectif of wds_source.
+            """
+            def random_samples(sources, probs=None, longest=False):
+    '''Yield samples randomly from multiple sources based on given probabilities.
+
+    Args:
+        sources (list): List of iterable sources to draw samples from.
+        probs (list, optional): List of probabilities for each source. Defaults to None.
+        longest (bool): If True, continue until all sources are exhausted. Defaults to False.
+
+    Yields:
+        Sample randomly selected from one of the sources.
+    '''
+    if probs is None:
+        probs = [1] * len(sources)
+    else:
+        probs = list(probs)
+    while len(sources) > 0:
+        cum = (np.array(probs) / np.sum(probs)).cumsum()
+        r = random.random()
+        i = np.searchsorted(cum, r)
+        try:
+            yield next(sources[i])
+        except StopIteration:
+            if longest:
+                del sources[i]
+                del probs[i]
+            else:
+                break
+
+
+class RandomMix(IterableDataset):
+    '''Iterate over multiple datasets by randomly selecting samples based on given probabilities.'''
+
+    def __init__(self, datasets, probs=None, longest=False):
+        '''Initialize the RandomMix iterator.
+
+        Args:
+            datasets (list): List of datasets to iterate over.
+            probs (list, optional): List of probabilities for each dataset. Defaults to None.
+            longest (bool): If True, continue until all datasets are exhausted. Defaults to False.
+        '''
+        self.datasets = datasets
+        self.probs = probs
+        self.longest = longest
+
+    def __iter__(self):
+        '''Return an iterator over the sources.
+
+        Returns:
+            iterator: An iterator that yields samples randomly from the datasets.
+        '''
+        sources = [iter(d) for d in self.datasets]
+        return random_samples(sources, self.probs, longest=self.longest)
+            """
             ds_indices.append(0)
 
         with self._lock:
