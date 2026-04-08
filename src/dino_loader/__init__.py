@@ -53,7 +53,7 @@ import logging
 from dino_loader.config import DINOAugConfig, LoaderConfig, NormStats
 from dino_loader.loader import DINODataLoader
 from dino_loader.memory import Batch
-from dino_loader.pipeline_graph import (  # noqa: F401
+from dino_loader.pipeline_graph import (
     BatchFilterNode,
     BatchMapNode,
     MaskMapNode,

@@ -64,7 +64,6 @@ from dino_loader.memory import Batch
 from dino_loader.monitor.metrics import init_registry
 from dino_loader.pipeline_graph import NodePipeline, _DALINode, wrap_loader
 from dino_loader.shard_reader import ShardReaderNode
-from dino_loader.sources.protocol import SourceProtocol
 from dino_loader.sources.resolution import ResolutionSource
 
 log = logging.getLogger(__name__)
