@@ -50,28 +50,14 @@ from typing import Any
 
 import numpy as np
 from dino_datasets import DatasetSpec
+from webdataset.shardlists import ResampledShards
 
 from dino_loader.augmentation import SampleMeta, SamplePredicate
 from dino_loader.config import SharedExtractionPoolConfig
+from dino_loader.monitor.metrics import MetricField, get_registry
 from dino_loader.sources._weights import MixingWeights
 
 log = logging.getLogger(__name__)
-
-try:
-    from dino_loader.monitor.metrics import MetricField, get_registry
-    HAS_METRICS = True
-except ImportError:
-    HAS_METRICS = False
-
-try:
-    from webdataset.shardlists import ResampledShards
-    HAS_WDS = True
-except ImportError:
-    HAS_WDS = False
-    log.warning(
-        "webdataset not installed — shard_sampling='resampled' will fall back "
-        "to 'epoch' mode. Install with: pip install webdataset",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -206,21 +192,13 @@ class ShardIterator:
 
         self._resampled_iter = None
         if self._sampling == "resampled":
-            if HAS_WDS:
-                self._resampled_iter = iter(
-                    ResampledShards(
-                        urls          = self._all_shards,
-                        seed          = seed + rank,
-                        deterministic = True,
-                    ),
-                )
-            else:
-                log.warning(
-                    "ShardIterator '%s': shard_sampling='resampled' requested "
-                    "but webdataset is not installed — falling back to 'epoch'.",
-                    self._name,
-                )
-                self._sampling = "epoch"
+            self._resampled_iter = iter(
+                ResampledShards(
+                    urls          = self._all_shards,
+                    seed          = seed + rank,
+                    deterministic = True,
+                ),
+            )
 
         self._shuffle_buffer_size = shuffle_buffer_size
         self._min_sample_quality  = (
@@ -387,7 +365,7 @@ class ShardIterator:
             import contextvars  # noqa: PLC0415
             ctx = contextvars.copy_context()
             ctx.run(self._io_loop_inner)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.error(
                 "ShardIterator '%s': I/O thread crashed: %s",
                 self._name, exc, exc_info=True,
@@ -679,7 +657,7 @@ class MixingSource:
 
         # Métriques de queue échantillonnées 1/100 pour ne pas saturer le hot path.
         self._batch_count += 1
-        if HAS_METRICS and self._batch_count % 100 == 0:
+        if self._batch_count % 100 == 0:
             reg = get_registry()
             if reg is not None:
                 m = reg.metrics

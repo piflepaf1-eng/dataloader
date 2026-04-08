@@ -48,8 +48,8 @@ from typing import Any
 import numpy as np
 import torch
 import torchdata.nodes as tn
-from torchdata.nodes import BaseNode
 from dino_datasets import DatasetSpec
+from torchdata.nodes import BaseNode
 
 from dino_loader.config import SharedExtractionPoolConfig
 from dino_loader.memory import Batch
@@ -352,7 +352,7 @@ class MaskMapNode(BaseNode):  # type: ignore[misc]
     def as_transform(
         mask_generator,
         num_masking_patches: int | None = None,
-    ) -> "Callable[[Batch], Batch]":  # noqa: F821
+    ) -> Callable[[Batch], Batch]:  # noqa: F821
         """Return a ``Batch → Batch`` callable for use with ``.map()``."""
 
         def _apply(batch: Batch) -> Batch:
