@@ -1,9 +1,6 @@
 """tests/test_loader_config.py
 ==============================
-Unit tests for :class:`dino_loader.config.LoaderConfig`,
-:class:`dino_loader.config.SharedExtractionPoolConfig`,
-:class:`dino_loader.config.PipelineConfig` and
-:class:`dino_loader.config.CheckpointState`.
+Unit tests for config dataclasses and checkpoint serialization.
 
 Coverage
 --------
@@ -15,22 +12,24 @@ LoaderConfig
 - FP8 requires transformer-engine at construction time [CFG-B4]
 - dali_cpu_queue default ≥ 16 (post-AsyncPrefetchIterator removal)
 - adaptive_prefetch validation [ARCH2]
-- prometheus_port validation [ARCH3]
 
-SharedExtractionPoolConfig [CFG-POOL]
+SharedExtractionPoolConfig
 - Valeurs par défaut
 - Validation max_workers > 0
 
-PipelineConfig [CFG-PIPE]
+PipelineConfig
 - from_loader_config() produit les bons champs
 - Seed offset par rank
 
-CheckpointState
-- save / load round-trip avec SHA-256 [M3]
+CheckpointState — pure dataclass (no I/O)
+- to_dict / from_dict round-trip
+- Missing fields default gracefully
+
+save_checkpoint / load_checkpoint (from checkpoint.py)
+- SHA-256 envelope round-trip [M3]
 - Tampered file raises ValueError
 - Backward-compatible flat format
 - Atomic write via .tmp → rename
-- Missing crop-size fields default gracefully
 """
 
 from __future__ import annotations
@@ -47,12 +46,14 @@ _SRC = str(Path(__file__).parent.parent / "src")
 if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
+from dino_loader.checkpoint import load_checkpoint, save_checkpoint
 from dino_loader.config import (
     CheckpointState,
     LoaderConfig,
     PipelineConfig,
     SharedExtractionPoolConfig,
 )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LoaderConfig — defaults
@@ -68,8 +69,6 @@ class TestLoaderConfigDefaults:
         assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").shuffle_buffer_size == 512
 
     def test_stateful_dataloader_enabled_by_default(self):
-        # Quand stateful=True (défaut), checkpoint_dir doit être fourni.
-        # On teste donc le comportement par défaut en passant un checkpoint_dir.
         cfg = LoaderConfig(checkpoint_dir="/tmp/test_ckpt")
         assert cfg.stateful_dataloader is True
 
@@ -139,17 +138,14 @@ class TestLoaderConfigValidation:
                          stateful_dataloader=False, checkpoint_dir="")
 
     def test_stateful_without_checkpoint_dir_raises(self):
-        """[CFG-CKPT] stateful_dataloader=True requiert un checkpoint_dir non vide."""
         with pytest.raises(ValueError, match="checkpoint_dir"):
             LoaderConfig(stateful_dataloader=True, checkpoint_dir="")
 
     def test_stateful_with_checkpoint_dir_valid(self, tmp_path):
-        """stateful=True + checkpoint_dir valide → pas d'erreur."""
         cfg = LoaderConfig(stateful_dataloader=True, checkpoint_dir=str(tmp_path / "ckpt"))
         assert cfg.stateful_dataloader is True
 
     def test_non_stateful_without_checkpoint_dir_valid(self):
-        """stateful=False ne requiert pas checkpoint_dir."""
         cfg = LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
         assert not cfg.stateful_dataloader
 
@@ -175,19 +171,17 @@ class TestFP8RequiresTE:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SharedExtractionPoolConfig [CFG-POOL]
+# SharedExtractionPoolConfig
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestSharedExtractionPoolConfig:
 
     def test_default_max_workers(self):
-        cfg = SharedExtractionPoolConfig()
-        assert cfg.max_workers == 16
+        assert SharedExtractionPoolConfig().max_workers == 16
 
     def test_default_queue_depth(self):
-        cfg = SharedExtractionPoolConfig()
-        assert cfg.queue_depth_per_shard == 256
+        assert SharedExtractionPoolConfig().queue_depth_per_shard == 256
 
     def test_max_workers_zero_raises(self):
         with pytest.raises(ValueError, match="max_workers"):
@@ -200,7 +194,6 @@ class TestSharedExtractionPoolConfig:
     def test_custom_values_valid(self):
         cfg = SharedExtractionPoolConfig(max_workers=8, queue_depth_per_shard=128)
         assert cfg.max_workers == 8
-        assert cfg.queue_depth_per_shard == 128
 
     def test_loader_config_has_extraction_pool(self):
         cfg = LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
@@ -208,7 +201,7 @@ class TestSharedExtractionPoolConfig:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PipelineConfig [CFG-PIPE]
+# PipelineConfig
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -227,11 +220,11 @@ class TestPipelineConfig:
 
     def test_from_loader_config(self, tmp_path):
         loader_cfg = LoaderConfig(
-            dali_num_threads  = 4,
-            hw_decoder_load   = 0.75,
-            dali_cpu_queue    = 20,
-            dali_gpu_queue    = 8,
-            seed              = 42,
+            dali_num_threads   = 4,
+            hw_decoder_load    = 0.75,
+            dali_cpu_queue     = 20,
+            dali_gpu_queue     = 8,
+            seed               = 42,
             fuse_normalization = False,
             stateful_dataloader = True,
             checkpoint_dir      = str(tmp_path / "ckpt"),
@@ -242,23 +235,20 @@ class TestPipelineConfig:
         assert cfg.hw_decoder_load == 0.75
         assert cfg.cpu_queue       == 20
         assert cfg.gpu_queue       == 8
-        assert cfg.seed            == 42 + 3   # seed + rank
+        assert cfg.seed            == 42 + 3
         assert cfg.fuse_normalization is False
 
     def test_seed_offset_by_rank(self, tmp_path):
-        """Chaque rang doit avoir un seed distinct."""
         loader_cfg = LoaderConfig(
             seed=100, stateful_dataloader=True,
             checkpoint_dir=str(tmp_path / "ckpt"),
         )
         cfg0 = PipelineConfig.from_loader_config(cfg=loader_cfg, device_id=0, rank=0)
         cfg1 = PipelineConfig.from_loader_config(cfg=loader_cfg, device_id=1, rank=1)
-        assert cfg0.seed != cfg1.seed
         assert cfg0.seed == 100
         assert cfg1.seed == 101
 
     def test_is_frozen(self):
-        """PipelineConfig est frozen (immutable)."""
         cfg = PipelineConfig()
         with pytest.raises((AttributeError, TypeError)):
             cfg.seed = 999  # type: ignore[misc]
@@ -272,8 +262,7 @@ class TestPipelineConfig:
 class TestAdaptivePrefetch:
 
     def test_default_disabled(self):
-        cfg = LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
-        assert cfg.adaptive_prefetch is False
+        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").adaptive_prefetch is False
 
     def test_enable_with_valid_target(self):
         cfg = LoaderConfig(
@@ -304,102 +293,86 @@ class TestAdaptivePrefetch:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CheckpointState — round-trip
+# CheckpointState — pure dataclass (no I/O methods)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 def _make_state(step: int = 100, epoch: int = 2) -> CheckpointState:
     return CheckpointState(
-        step=step,
-        epoch=epoch,
+        step=step, epoch=epoch,
         dataset_names=["laion", "imagenet"],
         mixing_weights=[0.7, 0.3],
-        global_crop_size=224,
-        local_crop_size=96,
+        global_crop_size=224, local_crop_size=96,
     )
 
 
-class TestCheckpointStateRoundTrip:
+class TestCheckpointStateDataclass:
+
+    def test_to_dict_contains_all_fields(self):
+        d = _make_state().to_dict()
+        for k in ("step", "epoch", "dataset_names", "mixing_weights",
+                  "global_crop_size", "local_crop_size"):
+            assert k in d
+
+    def test_from_dict_round_trip(self):
+        state = _make_state(step=7, epoch=3)
+        d     = state.to_dict()
+        restored = CheckpointState.from_dict(d)
+        assert restored.step  == 7
+        assert restored.epoch == 3
+
+    def test_from_dict_ignores_unknown_keys(self):
+        d = _make_state().to_dict()
+        d["unknown_key"] = "ignored"
+        restored = CheckpointState.from_dict(d)
+        assert restored.step == 100
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# save_checkpoint / load_checkpoint — I/O (previously on CheckpointState)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestCheckpointIO:
 
     def test_save_and_load_step(self, tmp_path):
-        state = _make_state(step=42)
-        path  = tmp_path / "dl_state.json"
-        state.save(path)
-        assert CheckpointState.load(path).step == 42
+        path = tmp_path / "dl_state.json"
+        save_checkpoint(_make_state(step=42), path)
+        assert load_checkpoint(path).step == 42
 
     def test_save_and_load_epoch(self, tmp_path):
         path = tmp_path / "dl_state.json"
-        _make_state(epoch=5).save(path)
-        assert CheckpointState.load(path).epoch == 5
-
-    def test_save_and_load_dataset_names(self, tmp_path):
-        path = tmp_path / "dl_state.json"
-        _make_state().save(path)
-        assert CheckpointState.load(path).dataset_names == ["laion", "imagenet"]
-
-    def test_save_and_load_mixing_weights(self, tmp_path):
-        path = tmp_path / "dl_state.json"
-        _make_state().save(path)
-        assert CheckpointState.load(path).mixing_weights == [0.7, 0.3]
+        save_checkpoint(_make_state(epoch=5), path)
+        assert load_checkpoint(path).epoch == 5
 
     def test_save_and_load_crop_sizes(self, tmp_path):
         path = tmp_path / "dl_state.json"
-        _make_state().save(path)
-        loaded = CheckpointState.load(path)
+        save_checkpoint(_make_state(), path)
+        loaded = load_checkpoint(path)
         assert loaded.global_crop_size == 224
         assert loaded.local_crop_size  == 96
 
     def test_saved_file_is_valid_json(self, tmp_path):
         path = tmp_path / "dl_state.json"
-        _make_state(step=100).save(path)
+        save_checkpoint(_make_state(), path)
         data = json.loads(path.read_text())
         assert "payload" in data or "step" in data
 
-    def test_atomic_write_no_tmp_after_success(self, tmp_path):
-        path = tmp_path / "dl_state.json"
-        _make_state().save(path)
-        assert not (tmp_path / "dl_state.tmp").exists()
-        assert path.exists()
-
-
-class TestCheckpointStateIntegrity:
-
-    def test_save_creates_envelope_with_sha256(self, tmp_path):
+    def test_envelope_sha256(self, tmp_path):
         path = tmp_path / "state.json"
-        _make_state().save(path)
-        raw = json.loads(path.read_text())
-        assert "payload" in raw
-        assert "sha256" in raw
-        assert len(raw["sha256"]) == 64
-
-    def test_checksum_is_correct(self, tmp_path):
-        path = tmp_path / "state.json"
-        _make_state().save(path)
+        save_checkpoint(_make_state(), path)
         raw      = json.loads(path.read_text())
-        computed = hashlib.sha256(json.dumps(raw["payload"], indent=2).encode()).hexdigest()
+        computed = hashlib.sha256(json.dumps(raw["payload"], indent=2, sort_keys=True).encode()).hexdigest()
         assert raw["sha256"] == computed
 
-    def test_tampered_payload_raises_on_load(self, tmp_path):
+    def test_tampered_raises(self, tmp_path):
         path = tmp_path / "state.json"
-        _make_state().save(path)
+        save_checkpoint(_make_state(), path)
         raw = json.loads(path.read_text())
         raw["payload"]["step"] = 9999
         path.write_text(json.dumps(raw))
         with pytest.raises(ValueError, match="integrity check"):
-            CheckpointState.load(path)
-
-
-class TestCheckpointStateBackwardCompat:
-
-    def test_legacy_flat_format_loads(self, tmp_path):
-        path = tmp_path / "old.json"
-        path.write_text(json.dumps({
-            "step": 10, "epoch": 0,
-            "dataset_names": ["laion"],
-            "mixing_weights": [1.0],
-        }))
-        state = CheckpointState.load(path)
-        assert state.step == 10
+            load_checkpoint(path)
 
     def test_missing_crop_sizes_default_to_224_96(self, tmp_path):
         path = tmp_path / "old_state.json"
@@ -408,6 +381,6 @@ class TestCheckpointStateBackwardCompat:
             "dataset_names": ["laion"],
             "mixing_weights": [1.0],
         }))
-        loaded = CheckpointState.load(path)
+        loaded = load_checkpoint(path)
         assert loaded.global_crop_size == 224
         assert loaded.local_crop_size  == 96

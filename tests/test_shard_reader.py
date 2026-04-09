@@ -1,36 +1,46 @@
-"""tests/test_nodes.py
-=====================
-Unit tests for shard reader and pipeline graph nodes.
+"""tests/test_shard_reader.py
+==============================
+Tests unitaires pour ``dino_loader.shard_reader`` et les nœuds de graphe
+``dino_loader.pipeline_graph``.
 
-All imports come directly from ``shard_reader`` and ``pipeline_graph``.
-The ``nodes.py`` shim has been removed (REFACTOR-R1).
+Note sur les imports
+---------------------
+Ce fichier importe directement depuis ``shard_reader`` et ``pipeline_graph``,
+conformément à CONVENTIONS.md.  L'ancien ``nodes.py`` (shim de compatibilité)
+a été supprimé.
 
 Coverage
 --------
-ShardReaderNode
-- next() returns (jpeg_list, metadata_list)                        [slow]
-- get_state() returns epoch, mixing_weights, dataset_names
-- set_epoch updates state
-- set_weights normalises correctly                                  [slow]
-- reset with saved state restores epoch                            [slow]
-- dataset_names property
-- multiple batches without error                                    [slow]
+ShardReaderNode — état (rapide, sans I/O)
+- dataset_names disponible avant reset()
+- set_epoch avant reset() ne lève pas d'erreur
 
-MetadataNode
-- passes through jpegs and metadata                                [slow]
-- pop_last_metadata clears after first call                        [slow]
-- get_state delegates to source
+ShardReaderNode — intégration [slow]
+- next() retourne (jpeg_list, metadata_list)
+- get_state() contient epoch, mixing_weights, dataset_names
+- set_epoch met à jour l'état
+- reset avec état sauvegardé restaure l'époque
+- set_weights normalise correctement
+- Plusieurs batches sans erreur
 
-build_reader_graph
-- returns (loader, reader_node)
-- loader is iterable                                               [slow]
-- loader state_dict round-trip                                     [slow]
+MetadataNode — intégration [slow]
+- Passe les jpegs et métadonnées
+- pop_last_metadata vide le buffer après le premier appel
+- get_state délègue à la source
 
-MaskMapNode
-- as_transform applies mask to batch
-- mask has correct shape and dtype
-- exact count guarantee preserved after transform
+build_reader_graph — intégration [slow]
+- Retourne (loader, reader_node)
+- loader est itérable
+- state_dict round-trip
+
+MaskMapNode — rapide (stub Batch, sans I/O)
+- as_transform ajoute des masques
+- Shape et dtype des masques
+- Garantie de count exact
+- Les crops globaux ne sont pas modifiés
 """
+
+from __future__ import annotations
 
 import sys
 from pathlib import Path
@@ -42,7 +52,6 @@ if _SRC not in sys.path:
     sys.path.insert(0, _SRC)
 
 import torchdata.nodes as tn
-
 import numpy as np
 from dino_datasets import DatasetSpec
 
@@ -64,13 +73,14 @@ def _cache() -> InProcessShardCache:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ShardReaderNode — state (fast, no I/O)
+# ShardReaderNode — état (rapide, sans I/O)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestShardReaderNodeState:
 
     def test_dataset_names_before_reset(self, tmp_path: Path) -> None:
+        """dataset_names est disponible avant reset() depuis la liste des specs."""
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
         node = ShardReaderNode(
             specs=[_make_spec(tar_paths, "myds")], batch_size=4,
@@ -78,17 +88,18 @@ class TestShardReaderNodeState:
         )
         assert node.dataset_names == ["myds"]
 
-    def test_set_epoch_before_reset(self, tmp_path: Path) -> None:
+    def test_set_epoch_before_reset_does_not_raise(self, tmp_path: Path) -> None:
+        """set_epoch avant reset() ne doit pas lever d'exception."""
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=1)
         node = ShardReaderNode(
             specs=[_make_spec(tar_paths)], batch_size=4,
             cache=_cache(), rank=0, world_size=1,
         )
-        node.set_epoch(5)  # must not raise
+        node.set_epoch(5)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ShardReaderNode — integration (slow)
+# ShardReaderNode — intégration [slow]
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -96,7 +107,9 @@ class TestShardReaderNodeState:
 class TestShardReaderNodeOutput:
 
     def test_yields_jpeg_and_metadata(self, tmp_path: Path) -> None:
-        tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2, n_samples_per_shard=8)
+        tar_paths = scaffold_dataset_dir(
+            root=tmp_path, n_shards=2, n_samples_per_shard=8,
+        )
         node = ShardReaderNode(
             specs=[_make_spec(tar_paths)], batch_size=4,
             cache=_cache(), rank=0, world_size=1,
@@ -105,11 +118,12 @@ class TestShardReaderNodeOutput:
         jpegs, meta = node.next()
         assert len(jpegs) == 4
         assert len(meta) == 4
-        for j in jpegs:
-            assert isinstance(j, np.ndarray)
+        assert all(isinstance(j, np.ndarray) for j in jpegs)
 
     def test_multiple_batches_no_error(self, tmp_path: Path) -> None:
-        tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=4, n_samples_per_shard=16)
+        tar_paths = scaffold_dataset_dir(
+            root=tmp_path, n_shards=4, n_samples_per_shard=16,
+        )
         node = ShardReaderNode(
             specs=[_make_spec(tar_paths)], batch_size=8,
             cache=_cache(), rank=0, world_size=1,
@@ -120,7 +134,7 @@ class TestShardReaderNodeOutput:
             assert len(jpegs) == 8
             assert len(meta) == 8
 
-    def test_get_state_contains_epoch_weights_names(self, tmp_path: Path) -> None:
+    def test_get_state_contains_required_keys(self, tmp_path: Path) -> None:
         tar_paths = scaffold_dataset_dir(root=tmp_path, n_shards=2)
         node = ShardReaderNode(
             specs=[_make_spec(tar_paths)], batch_size=4,
@@ -175,7 +189,7 @@ class TestShardReaderNodeOutput:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MetadataNode — integration (slow)
+# MetadataNode — intégration [slow]
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -220,7 +234,7 @@ class TestMetadataNode:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# build_reader_graph — integration (slow)
+# build_reader_graph — intégration [slow]
 # ══════════════════════════════════════════════════════════════════════════════
 
 
@@ -260,11 +274,12 @@ class TestBuildReaderGraph:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MaskMapNode — fast (no I/O)
+# MaskMapNode — rapide (stub Batch, sans I/O)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestMaskMapNodeTransform:
+    """Tests pour MaskMapNode.as_transform() — aucun I/O de shard requis."""
 
     def test_as_transform_adds_masks(self) -> None:
         import torch
@@ -281,7 +296,7 @@ class TestMaskMapNodeTransform:
         out = fn(batch)
         assert out.masks is not None
 
-    def test_masks_shape_matches_batch(self) -> None:
+    def test_masks_shape_matches_batch_size(self) -> None:
         import torch
         from dino_loader.masking import MaskingGenerator
         from dino_loader.memory import Batch
@@ -313,6 +328,7 @@ class TestMaskMapNodeTransform:
         assert out.masks.dtype == torch.bool
 
     def test_masks_exact_count(self) -> None:
+        """La garantie de count exact de MaskingGenerator est préservée end-to-end."""
         import torch
         from dino_loader.masking import MaskingGenerator
         from dino_loader.memory import Batch
@@ -330,6 +346,7 @@ class TestMaskMapNodeTransform:
             assert int(out.masks[0].sum().item()) == n_mask
 
     def test_global_crops_unchanged(self) -> None:
+        """Appliquer le transform de masquage ne doit pas muter les tenseurs de crop."""
         import torch
         from dino_loader.masking import MaskingGenerator
         from dino_loader.memory import Batch

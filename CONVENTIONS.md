@@ -10,7 +10,8 @@
 - **Pas de `from __future__ import annotations`** — utiliser la syntaxe native 3.12.
   Toutes les annotations de type utilisent les génériques built-in (`list[str]`, `dict[str, int]`, `X | Y`).
 - **Alias de type PEP 695** (`type Foo = ...`) préférés à `TypeAlias` de `typing`.
-- **`match` / `case`** préféré aux longues chaînes `isinstance` pour le dispatch sur les hiérarchies de types.
+- **`match` / `case`** préféré aux longues chaînes `isinstance` dans le code générique ; dans les backends,
+  `isinstance` reste acceptable pour les dispatch sur les specs (le pattern Strategy y est plus lisible).
 - **`pathlib.Path`** utilisé partout. Quand `os.*` ou les chemins `str` sont inévitables, ajouter `# noqa: PTH<code>`.
 - **Annotations** : toutes les fonctions et méthodes publiques sont annotées, y compris `__iter__`.
 
@@ -21,7 +22,7 @@
 - **Niveau module uniquement.** Les imports lourds conditionnels (`torch.distributed`, `nvidia.dali`, etc.)
   restent locaux à leur fonction avec `# noqa: PLC0415` et un commentaire de justification.
 - **Pas d'imports circulaires.** L'ordre de dépendance est :
-  `config → augmentation → sources → shard_reader → pipeline_graph → backends → loader`.
+  `config → augmentation → sources → shard_reader → batch_node → pipeline_graph → backends → loader`.
   `monitor.*` est importé seulement depuis les couches qui en ont besoin.
 - Les blocs `TYPE_CHECKING` sont autorisés uniquement pour les références forward dans les annotations.
 
@@ -44,9 +45,10 @@
 
 ## Dataclasses
 
-- **`@dataclass(frozen=True)`** pour les value objects immutables (`DatasetSpec`, `ClusterTopology`, `NormStats`, …).
-- **`@dataclass`** (mutable) pour les objets de configuration (`LoaderConfig`, `DINOAugConfig`, `CheckpointState`).
-- **`dataclasses.replace()`** (alias `_dc_replace`) est la seule façon de produire des copies modifiées des dataclasses frozen.
+- **`@dataclass(frozen=True)`** pour les value objects immutables (`DatasetSpec`, `ClusterTopology`, `NormStats`, `PipelineConfig`).
+- **`@dataclass`** (mutable) pour les objets de configuration (`LoaderConfig`, `DINOAugConfig`).
+- **`CheckpointState`** est un pur dataclass **sans méthodes I/O** — `save` et `load` vivent dans `checkpoint.py`.
+- **`dataclasses.replace()`** est la seule façon de produire des copies modifiées des dataclasses frozen.
 
 ---
 
@@ -70,24 +72,24 @@ Les conversions vers d'autres échelles se font **uniquement au point d'utilisat
 
 | Fichier | Responsabilité |
 |------|---------------|
-| `config.py` | Dataclasses pures : `DINOAugConfig`, `LoaderConfig`, `CheckpointState`, `NormStats` |
-| `augmentation.py` | Hiérarchie `AugmentationSpec` + protocole `SamplePredicate` |
+| `config.py` | Dataclasses pures : `DINOAugConfig`, `LoaderConfig`, `CheckpointState`, `NormStats`, `PipelineConfig` |
+| `augmentation.py` | Hiérarchie `AugmentationSpec` + protocole `SamplePredicate` + `split_views` par spec |
+| `checkpoint.py` | `save_checkpoint`, `load_checkpoint`, `DataLoaderCheckpointer` — toute la logique I/O + SHA-256 |
+| `batch_node.py` | `_DALINode` — pilote l'itérateur backend, assemble `Batch`, métriques, stall watchdog |
 | `sources/protocol.py` | `SourceProtocol` — interface commune pour toutes les sources de données |
 | `sources/_weights.py` | `MixingWeights` — vecteur de poids normalisé thread-safe |
 | `sources/resolution.py` | `ResolutionSource` — holder thread-safe de la résolution de crop |
 | `sources/hpc_source.py` | `MixingSource`, `ShardIterator` — source de production HPC (Lustre + /dev/shm) |
 | `sources/wds_source.py` | `WDSSource` — source alternative basée webdataset |
 | `shard_reader.py` | `ShardReaderNode`, `build_reader_graph` — stages 1-2 : I/O shards + mixing |
-| `pipeline_graph.py` | `_DALINode`, `MetadataNode`, `MaskMapNode`, `BatchMapNode`, `BatchFilterNode`, `NodePipeline`, `wrap_loader` |
+| `pipeline_graph.py` | `MetadataNode`, `MaskMapNode`, `BatchMapNode`, `BatchFilterNode`, `NodePipeline`, `wrap_loader` |
 | `pipeline.py` | Constructeur de pipeline DALI statique + `NormSource` |
 | `memory.py` | `Batch`, `H2DStream`, `FP8Formatter`, `allocate_buffers` |
-| `checkpoint.py` | `DataLoaderCheckpointer` — I/O JSON atomique, pointeur LATEST |
-| `loader.py` | `DINODataLoader` — point d'entrée principal ; pas de logique de post-traitement |
 | `masking.py` | `MaskingGenerator` — générateur pur de masques de patches iBOT |
-| `nodes.py` | **Shim de compatibilité uniquement** — ré-exporte depuis `shard_reader` et `pipeline_graph` |
 | `backends/` | Abstraction backend pluggable (DALI, CPU) |
 | `monitor/` | Métriques, tracing, OTEL, CLI monitor |
 | `experimental/` | `dynamic_pipeline` — mode dynamique DALI v2 (pas en production) |
+| `loader.py` | `DINODataLoader` — point d'entrée principal ; orchestration sans logique métier |
 
 ### Invariants clés
 
@@ -95,24 +97,33 @@ Les conversions vers d'autres échelles se font **uniquement au point d'utilisat
   Toute l'augmentation est dans `augmentation.py`, `pipeline.py` et les `backends/`.
   Tous les transforms post-DALI sont dans `pipeline_graph.py`.
 
-- `shard_reader.py` ne connaît **pas** `loader.py`. La dépendance est unidirectionnelle :
+- **`split_views` et `initial_sizes` vivent sur les specs**, pas dans `loader.py`.
+  Chaque `AugmentationSpec` sait comment séparer ses propres vues et déclarer ses dimensions initiales.
+  Il n'y a **pas de dispatch `isinstance`** dans `loader.py` pour ces opérations.
+
+- **`CheckpointState` est un pur dataclass** sans `save()` ni `load()`.
+  Ces méthodes sont dans `checkpoint.py` (`save_checkpoint`, `load_checkpoint`).
+
+- **`_DALINode` est dans `batch_node.py`** — il pilote l'itérateur backend et assemble les Batch.
+  `pipeline_graph.py` le ré-exporte pour la compat mais n'en dépend pas pour sa logique propre.
+
+- `shard_reader.py` ne connaît **pas** `pipeline_graph.py`. La dépendance est unidirectionnelle :
   `loader.py → shard_reader.py → sources/`, jamais l'inverse.
 
 - `pipeline_graph.py` ne connaît **pas** `shard_reader.py`. Les deux sont des feuilles
-  importées par `loader.py`. Cela évite tout couplage entre l'I/O et les transforms de batch.
-
-- `nodes.py` est **uniquement un shim de compatibilité**. Ne pas y ajouter de logique.
-  Les nouveaux modules doivent importer directement depuis `shard_reader` et `pipeline_graph`.
+  importées par `loader.py`.
 
 - `masking.py` est un **module pur** sans dépendance à torch.distributed ou DALI.
   `MaskMapNode` dans `pipeline_graph.py` l'enveloppe pour le graphe torchdata.
 
 - `config.py` n'importe **rien** de `dino_loader`. Il peut importer de `dino_datasets`
-  uniquement pour le re-export de `DatasetSpec`.
+  uniquement pour le ré-export de `DatasetSpec`.
 
-- Les modules `monitor/` sont importés **paresseusement** dans les fonctions avec `# noqa: PLC0415`.
+- Les modules `monitor/` sont importés **paresseusement** avec `# noqa: PLC0415`.
 
 - Toutes les statistiques de normalisation passent par `NormStats`. Pas de conversion `× 255` en ligne.
+
+- **`nodes.py` a été supprimé.** Importer directement depuis `shard_reader` et `pipeline_graph`.
 
 ---
 
@@ -128,12 +139,9 @@ Deux implémentations de source, toutes deux conformes à `SourceProtocol` :
 ### `WDSSource` (simple, alternative)
 - Délègue cycling, shuffle et mixing à `webdataset`
 - Recommandée sur NVMe local ou Lustre MDS rapide (≤ 8 rangs/nœud)
-- Plus simple à déboguer
 
 ### Règle d'or
-
 Typer les arguments de source avec `SourceProtocol`, pas avec une implémentation concrète.
-`ShardReaderNode` accepte une source injectée via `source=` ; sans injection, `MixingSource` est utilisée par défaut.
 
 ---
 
@@ -152,8 +160,7 @@ pipeline = (
 )
 ```
 
-`DINODataLoader` expose aussi des raccourcis `.map()`, `.select()`, `.with_epoch()` qui délèguent à son `NodePipeline` interne.
-`NodePipeline` fournit un `state_dict` complet sur tout le graphe.
+`DINODataLoader` expose aussi des raccourcis `.map()`, `.select()`, `.with_epoch()`.
 
 ---
 
@@ -167,19 +174,24 @@ Les contrats clés :
 - **`next()`** : retourne un item ; lève `StopIteration` en fin d'époque.
 - **`get_state()`** : retourne un dict JSON-sérialisable pour le checkpointing.
 
-`wrap_loader(dino_loader)` bridge un `DINODataLoader` dans ce graphe.
+---
+
+## Dispatch sur AugmentationSpec
+
+Le dispatch sur les sous-types de `AugmentationSpec` doit être **limité aux backends** (`cpu.py`, `dali_backend.py`).  Dans le reste du codebase (loader, pipeline_graph), utiliser les méthodes polymorphes :
+
+| Besoin | Méthode / propriété |
+|---|---|
+| Dimensions initiales | `spec.initial_global_size`, `spec.initial_local_size` |
+| Séparer global/local | `spec.split_views(views)` |
+| Noms des vues | `spec.output_map` |
+| Stats de normalisation | `spec.norm_stats` |
 
 ---
 
-## Pipeline dynamique (`experimental/dynamic_pipeline.py`)
+## Parallélisme CPU [PERF-CPU]
 
-Le pipeline dynamique est **expérimental** au sens où il dépend de
-`nvidia.dali.experimental.dynamic`, une API NVIDIA susceptible de changer.
-
-### Contrat de randomness
-
-Tous les paramètres stochastiques dans les fonctions de batch dynamiques **doivent** utiliser
-`ndd.random.*`, jamais Python `random` ou `numpy.random`.
+`CPUAugPipeline.run_one_batch()` parallélise le décodage + augmentation JPEG via un `ThreadPoolExecutor` interne.  Le nombre de workers est `min(batch_size, cpu_count, 16)`.  La reproductibilité des tests est assurée par un seed initial commun ; les workers utilisent leurs propres états RNG thread-locaux.
 
 ---
 
@@ -189,8 +201,9 @@ Tous les paramètres stochastiques dans les fonctions de batch dynamiques **doiv
 - **Isolation** : chaque test est indépendant. Les singletons et l'état global sont patchés dans les fixtures.
 - **Tests lents** : tout test qui démarre de vrais threads `ShardIterator`, construit un graphe `tn.Loader` complet,
   ou exécute plusieurs opérations d'I/O de shards doit être décoré avec `@pytest.mark.slow`.
-- **Imports directs** : les nouveaux tests importent depuis `shard_reader` et `pipeline_graph`,
-  pas depuis `nodes` (shim de compatibilité).
+- **Imports directs** : les tests importent depuis `shard_reader` et `pipeline_graph`,
+  **jamais depuis `nodes`** (supprimé).
+- **`test_nodes.py` a été remplacé par `test_shard_reader.py`.**
 - **Pas de `from __future__ import annotations`** dans les fichiers de test.
 
 ---
@@ -201,12 +214,13 @@ Tous les paramètres stochastiques dans les fonctions de batch dynamiques **doiv
 - **DALI queues remplacent AsyncPrefetchIterator** : `dali_cpu_queue ≥ 16` est la mesure compensatoire.
 - **`NormSource` copy-on-write** : `set_dataset_indices()` construit la nouvelle liste hors du lock et swap atomiquement.
 - **Budget de threads** : le pool d'extraction est partagé entre tous les `ShardIterator` via `SharedExtractionPoolConfig`.
+- **Parallélisme CPU** : `CPUAugPipeline` utilise un `ThreadPoolExecutor` pour paralléliser le décodage JPEG.
 
 ---
 
 ## Documentation
 
-- **README.md** : garder les dépendances runtime à jour.
+- **README.md** : garder les dépendances runtime et la liste des modules à jour.
 - **Docstrings** : modules, classes publiques, toutes les méthodes publiques. Style Google.
 - **Commentaires en ligne** : *pourquoi*, jamais *quoi*.
 - **`# noqa` commentaires** : toujours inclure le code spécifique (ex : `# noqa: PTH112`).
