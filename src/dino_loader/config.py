@@ -22,7 +22,6 @@ from dataclasses import asdict, dataclass, field
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
 # NormStats — statistiques de normalisation canoniques
 # ---------------------------------------------------------------------------

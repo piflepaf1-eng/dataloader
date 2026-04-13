@@ -50,7 +50,6 @@ Corrections intégrées
 """
 
 import logging
-import threading
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 

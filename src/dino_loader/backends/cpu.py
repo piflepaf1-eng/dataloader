@@ -361,7 +361,7 @@ class CPUAugPipeline:
 
         return {
             f"view_{view_idx}": torch.stack(
-                [results[sample_idx][view_idx] for sample_idx in range(self._batch_size)]
+                [results[sample_idx][view_idx] for sample_idx in range(self._batch_size)],
             )
             for view_idx in range(cfg.n_views)
         }
@@ -452,12 +452,12 @@ class CPULeJEPAPipeline:
             if random.random() < 0.5:
                 ctx = ctx.transpose(Image.FLIP_LEFT_RIGHT)
             output["context"].append(
-                _to_tensor_normalized(ctx, spec.norm_stats, out_dtype=self._out_dtype)
+                _to_tensor_normalized(ctx, spec.norm_stats, out_dtype=self._out_dtype),
             )
             for i in range(spec.n_target_views):
                 tgt = _random_resized_crop(img, spec.target_crop_size, spec.target_scale)
                 output[f"target_{i}"].append(
-                    _to_tensor_normalized(tgt, spec.norm_stats, out_dtype=self._out_dtype)
+                    _to_tensor_normalized(tgt, spec.norm_stats, out_dtype=self._out_dtype),
                 )
 
         return {k: torch.stack(v) for k, v in output.items()}
