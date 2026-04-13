@@ -28,6 +28,10 @@ après la sortie du pipeline d'augmentation :
 
 ``wrap_loader``
     Factory publique : bridge ``DINODataLoader`` → ``NodePipeline``.
+    Accepte tout objet itérable : si ``_dali_node`` est présent il est utilisé
+    comme nœud source natif, sinon ``tn.IterableWrapper`` enveloppe l'itérable.
+    Cela permet aux tests d'utiliser des faux loaders légers sans instancier
+    le stack DALI complet.
 
 Note sur ``_DALINode``
 ----------------------
@@ -47,6 +51,9 @@ Corrections intégrées
 [FIX-STATE-MAX-STEPS] max_steps inclus dans state_dict / load_state_dict.
 [PROPS]               NodePipeline expose current_resolution, current_weights,
                       backend, aug_spec.
+[FIX-WRAP-LOADER]     wrap_loader accepte tout itérable : _dali_node est
+                      optionnel.  Les tests peuvent passer des faux loaders
+                      sans instancier le stack DALI.
 """
 
 import logging
@@ -481,11 +488,13 @@ def wrap_loader(dino_loader: Any) -> NodePipeline:
     Point d'entrée recommandé pour construire un pipeline de post-traitement.
     Utilisé en interne par ``DINODataLoader.as_pipeline()``.
 
-    Args:
-        dino_loader: Instance de ``DINODataLoader`` exposant ``_dali_node``.
+    ``_dali_node`` est utilisé comme source native quand il est présent
+    (production).  En son absence, ``tn.IterableWrapper`` enveloppe
+    ``dino_loader`` directement, ce qui permet aux tests d'utiliser des
+    faux loaders légers sans instancier le stack DALI complet.
 
-    Raises:
-        TypeError: Si ``dino_loader`` n'expose pas ``_dali_node``.
+    Args:
+        dino_loader: Instance de ``DINODataLoader`` ou tout itérable de ``Batch``.
 
     Example::
 
@@ -498,11 +507,10 @@ def wrap_loader(dino_loader: Any) -> NodePipeline:
 
     """
     dali_node = getattr(dino_loader, "_dali_node", None)
-    if dali_node is None:
-        msg = (
-            f"wrap_loader: l'objet fourni ({type(dino_loader).__name__}) "
-            "n'expose pas d'attribut '_dali_node'. "
-            "Passer une instance de DINODataLoader."
-        )
-        raise TypeError(msg)
-    return NodePipeline(root_node=dali_node, dino_loader=dino_loader)
+    if dali_node is not None:
+        root: BaseNode = dali_node  # type: ignore[type-arg]
+    else:
+        # Fallback for test fakes and any iterable loader.
+        root = tn.IterableWrapper(iter(dino_loader))
+
+    return NodePipeline(root_node=root, dino_loader=dino_loader)

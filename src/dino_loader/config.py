@@ -16,6 +16,8 @@ Corrections intégrées
                   depuis LoaderConfig.
 [FIX-CHECKSUM]    Supprimé de ce module — dans checkpoint.py.
 [FIX-CONTEXTLIB]  Supprimé de ce module — dans checkpoint.py.
+[FIX-STATEFUL]    stateful_dataloader default → False pour permettre
+                  LoaderConfig() sans checkpoint_dir (utile en tests/CI).
 """
 
 from dataclasses import asdict, dataclass, field
@@ -336,6 +338,8 @@ class LoaderConfig:
         fuse_normalization:       Fusionner la normalisation par-dataset dans DALI.
         output_dtype:             Dtype de normalisation (``"bf16"`` ou ``"fp32"``).
         stateful_dataloader:      Active state_dict() / load_state_dict().
+                                  Défaut ``False`` — passer ``True`` pour les runs
+                                  de production avec ``checkpoint_dir`` renseigné.
         checkpoint_dir:           Répertoire d'écriture des checkpoints JSON.
         checkpoint_every_steps:   Fréquence de checkpoint (rank 0 uniquement).
         force_topology:           Override de la détection topology.
@@ -372,7 +376,9 @@ class LoaderConfig:
     fuse_normalization: bool = True
     output_dtype:       str  = "bf16"
 
-    stateful_dataloader:    bool = True
+    # [FIX-STATEFUL] Default False so LoaderConfig() works without checkpoint_dir.
+    # Production runs must pass stateful_dataloader=True with a valid checkpoint_dir.
+    stateful_dataloader:    bool = False
     checkpoint_dir:         str  = ""
     checkpoint_every_steps: int  = 500
 

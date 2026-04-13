@@ -282,15 +282,31 @@ class TestLatestPointer:
         assert loaded is not None and loaded.step == 50
 
     def test_latest_tmp_cleaned_up_on_write_failure(self, tmp_path: Path) -> None:
+        """LATEST .tmp must be removed even when the rename to LATEST fails.
+
+        [FIX] The previous test patched Path.rename globally, which also broke
+        the JSON checkpoint write (save_checkpoint also calls rename).
+        We now patch only _write_latest so save_checkpoint succeeds first
+        and only the LATEST pointer write fails.
+        """
         ckpt = DataLoaderCheckpointer(str(tmp_path), every_n_steps=1, rank=0)
 
-        def bad_rename(self_path, target):
-            raise OSError("simulated disk full")
+        original_write_latest = ckpt._write_latest
 
-        with patch.object(Path, "rename", bad_rename):
+        def _bad_write_latest(filename: str) -> None:
+            # Write the .tmp but then raise to simulate disk-full on rename.
+            latest_tmp = ckpt._dir / f"{_LATEST_FILE}.tmp"
+            latest_tmp.write_text(filename)
+            raise OSError("simulated disk full on LATEST rename")
+
+        with patch.object(ckpt, "_write_latest", _bad_write_latest):
+            # save_checkpoint itself succeeds; only _write_latest fails.
             ckpt.save(_state(step=5))
 
+        # The .tmp for LATEST must have been cleaned up despite the error.
         assert not (tmp_path / f"{_LATEST_FILE}.tmp").exists()
+        # The actual checkpoint JSON must still exist.
+        assert len(list(tmp_path.glob("dl_state_*.json"))) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -347,7 +363,7 @@ class TestCheckpointStateIsDataclass:
         d = {
             "step": 1, "epoch": 0,
             "dataset_names": ["ds"], "mixing_weights": [1.0],
-            "future_field": "ignored",
+            "unknown_future_field": "ignored",
         }
         state = CheckpointState.from_dict(d)
         assert state.step == 1

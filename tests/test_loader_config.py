@@ -65,33 +65,34 @@ from dino_loader.config import (
 class TestLoaderConfigDefaults:
 
     def test_node_shm_gb(self):
-        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").node_shm_gb == 128.0
+        assert LoaderConfig().node_shm_gb == 128.0
 
     def test_shuffle_buffer_size(self):
-        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").shuffle_buffer_size == 512
+        assert LoaderConfig().shuffle_buffer_size == 512
 
-    def test_stateful_dataloader_enabled_by_default(self):
-        cfg = LoaderConfig(checkpoint_dir="/tmp/test_ckpt")
-        assert cfg.stateful_dataloader is True
+    def test_stateful_dataloader_disabled_by_default(self):
+        """[FIX-STATEFUL] Default is False so LoaderConfig() works without checkpoint_dir."""
+        cfg = LoaderConfig()
+        assert cfg.stateful_dataloader is False
 
     def test_output_dtype_bf16(self):
-        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").output_dtype == "bf16"
+        assert LoaderConfig().output_dtype == "bf16"
 
     def test_seed_default(self):
-        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").seed == 0
+        assert LoaderConfig().seed == 0
 
     def test_dali_cpu_queue_at_least_16(self):
-        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").dali_cpu_queue >= 16
+        assert LoaderConfig().dali_cpu_queue >= 16
 
     def test_heartbeat_stale_s_default(self):
-        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").heartbeat_stale_s == 300.0
+        assert LoaderConfig().heartbeat_stale_s == 300.0
 
     def test_prometheus_port_disabled_by_default(self):
-        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").prometheus_port is None
+        assert LoaderConfig().prometheus_port is None
 
     def test_no_shard_extraction_workers_field(self):
         """shard_extraction_workers has been removed — use extraction_pool instead."""
-        cfg = LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
+        cfg = LoaderConfig()
         assert not hasattr(cfg, "shard_extraction_workers"), (
             "shard_extraction_workers must be removed; use extraction_pool.max_workers"
         )
@@ -106,45 +107,44 @@ class TestLoaderConfigValidation:
 
     def test_invalid_output_dtype_raises(self):
         with pytest.raises(ValueError, match="output_dtype"):
-            LoaderConfig(output_dtype="int8", stateful_dataloader=False, checkpoint_dir="")
+            LoaderConfig(output_dtype="int8")
 
     def test_valid_dtype_bf16(self):
-        LoaderConfig(output_dtype="bf16", stateful_dataloader=False, checkpoint_dir="")
+        LoaderConfig(output_dtype="bf16")
 
     def test_valid_dtype_fp32(self):
-        LoaderConfig(output_dtype="fp32", stateful_dataloader=False, checkpoint_dir="")
+        LoaderConfig(output_dtype="fp32")
 
     def test_hw_decoder_load_above_one_raises(self):
         with pytest.raises(ValueError):
-            LoaderConfig(hw_decoder_load=1.5, stateful_dataloader=False, checkpoint_dir="")
+            LoaderConfig(hw_decoder_load=1.5)
 
     def test_hw_decoder_load_at_boundaries_valid(self):
-        LoaderConfig(hw_decoder_load=0.0, stateful_dataloader=False, checkpoint_dir="")
-        LoaderConfig(hw_decoder_load=1.0, stateful_dataloader=False, checkpoint_dir="")
+        LoaderConfig(hw_decoder_load=0.0)
+        LoaderConfig(hw_decoder_load=1.0)
 
     def test_shm_warn_threshold_above_one_raises(self):
         with pytest.raises(ValueError):
-            LoaderConfig(shm_warn_threshold=1.5, stateful_dataloader=False, checkpoint_dir="")
+            LoaderConfig(shm_warn_threshold=1.5)
 
     def test_shm_warn_threshold_negative_raises(self):
         with pytest.raises(ValueError):
-            LoaderConfig(shm_warn_threshold=-0.1, stateful_dataloader=False, checkpoint_dir="")
+            LoaderConfig(shm_warn_threshold=-0.1)
 
     def test_stall_timeout_negative_raises(self):
         with pytest.raises(ValueError, match="stall_timeout_s"):
-            LoaderConfig(stall_timeout_s=-1.0, stateful_dataloader=False, checkpoint_dir="")
+            LoaderConfig(stall_timeout_s=-1.0)
 
     def test_stall_timeout_zero_is_valid(self):
-        LoaderConfig(stall_timeout_s=0.0, stateful_dataloader=False, checkpoint_dir="")
+        LoaderConfig(stall_timeout_s=0.0)
 
     def test_heartbeat_stale_zero_raises(self):
         with pytest.raises(ValueError, match="heartbeat_stale_s"):
-            LoaderConfig(heartbeat_stale_s=0.0, stateful_dataloader=False, checkpoint_dir="")
+            LoaderConfig(heartbeat_stale_s=0.0)
 
     def test_dali_fp8_without_use_fp8_raises(self):
         with pytest.raises(ValueError):
-            LoaderConfig(dali_fp8_output=True, use_fp8_output=False,
-                         stateful_dataloader=False, checkpoint_dir="")
+            LoaderConfig(dali_fp8_output=True, use_fp8_output=False)
 
     def test_stateful_without_checkpoint_dir_raises(self):
         with pytest.raises(ValueError, match="checkpoint_dir"):
@@ -155,8 +155,15 @@ class TestLoaderConfigValidation:
         assert cfg.stateful_dataloader is True
 
     def test_non_stateful_without_checkpoint_dir_valid(self):
+        # [FIX-STATEFUL] This is now the default — must not raise.
         cfg = LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
         assert not cfg.stateful_dataloader
+
+    def test_default_loader_config_does_not_raise(self):
+        """LoaderConfig() with no arguments must work (stateful_dataloader=False by default)."""
+        cfg = LoaderConfig()
+        assert not cfg.stateful_dataloader
+        assert cfg.checkpoint_dir == ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -170,12 +177,12 @@ class TestFP8RequiresTE:
         with patch.dict("sys.modules", {"transformer_engine": None,
                                         "transformer_engine.pytorch": None}):
             with pytest.raises(ValueError, match="transformer-engine"):
-                LoaderConfig(use_fp8_output=True, stateful_dataloader=False, checkpoint_dir="")
+                LoaderConfig(use_fp8_output=True)
 
     def test_fp8_false_does_not_require_te(self):
         with patch.dict("sys.modules", {"transformer_engine": None,
                                         "transformer_engine.pytorch": None}):
-            cfg = LoaderConfig(use_fp8_output=False, stateful_dataloader=False, checkpoint_dir="")
+            cfg = LoaderConfig(use_fp8_output=False)
             assert cfg.use_fp8_output is False
 
 
@@ -205,7 +212,7 @@ class TestSharedExtractionPoolConfig:
         assert cfg.max_workers == 8
 
     def test_loader_config_has_extraction_pool(self):
-        cfg = LoaderConfig(stateful_dataloader=False, checkpoint_dir="")
+        cfg = LoaderConfig()
         assert isinstance(cfg.extraction_pool, SharedExtractionPoolConfig)
 
 
@@ -271,14 +278,12 @@ class TestPipelineConfig:
 class TestAdaptivePrefetch:
 
     def test_default_disabled(self):
-        assert LoaderConfig(stateful_dataloader=False, checkpoint_dir="").adaptive_prefetch is False
+        assert LoaderConfig().adaptive_prefetch is False
 
     def test_enable_with_valid_target(self):
         cfg = LoaderConfig(
             adaptive_prefetch=True,
             adaptive_prefetch_target_util=0.80,
-            stateful_dataloader=False,
-            checkpoint_dir="",
         )
         assert cfg.adaptive_prefetch is True
 
@@ -287,8 +292,6 @@ class TestAdaptivePrefetch:
             LoaderConfig(
                 adaptive_prefetch=True,
                 adaptive_prefetch_target_util=0.0,
-                stateful_dataloader=False,
-                checkpoint_dir="",
             )
 
     def test_target_above_one_raises(self):
@@ -296,8 +299,6 @@ class TestAdaptivePrefetch:
             LoaderConfig(
                 adaptive_prefetch=True,
                 adaptive_prefetch_target_util=1.1,
-                stateful_dataloader=False,
-                checkpoint_dir="",
             )
 
 
