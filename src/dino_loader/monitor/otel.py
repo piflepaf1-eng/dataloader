@@ -343,7 +343,8 @@ def stage(
         - ``"network_stall"``   Network stall detection
         - ``"multinode_stall"`` Multi-node stall detection
 
-    attributes
+    Attributes
+    ----------
         Optional dict of extra OTEL span attributes.
 
     """
@@ -445,7 +446,6 @@ class StageTimer:
         """Stop the timer on context exit, recording metrics even on exception."""
         self.stop()
         # Never suppress exceptions.
-        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
