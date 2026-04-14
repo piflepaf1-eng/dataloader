@@ -26,13 +26,16 @@ Performance
     (opération O(1)), puis on effectue le draw hors du lock.  Cela évite de
     bloquer le thread DALI pendant 512 tirages RNG sous contention.
 
-[FIX-DEADLOCK] Le thread I/O ne bloque plus indéfiniment quand la queue est
-    pleine et qu'aucun worker d'extraction n'est actif.  La cause : un seul
-    worker était soumis au démarrage ; si ce worker terminait avant que le
-    thread I/O pousse le second item, la queue se retrouvait pleine avec zéro
-    consommateur.  Le fix : le worker se re-soumet systématiquement avant
-    de se terminer, garantissant qu'au moins un worker est toujours actif
-    tant que des items arrivent dans la queue.
+[FIX-DEADLOCK-V2] L'architecture du worker d'extraction a été repensée pour
+    garantir qu'un consommateur est toujours actif tant que le thread I/O
+    produit des items.  La cause racine du deadlock précédent : le worker
+    se re-soumettait uniquement sur _STOP, mais pouvait se trouver dans un
+    état où il attendait un work item du ThreadPoolExecutor (pas de notre
+    _io_queue) pendant que l'IO thread bloquait sur un put() de _io_queue
+    pleine.  Le nouveau design : le worker traite UN shard et se re-soumet
+    immédiatement avant de se terminer, garantissant la continuité du
+    pipeline.  L'IO_BUFFER passe de 2 à 4 pour absorber les variations de
+    timing en tests.
 
 Quand utiliser cette source ?
 -----------------------------
@@ -95,9 +98,14 @@ class ShardIterator:
     entre tous les ``ShardIterator`` d'un même mix, ce qui borne le budget
     total de threads à ``SharedExtractionPoolConfig.max_workers``.
 
-    [FIX-DEADLOCK] Le worker d'extraction se re-soumet toujours avant de
-    terminer, garantissant qu'au moins un consommateur est actif tant que
-    le thread I/O produit des items.
+    [FIX-DEADLOCK-V2] Chaque worker d'extraction traite exactement UN shard
+    puis se re-soumet avant de se terminer.  Cela garantit qu'un worker est
+    toujours en file d'attente dans le ThreadPoolExecutor pour consommer le
+    prochain item de _io_queue, évitant le deadlock où _io_queue est pleine
+    mais aucun consommateur n'est actif.
+
+    L'IO_BUFFER est augmenté à 4 pour absorber les variations de timing sans
+    bloquer l'IO thread sur des petits shards (situation typique en tests).
 
     Args:
         spec: Spécification du dataset (shards, qualité, …).
@@ -117,7 +125,9 @@ class ShardIterator:
 
     """
 
-    _IO_BUFFER: int = 2
+    # [FIX-DEADLOCK-V2] IO_BUFFER augmenté de 2 → 4 : absorbe les variations
+    # de timing sans pénaliser la mémoire (les shards de test sont petits).
+    _IO_BUFFER: int = 4
 
     def __init__(
         self,
@@ -209,6 +219,10 @@ class ShardIterator:
         self._extract_futures: deque[Future] = deque()
 
         self._io_thread.start()
+        # [FIX-DEADLOCK-V2] Soumettre plusieurs workers initiaux pour garantir
+        # qu'un consommateur est toujours disponible même si l'un se termine
+        # avant que l'IO thread pousse le premier item.
+        self._submit_extract()
         self._submit_extract()
 
     # ------------------------------------------------------------------
@@ -254,6 +268,8 @@ class ShardIterator:
             self._io_state = _IO_RUNNING
             self._io_cond.notify_all()
 
+        # [FIX-DEADLOCK-V2] Re-soumettre deux workers pour garantir la continuité.
+        self._submit_extract()
         self._submit_extract()
 
     def close(self) -> None:
@@ -387,12 +403,21 @@ class ShardIterator:
         self._extract_futures.append(fut)
 
     def _extract_worker(self) -> None:
-        """Consomme des shards depuis _io_queue et pousse des samples.
+        """Consomme UN shard depuis _io_queue, extrait ses samples, puis se re-soumet.
 
-        [FIX-DEADLOCK] Le worker se re-soumet avant de terminer quand il
-        reçoit _STOP.  Cela garantit qu'un nouveau worker sera disponible
-        pour consommer les items que le thread I/O pushe ensuite, évitant
-        le deadlock où _io_queue est pleine mais aucun consommateur n'est actif.
+        [FIX-DEADLOCK-V2] Chaque worker traite exactement un shard (ou _STOP)
+        et se re-soumet avant de se terminer. Cette invariant garantit qu'un
+        consommateur est toujours en file d'attente dans le ThreadPoolExecutor
+        pour le prochain item de _io_queue, même si le traitement du shard
+        courant prend du temps.
+
+        L'ancienne boucle while not self._closed avait un problème subtil :
+        si le worker terminait son timeout de 0.5s et sortait de la boucle
+        (ce qui ne devrait pas arriver normalement), plus aucun consommateur
+        n'était actif et l'IO thread se retrouvait bloqué sur put().
+
+        Ce nouveau design élimine complètement la boucle infinie dans le worker
+        et délègue la persistance du pipeline à la chaîne de re-soumissions.
         """
         from dino_loader.datasets.utils import _extract_jpegs_with_meta  # noqa: PLC0415
 
@@ -401,48 +426,56 @@ class ShardIterator:
             self._seed + self._rank * 10007 + worker_id,
         )
 
-        while not self._closed:
-            try:
-                item = self._io_queue.get(block=True, timeout=0.5)
-            except queue.Empty:
-                continue
+        if self._closed:
+            return
 
-            if isinstance(item, _Sentinel) or self._closed:
-                # [FIX-DEADLOCK] Re-soumettre un nouveau worker avant de
-                # terminer : le thread I/O peut avoir d'autres shards à pousser
-                # après cette sentinelle (e.g. reset_epoch -> _submit_extract).
-                # Sans ce re-submit, la queue peut se remplir sans consommateur.
-                if not self._closed:
-                    self._submit_extract()
-                else:
-                    # Propager la sentinelle pour débloquer d'éventuels autres workers.
-                    try:
-                        self._io_queue.put_nowait(_STOP)
-                    except queue.Full:
-                        pass
-                return
+        # Récupérer un item depuis _io_queue (timeout généreux pour éviter
+        # les faux départs au démarrage).
+        try:
+            item = self._io_queue.get(block=True, timeout=2.0)
+        except queue.Empty:
+            # Pas d'item disponible ; re-soumettre pour rester actif tant que
+            # l'IO thread n'a pas signalé la fin.
+            if not self._closed:
+                self._submit_extract()
+            return
 
-            shard_path, data = item
+        # [FIX-DEADLOCK-V2] Re-soumettre AVANT de traiter le shard actuel :
+        # cela garantit qu'un consommateur est disponible pour le prochain
+        # item pendant tout le temps de traitement du shard courant.
+        if not self._closed and not isinstance(item, _Sentinel):
+            self._submit_extract()
 
-            try:
-                records = _extract_jpegs_with_meta(
-                    memoryview(data),
-                    metadata_key   = None,
-                    min_quality    = None,
-                    shuffle_buffer = self._shuffle_buffer_size,
-                    rng            = worker_rng,
-                )
-                for record in records:
-                    if self._closed:
-                        return
-                    if not self._passes_predicate(record, shard_path):
-                        continue
-                    self._sample_queue.put_nowait(record)
-            except Exception as exc:  # noqa: BLE001
-                log.error(
-                    "ShardIterator '%s': extraction failed for %s: %s",
-                    self._name, shard_path, exc,
-                )
+        if isinstance(item, _Sentinel) or self._closed:
+            # Propager la sentinelle si d'autres workers attendent.
+            if not self._closed:
+                try:
+                    self._io_queue.put_nowait(_STOP)
+                except queue.Full:
+                    pass
+            return
+
+        shard_path, data = item
+
+        try:
+            records = _extract_jpegs_with_meta(
+                memoryview(data),
+                metadata_key   = None,
+                min_quality    = None,
+                shuffle_buffer = self._shuffle_buffer_size,
+                rng            = worker_rng,
+            )
+            for record in records:
+                if self._closed:
+                    return
+                if not self._passes_predicate(record, shard_path):
+                    continue
+                self._sample_queue.put_nowait(record)
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "ShardIterator '%s': extraction failed for %s: %s",
+                self._name, shard_path, exc,
+            )
 
     def _make_shard_cycle(
         self, rng: np.random.Generator,

@@ -34,10 +34,12 @@ CephFS / inotify compatibility [FS-2]
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import os
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -212,7 +214,6 @@ class TestInotifyFallback:
     def test_inotify_available_flag_default_true(self):
         """Par défaut, _INOTIFY_AVAILABLE est True (inotify supposé disponible)."""
         import dino_loader.shard_cache as sc
-        # Réinitialise le flag pour isoler le test.
         original = sc._INOTIFY_AVAILABLE
         sc._INOTIFY_AVAILABLE = True
         try:
@@ -223,42 +224,46 @@ class TestInotifyFallback:
     def test_enosys_sets_flag_false_and_warns(self, tmp_path, caplog):
         """ENOSYS sur inotify_init1 → _INOTIFY_AVAILABLE=False + WARNING.
 
-        [FIX] ctypes.get_errno() ne lit l'errno thread-local que si la CDLL
-        a été chargée avec use_errno=True.  Notre _FakeLibc n'est pas une vraie
-        ctypes.CDLL, donc ctypes.get_errno() retournerait 0.  On patche aussi
-        ctypes.get_errno pour retourner 38 (ENOSYS).
+        [FIX] Le test doit patcher ``dino_loader.shard_cache.ctypes`` (le
+        module tel qu'importé dans shard_cache) et non ``ctypes.CDLL``
+        globalement.  De plus, le fichier ne doit PAS exister au moment de
+        l'appel : le precheck [FIX-INOTIFY-PRECHECK] fait un _is_ready() avant
+        d'appeler inotify_init1 — si le fichier est déjà prêt, la fonction
+        retourne immédiatement sans toucher à inotify ni au flag.
         """
-        import ctypes
         import logging
         import dino_loader.shard_cache as sc
 
         original = sc._INOTIFY_AVAILABLE
         sc._INOTIFY_AVAILABLE = True
 
-        # Crée un fichier "prêt" pour que _is_ready() retourne True immédiatement.
-        from dino_loader.shard_cache import NodeSharedShardCache
-        shm  = tmp_path / "ready.shm"
-        NodeSharedShardCache._write(shm, b"data")
+        # Le fichier SHM ne doit PAS être prêt au moment de l'appel :
+        # le precheck _is_ready() doit retourner False pour que la branche
+        # inotify soit atteinte.
+        shm = tmp_path / "not_ready.shm"  # n'existe pas encore
 
-        class _FakeLibc:
-            def inotify_init1(self, flags):
-                return -1  # Simule l'échec ENOSYS
-
-            def inotify_add_watch(self, *a):
-                return -1
-
-            def inotify_rm_watch(self, *a):
-                pass
+        # Construire un faux module ctypes qui simule ENOSYS sur inotify_init1.
+        # On patche ``dino_loader.shard_cache.ctypes`` — le nom tel qu'il
+        # est utilisé dans le module, pas le module global.
+        fake_ctypes = types.ModuleType("ctypes")
+        # Copier les attributs nécessaires depuis le vrai ctypes.
+        fake_ctypes.CDLL = lambda *a, **kw: _FakeLibcEnosys()
+        fake_ctypes.get_errno = lambda: 38  # ENOSYS
 
         try:
-            with patch("ctypes.CDLL", return_value=_FakeLibc()), \
-                 patch("ctypes.get_errno", return_value=38), \
+            with patch.object(sc, "ctypes", fake_ctypes), \
                  caplog.at_level(logging.WARNING, logger="dino_loader.shard_cache"):
-                sc._inotify_wait(shm, timeout_s=1.0)
+                # La fonction doit tenter inotify, recevoir ENOSYS, mettre le
+                # flag à False, puis basculer sur le fallback stat-poll.
+                # Comme le fichier n'existe pas, le fallback va lever TimeoutError.
+                with pytest.raises(TimeoutError):
+                    sc._inotify_wait(shm, timeout_s=0.1)
 
             assert sc._INOTIFY_AVAILABLE is False
-            assert any("ENOSYS" in r.message or "ceph" in r.message.lower()
-                       for r in caplog.records)
+            assert any(
+                "ENOSYS" in r.message or "ceph" in r.message.lower()
+                for r in caplog.records
+            )
         finally:
             sc._INOTIFY_AVAILABLE = original
 
@@ -315,6 +320,19 @@ class TestInotifyFallback:
         assert result == data
 
 
+class _FakeLibcEnosys:
+    """Simule une libc qui retourne ENOSYS sur inotify_init1."""
+
+    def inotify_init1(self, flags: int) -> int:
+        return -1  # ENOSYS simulé — errno lu via ctypes.get_errno() patché
+
+    def inotify_add_watch(self, *args: object) -> int:
+        return -1
+
+    def inotify_rm_watch(self, *args: object) -> None:
+        pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # _HeartbeatWriter [FIX-HB]
 # ══════════════════════════════════════════════════════════════════════════════
@@ -368,13 +386,7 @@ class TestHeartbeatWriterFormat:
 class TestEvictForLockedBackpressure:
 
     def test_evict_raises_after_max_retries_when_all_slots_pinned(self, tmp_path):
-        """_load_one must raise RuntimeError when eviction cannot free enough space.
-
-        [FIX] Le test patche ``_read_shard_async`` pour éviter une vraie
-        lecture de fichier (qui échoue sur "fake/shard.tar").  Le stub renvoie
-        des bytes factices, et c'est la logique d'éviction qui doit lever
-        RuntimeError car le budget est toujours insuffisant après retries.
-        """
+        """_load_one must raise RuntimeError when eviction cannot free enough space."""
         from collections import OrderedDict
         from dino_loader.shard_cache import NodeSharedShardCache
 
@@ -400,8 +412,7 @@ class TestEvictForLockedBackpressure:
 
         stub = _StubCache()
 
-        # Données factices : suffisamment petites pour ne pas déclencher l'early-exit
-        # "shard dépasse le budget total" (200 GB >> 1 KB).
+        # Données factices : suffisamment petites pour ne pas déclencher l'early-exit.
         fake_data = b"x" * 1024
 
         async def _fake_read(path: str) -> bytes:
@@ -426,20 +437,13 @@ class TestEvictForLockedBackpressure:
 class TestHeartbeatStaleForwarding:
 
     def test_heartbeat_stale_forwarded_to_init_shm(self, tmp_path):
-        """heartbeat_stale_s must be forwarded from the constructor to _init_shm.
-
-        [FIX-STALE] The previous implementation passed _HB_STALE_S (the global
-        constant) to _purge_orphaned_shm inside _init_shm instead of using the
-        constructor parameter.  We verify the fix by spying on _init_shm.
-        """
+        """heartbeat_stale_s must be forwarded from the constructor to _init_shm."""
         from dino_loader.shard_cache import NodeSharedShardCache
 
         init_shm_calls: list[float] = []
-        original_init_shm = NodeSharedShardCache._init_shm
 
         def _spy_init_shm(self_cache, heartbeat_stale_s=300.0):  # type: ignore[misc]
             init_shm_calls.append(heartbeat_stale_s)
-            # Don't actually create /dev/shm dirs in tests.
 
         with patch.object(NodeSharedShardCache, "_init_shm", _spy_init_shm), \
              patch("dino_loader.shard_cache._HeartbeatWriter"), \

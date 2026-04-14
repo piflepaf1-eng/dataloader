@@ -35,6 +35,15 @@ Corrections intégrées
 ---------------------
 [FIX-ENV]          DistribEnv conservé tel quel.
 [FIX-ACTIVE-ITER]  Guard contre le double-iter via _active_iter + lock.
+[FIX-ACTIVE-ITER2] Le flag _active_iter est maintenant mis à jour de façon
+                   synchrone avant que __iter__ rende la main à l'appelant.
+                   L'implémentation précédente utilisait ``yield from`` dans
+                   un générateur : le corps du générateur (y compris le flag)
+                   n'était exécuté qu'au premier next(), jamais avant __iter__
+                   lui-même.  La nouvelle implémentation utilise une méthode
+                   helper non-générateur pour le prologue/épilogue et un
+                   générateur séparé pour le yield, garantissant que le flag
+                   est visible immédiatement après l'appel à __iter__().
 [FIX-RESET-ITER]   set_epoch() appelle _dali_node.reset_iter() (thread-safe).
 [FIX-MASK-CALL]    _assemble_batch appelait mask_generator(n_tokens) avec
                    n_tokens (int) comme argument positionnel ``flat`` (bool).
@@ -145,6 +154,8 @@ class DINODataLoader:
         self._last_ckpt_state: CheckpointState | None = None
 
         self._epoch_lock       = threading.Lock()
+        # [FIX-ACTIVE-ITER2] Lock protects _active_iter flag; set synchronously
+        # in __iter__ before yielding to the caller (not lazily in the generator body).
         self._active_iter      = False
         self._active_iter_lock = threading.Lock()
 
@@ -359,6 +370,18 @@ class DINODataLoader:
     def __iter__(self) -> Iterator[Batch]:
         """Itère via le NodePipeline interne.
 
+        [FIX-ACTIVE-ITER2] Le flag _active_iter est mis à True de façon
+        synchrone avant que __iter__ rende la main à l'appelant.
+        L'implémentation précédente plaçait ``yield from self._pipeline``
+        directement dans le corps d'un générateur : le prologue (mise à True
+        du flag) n'était exécuté qu'au premier next(), donc le flag restait
+        False immédiatement après l'appel à __iter__().
+
+        La nouvelle implémentation :
+        1. Acquiert le lock et met le flag à True de façon synchrone.
+        2. Retourne un générateur séparé (_iter_impl) qui fait le yield.
+        3. Le générateur nettoie le flag dans son finally.
+
         Raises:
             RuntimeError: Si une itération est déjà active.
 
@@ -372,6 +395,10 @@ class DINODataLoader:
                 raise RuntimeError(msg)
             self._active_iter = True
 
+        return self._iter_impl()
+
+    def _iter_impl(self) -> Iterator[Batch]:
+        """Générateur interne : yield les batches et nettoie le flag en sortie."""
         try:
             yield from self._pipeline
         finally:
@@ -557,12 +584,6 @@ class DINODataLoader:
 
         masks = None
         if self._mask_generator is not None and self._aug_spec.supports_masking:
-            # [FIX-MASK-CALL] Correct API: gen(flat=True) returns a 1-D bool
-            # numpy array of shape (height * width,).  We then stack it for the
-            # batch dimension.  Previously gen(n_tokens) was called with an int
-            # as the positional ``flat`` argument (which is bool-typed) — it
-            # returned a 1-D array but of the grid shape, not n_tokens, and the
-            # intent (repeat for the whole batch) was never implemented.
             mask_np = self._mask_generator(flat=True)           # shape: (H*W,)
             mask_1d = torch.from_numpy(mask_np)                # (H*W,)
             batch_size = g_gpu[0].shape[0] if g_gpu else len(metadata)
