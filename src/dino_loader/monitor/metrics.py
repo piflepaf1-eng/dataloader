@@ -34,6 +34,9 @@ Fixes applied
             all integer counters.
 [FIX-CLOSE] self.data set to None before shm.close() to release the ctypes
             from_buffer reference and avoid BufferError on Python 3.12.
+[FIX-CLOSE2] unlink() now also clears self.data before calling shm.unlink()
+            so that a subsequent close() call does not encounter a stale
+            exported pointer reference into a destroyed segment.
 """
 
 import ctypes
@@ -137,7 +140,7 @@ class MetricsRegistry:
     ``self.data`` is a ctypes Structure overlaid on the shared-memory mmap via
     ``from_buffer``.  It must be released (set to None) before ``shm.close()``
     is called, otherwise CPython raises ``BufferError: cannot close exported
-    pointers exist``.  ``close()`` handles this automatically.
+    pointers exist``.  Both ``close()`` and ``unlink()`` ensure this invariant.
     """
 
     def __init__(
@@ -245,6 +248,14 @@ class MetricsRegistry:
         """
         return self.data
 
+    def _release_data(self) -> None:
+        """Release the ctypes overlay so shm has no exported pointer references.
+
+        Must be called before any shm.close() or shm.unlink() to avoid
+        ``BufferError: cannot close exported pointers exist`` on Python 3.12.
+        """
+        self.data = None
+
     def close(self) -> None:
         """Detach from shared memory (does not unlink the block).
 
@@ -253,14 +264,18 @@ class MetricsRegistry:
         ``BufferError: cannot close exported pointers exist`` because the
         ctypes structure holds a live reference into the mmap buffer.
         """
-        if self.data is not None:
-            # Drop the ctypes overlay so the mmap has no exported pointers.
-            self.data = None
+        self._release_data()
         if self.shm is not None:
             self.shm.close()
 
     def unlink(self) -> None:
-        """Destroy the shared-memory block. Call once, on the creator."""
+        """Destroy the shared-memory block. Call once, on the creator.
+
+        [FIX-CLOSE2] Releases ``self.data`` before unlinking so that a
+        subsequent ``close()`` call does not encounter a stale exported
+        pointer into the now-destroyed segment.
+        """
+        self._release_data()
         if self.shm is not None:
             self.shm.unlink()
 

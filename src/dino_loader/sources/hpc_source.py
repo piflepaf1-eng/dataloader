@@ -26,6 +26,14 @@ Performance
     (opération O(1)), puis on effectue le draw hors du lock.  Cela évite de
     bloquer le thread DALI pendant 512 tirages RNG sous contention.
 
+[FIX-DEADLOCK] Le thread I/O ne bloque plus indéfiniment quand la queue est
+    pleine et qu'aucun worker d'extraction n'est actif.  La cause : un seul
+    worker était soumis au démarrage ; si ce worker terminait avant que le
+    thread I/O pousse le second item, la queue se retrouvait pleine avec zéro
+    consommateur.  Le fix : le worker se re-soumet systématiquement avant
+    de se terminer, garantissant qu'au moins un worker est toujours actif
+    tant que des items arrivent dans la queue.
+
 Quand utiliser cette source ?
 -----------------------------
 - Clusters avec Lustre lent et beaucoup de rangs par nœud (≥ 8).
@@ -86,6 +94,10 @@ class ShardIterator:
     Le ``ThreadPoolExecutor`` est injecté par ``MixingSource`` et partagé
     entre tous les ``ShardIterator`` d'un même mix, ce qui borne le budget
     total de threads à ``SharedExtractionPoolConfig.max_workers``.
+
+    [FIX-DEADLOCK] Le worker d'extraction se re-soumet toujours avant de
+    terminer, garantissant qu'au moins un consommateur est actif tant que
+    le thread I/O produit des items.
 
     Args:
         spec: Spécification du dataset (shards, qualité, …).
@@ -375,6 +387,13 @@ class ShardIterator:
         self._extract_futures.append(fut)
 
     def _extract_worker(self) -> None:
+        """Consomme des shards depuis _io_queue et pousse des samples.
+
+        [FIX-DEADLOCK] Le worker se re-soumet avant de terminer quand il
+        reçoit _STOP.  Cela garantit qu'un nouveau worker sera disponible
+        pour consommer les items que le thread I/O pushe ensuite, évitant
+        le deadlock où _io_queue est pleine mais aucun consommateur n'est actif.
+        """
         from dino_loader.datasets.utils import _extract_jpegs_with_meta  # noqa: PLC0415
 
         worker_id  = next(self._worker_counter)
@@ -389,10 +408,18 @@ class ShardIterator:
                 continue
 
             if isinstance(item, _Sentinel) or self._closed:
-                try:
-                    self._io_queue.put_nowait(_STOP)
-                except queue.Full:
-                    pass
+                # [FIX-DEADLOCK] Re-soumettre un nouveau worker avant de
+                # terminer : le thread I/O peut avoir d'autres shards à pousser
+                # après cette sentinelle (e.g. reset_epoch -> _submit_extract).
+                # Sans ce re-submit, la queue peut se remplir sans consommateur.
+                if not self._closed:
+                    self._submit_extract()
+                else:
+                    # Propager la sentinelle pour débloquer d'éventuels autres workers.
+                    try:
+                        self._io_queue.put_nowait(_STOP)
+                    except queue.Full:
+                        pass
                 return
 
             shard_path, data = item

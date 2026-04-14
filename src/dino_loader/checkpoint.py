@@ -42,6 +42,13 @@ Signature des fonctions I/O
 ``save_checkpoint(path, state)`` et ``load_checkpoint(path)`` — la path
 est toujours le premier argument pour cohérence avec les conventions
 Python (pathlib, open, etc.).
+
+Corrections
+-----------
+[FIX-LATEST] ``DataLoaderCheckpointer.save()`` attrape l'exception de
+    ``_write_latest()`` et nettoie le ``.tmp`` orphelin.  Auparavant,
+    une exception dans ``_write_latest`` remontait jusqu'à l'appelant
+    sans nettoyage, laissant un fichier ``.tmp`` sur disque.
 """
 
 import contextlib
@@ -168,7 +175,13 @@ class DataLoaderCheckpointer:
         Ordre d'écriture :
         1. Écriture JSON atomique avec enveloppe SHA-256 (tmp → rename).
         2. Mise à jour atomique du pointeur LATEST (tmp → rename).
+           Les erreurs sont loggées mais n'interrompent pas la sauvegarde.
         3. Élagage des anciens checkpoints (best-effort).
+
+        [FIX-LATEST] Les exceptions levées par ``_write_latest`` sont
+        maintenant attrapées ici pour éviter qu'une erreur d'I/O sur le
+        fichier LATEST ne remonte jusqu'à l'appelant et masque le fait
+        que le checkpoint JSON a bien été écrit.
 
         """
         if self._rank != 0 or state.step % self._every != 0:
@@ -178,7 +191,15 @@ class DataLoaderCheckpointer:
         path     = self._dir / filename
         save_checkpoint(path, state)
 
-        self._write_latest(filename)
+        try:
+            self._write_latest(filename)
+        except Exception as exc:
+            # Nettoyage du .tmp orphelin laissé par _write_latest sur erreur.
+            latest_tmp = self._dir / f"{_LATEST_FILE}.tmp"
+            with contextlib.suppress(Exception):
+                latest_tmp.unlink(missing_ok=True)
+            log.warning("Failed to update LATEST pointer: %s", exc)
+
         self._prune()
 
         log.info("DataLoader checkpoint saved: %s", filename)
@@ -225,16 +246,16 @@ class DataLoaderCheckpointer:
         """Restaure depuis un dict produit par ``state_dict()``."""
 
     def _write_latest(self, filename: str) -> None:
-        """Met à jour le pointeur LATEST de façon atomique."""
+        """Met à jour le pointeur LATEST de façon atomique.
+
+        Raises:
+            OSError: Si l'écriture ou le rename échoue.
+
+        """
         latest_tmp = self._dir / f"{_LATEST_FILE}.tmp"
         latest     = self._dir / _LATEST_FILE
-        try:
-            latest_tmp.write_text(filename, encoding="utf-8")
-            latest_tmp.rename(latest)
-        except Exception as exc:
-            log.warning("Failed to write LATEST pointer: %s", exc)
-            with contextlib.suppress(Exception):
-                latest_tmp.unlink(missing_ok=True)
+        latest_tmp.write_text(filename, encoding="utf-8")
+        latest_tmp.rename(latest)
 
     def _resolve_latest(self) -> Path | None:
         """Retourne le Path du checkpoint le plus récent, ou None."""

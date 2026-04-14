@@ -221,7 +221,13 @@ class TestInotifyFallback:
             sc._INOTIFY_AVAILABLE = original
 
     def test_enosys_sets_flag_false_and_warns(self, tmp_path, caplog):
-        """ENOSYS sur inotify_init1 → _INOTIFY_AVAILABLE=False + WARNING."""
+        """ENOSYS sur inotify_init1 → _INOTIFY_AVAILABLE=False + WARNING.
+
+        [FIX] ctypes.get_errno() ne lit l'errno thread-local que si la CDLL
+        a été chargée avec use_errno=True.  Notre _FakeLibc n'est pas une vraie
+        ctypes.CDLL, donc ctypes.get_errno() retournerait 0.  On patche aussi
+        ctypes.get_errno pour retourner 38 (ENOSYS).
+        """
         import ctypes
         import logging
         import dino_loader.shard_cache as sc
@@ -236,17 +242,18 @@ class TestInotifyFallback:
 
         class _FakeLibc:
             def inotify_init1(self, flags):
-                ctypes.set_errno(38)  # ENOSYS
-                return -1
+                return -1  # Simule l'échec ENOSYS
+
             def inotify_add_watch(self, *a):
                 return -1
+
             def inotify_rm_watch(self, *a):
                 pass
 
         try:
             with patch("ctypes.CDLL", return_value=_FakeLibc()), \
+                 patch("ctypes.get_errno", return_value=38), \
                  caplog.at_level(logging.WARNING, logger="dino_loader.shard_cache"):
-                # _inotify_wait doit tomber en stat-poll et réussir (fichier prêt).
                 sc._inotify_wait(shm, timeout_s=1.0)
 
             assert sc._INOTIFY_AVAILABLE is False
@@ -363,25 +370,22 @@ class TestEvictForLockedBackpressure:
     def test_evict_raises_after_max_retries_when_all_slots_pinned(self, tmp_path):
         """_load_one must raise RuntimeError when eviction cannot free enough space.
 
-        [FIX] The previous test used MagicMock(spec=NodeSharedShardCache) which
-        does not have _sem, causing AttributeError.  We now build a minimal
-        stub with the exact attributes accessed by _load_one, including a real
-        asyncio.Semaphore, and patch the module-level constants to make the
-        test fast.
+        [FIX] Le test patche ``_read_shard_async`` pour éviter une vraie
+        lecture de fichier (qui échoue sur "fake/shard.tar").  Le stub renvoie
+        des bytes factices, et c'est la logique d'éviction qui doit lever
+        RuntimeError car le budget est toujours insuffisant après retries.
         """
         from collections import OrderedDict
         from dino_loader.shard_cache import NodeSharedShardCache
 
         class _StubCache:
             """Minimal stub providing the attributes accessed by _load_one."""
-            _sem          = asyncio.Semaphore(1)  # real semaphore
-            _lru          = OrderedDict()          # empty — nothing to evict
-            _total_bytes  = 200 * (1 << 30)       # 200 GB used
-            _max_bytes    = 128 * (1 << 30)       # 128 GB budget → always full
+            _sem          = asyncio.Semaphore(1)
+            _lru          = OrderedDict()           # empty — nothing to evict
+            _total_bytes  = 200 * (1 << 30)        # 200 GB used
+            _max_bytes    = 128 * (1 << 30)        # 128 GB budget → always full
             _in_flight: set = set()
             _metrics      = None
-
-            # _lru_lock must be a real lock.
             _lru_lock     = threading.Lock()
 
             def _evict_for_locked(self, incoming: int) -> None:
@@ -396,8 +400,16 @@ class TestEvictForLockedBackpressure:
 
         stub = _StubCache()
 
+        # Données factices : suffisamment petites pour ne pas déclencher l'early-exit
+        # "shard dépasse le budget total" (200 GB >> 1 KB).
+        fake_data = b"x" * 1024
+
+        async def _fake_read(path: str) -> bytes:
+            return fake_data
+
         with patch("dino_loader.shard_cache._EVICT_RETRIES", 1), \
-             patch("dino_loader.shard_cache._EVICT_WAIT_S", 0.01):
+             patch("dino_loader.shard_cache._EVICT_WAIT_S", 0.01), \
+             patch("dino_loader.shard_cache._read_shard_async", _fake_read):
 
             async def _run():
                 with pytest.raises(RuntimeError, match="could not evict enough space"):
