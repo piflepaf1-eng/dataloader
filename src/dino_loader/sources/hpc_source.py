@@ -12,36 +12,33 @@ Stage A — thread I/O (un daemon par ``ShardIterator``)
     production, ``InProcessShardCache`` en tests) dans une queue bornée.
 
 Stage B — workers d'extraction (``ThreadPoolExecutor`` *partagé*)
-    Parse le tar, évalue le prédicat, pousse les ``SampleRecord`` acceptés
-    dans la queue de samples.
+    Parse le tar via ``tar_utils.extract_jpegs_with_meta``, évalue le
+    prédicat, pousse les ``SampleRecord`` acceptés dans la queue de samples.
+    Les bytes JPEG restent **compressés** : DALI les décode via nvjpeg sur GPU.
 
-Le pool d'extraction est partagé entre tous les ``ShardIterator`` d'un même
-``MixingSource`` via ``SharedExtractionPoolConfig``, ce qui borne le budget
-total de threads à ``max_workers`` quelle que soit la cardinalité du mix.
+Invariant critique — bytes JPEG non décodés
+--------------------------------------------
+Les ``SampleRecord.jpeg`` contiennent des bytes JPEG bruts (compressés).
+Ils sont transmis tels quels à DALI ``ExternalSource`` qui les route vers le
+pipeline nvjpeg (ASIC matériel).  Le CPU ne décode **jamais** les images.
+Décoder sur CPU puis transférer des tenseurs denses serait ≈ 10-50× plus
+coûteux en bande passante PCIe et occuperait inutilement les cœurs CPU.
 
 Performance
 -----------
 [PERF-LOCK] ``MixingSource.__call__`` pré-calcule les indices hors du lock :
     le numpy RNG n'est pas thread-safe, donc on copie l'état RNG sous lock
-    (opération O(1)), puis on effectue le draw hors du lock.  Cela évite de
-    bloquer le thread DALI pendant 512 tirages RNG sous contention.
+    (opération O(1)), puis on effectue le draw hors du lock.
 
-[FIX-DEADLOCK-V2] L'architecture du worker d'extraction a été repensée pour
-    garantir qu'un consommateur est toujours actif tant que le thread I/O
-    produit des items.  La cause racine du deadlock précédent : le worker
-    se re-soumettait uniquement sur _STOP, mais pouvait se trouver dans un
-    état où il attendait un work item du ThreadPoolExecutor (pas de notre
-    _io_queue) pendant que l'IO thread bloquait sur un put() de _io_queue
-    pleine.  Le nouveau design : le worker traite UN shard et se re-soumet
-    immédiatement avant de se terminer, garantissant la continuité du
-    pipeline.  L'IO_BUFFER passe de 2 à 4 pour absorber les variations de
-    timing en tests.
+[FIX-DEADLOCK-V2] Chaque worker d'extraction traite UN shard et se re-soumet
+    immédiatement avant de se terminer, garantissant qu'un consommateur est
+    toujours actif dans le ThreadPoolExecutor.  L'IO_BUFFER passe de 2 à 4.
 
 Quand utiliser cette source ?
 -----------------------------
 - Clusters avec Lustre lent et beaucoup de rangs par nœud (≥ 8).
 - Configurations GB200 NVL72 : 71 rangs lisent depuis ``/dev/shm``, un seul
-  lit depuis Lustre, ce qui réduit la pression réseau d'un facteur ~70×.
+  lit depuis Lustre, réduisant la pression réseau d'un facteur ~70×.
 - Entraînements longue durée où le cache atteint un régime permanent.
 
 Pour des cas plus simples (NVMe local, peu de rangs), voir ``wds_source.py``.
@@ -64,6 +61,7 @@ from dino_loader.augmentation import SampleMeta, SamplePredicate, SampleRecord
 from dino_loader.config import SharedExtractionPoolConfig
 from dino_loader.monitor.metrics import MetricField, get_registry
 from dino_loader.sources._weights import MixingWeights
+from dino_loader.sources.tar_utils import extract_jpegs_with_meta
 
 log = logging.getLogger(__name__)
 
@@ -95,17 +93,16 @@ class ShardIterator:
     """Cycling de shards par dataset avec double-buffering strict.
 
     Le ``ThreadPoolExecutor`` est injecté par ``MixingSource`` et partagé
-    entre tous les ``ShardIterator`` d'un même mix, ce qui borne le budget
-    total de threads à ``SharedExtractionPoolConfig.max_workers``.
+    entre tous les ``ShardIterator`` d'un même mix, bornant le budget total
+    de threads à ``SharedExtractionPoolConfig.max_workers``.
+
+    Les samples produits contiennent des bytes JPEG bruts (non décodés).
+    DALI les décode via nvjpeg sur GPU — le CPU ne décode jamais les images.
 
     [FIX-DEADLOCK-V2] Chaque worker d'extraction traite exactement UN shard
     puis se re-soumet avant de se terminer.  Cela garantit qu'un worker est
     toujours en file d'attente dans le ThreadPoolExecutor pour consommer le
-    prochain item de _io_queue, évitant le deadlock où _io_queue est pleine
-    mais aucun consommateur n'est actif.
-
-    L'IO_BUFFER est augmenté à 4 pour absorber les variations de timing sans
-    bloquer l'IO thread sur des petits shards (situation typique en tests).
+    prochain item de _io_queue.
 
     Args:
         spec: Spécification du dataset (shards, qualité, …).
@@ -220,8 +217,7 @@ class ShardIterator:
 
         self._io_thread.start()
         # [FIX-DEADLOCK-V2] Soumettre plusieurs workers initiaux pour garantir
-        # qu'un consommateur est toujours disponible même si l'un se termine
-        # avant que l'IO thread pousse le premier item.
+        # qu'un consommateur est toujours disponible.
         self._submit_extract()
         self._submit_extract()
 
@@ -230,7 +226,12 @@ class ShardIterator:
     # ------------------------------------------------------------------
 
     def next_sample(self) -> SampleRecord:
-        """Bloque jusqu'à ce qu'un sample passe tous les filtres, puis le retourne."""
+        """Bloque jusqu'à ce qu'un sample passe tous les filtres, puis le retourne.
+
+        Returns:
+            ``SampleRecord`` avec bytes JPEG bruts (non décodés).
+
+        """
         while not self._closed:
             try:
                 return self._sample_queue.get(block=True, timeout=0.1)
@@ -403,24 +404,15 @@ class ShardIterator:
         self._extract_futures.append(fut)
 
     def _extract_worker(self) -> None:
-        """Consomme UN shard depuis _io_queue, extrait ses samples, puis se re-soumet.
+        """Consomme UN shard depuis _io_queue, extrait ses samples, se re-soumet.
+
+        Les bytes JPEG extraits restent compressés : aucun décodage CPU.
+        DALI les décode via nvjpeg sur GPU.
 
         [FIX-DEADLOCK-V2] Chaque worker traite exactement un shard (ou _STOP)
-        et se re-soumet avant de se terminer. Cette invariant garantit qu'un
-        consommateur est toujours en file d'attente dans le ThreadPoolExecutor
-        pour le prochain item de _io_queue, même si le traitement du shard
-        courant prend du temps.
-
-        L'ancienne boucle while not self._closed avait un problème subtil :
-        si le worker terminait son timeout de 0.5s et sortait de la boucle
-        (ce qui ne devrait pas arriver normalement), plus aucun consommateur
-        n'était actif et l'IO thread se retrouvait bloqué sur put().
-
-        Ce nouveau design élimine complètement la boucle infinie dans le worker
-        et délègue la persistance du pipeline à la chaîne de re-soumissions.
+        et se re-soumet avant de se terminer, garantissant la continuité du
+        pipeline sans risque de deadlock.
         """
-        from dino_loader.datasets.utils import _extract_jpegs_with_meta  # noqa: PLC0415
-
         worker_id  = next(self._worker_counter)
         worker_rng = np.random.default_rng(
             self._seed + self._rank * 10007 + worker_id,
@@ -429,25 +421,18 @@ class ShardIterator:
         if self._closed:
             return
 
-        # Récupérer un item depuis _io_queue (timeout généreux pour éviter
-        # les faux départs au démarrage).
         try:
             item = self._io_queue.get(block=True, timeout=2.0)
         except queue.Empty:
-            # Pas d'item disponible ; re-soumettre pour rester actif tant que
-            # l'IO thread n'a pas signalé la fin.
             if not self._closed:
                 self._submit_extract()
             return
 
-        # [FIX-DEADLOCK-V2] Re-soumettre AVANT de traiter le shard actuel :
-        # cela garantit qu'un consommateur est disponible pour le prochain
-        # item pendant tout le temps de traitement du shard courant.
+        # [FIX-DEADLOCK-V2] Re-soumettre AVANT de traiter le shard courant.
         if not self._closed and not isinstance(item, _Sentinel):
             self._submit_extract()
 
         if isinstance(item, _Sentinel) or self._closed:
-            # Propager la sentinelle si d'autres workers attendent.
             if not self._closed:
                 try:
                     self._io_queue.put_nowait(_STOP)
@@ -458,10 +443,11 @@ class ShardIterator:
         shard_path, data = item
 
         try:
-            records = _extract_jpegs_with_meta(
-                memoryview(data),
-                metadata_key   = None,
-                min_quality    = None,
+            # extract_jpegs_with_meta retourne des SampleRecord avec bytes
+            # JPEG bruts (non décodés) — invariant critique de performance.
+            records = extract_jpegs_with_meta(
+                data           = memoryview(data),
+                min_quality    = None,   # filtrage fin via _passes_predicate
                 shuffle_buffer = self._shuffle_buffer_size,
                 rng            = worker_rng,
             )
@@ -508,7 +494,16 @@ class ShardIterator:
 class MixingSource:
     """Callback DALI ``ExternalSource`` mixant des samples de plusieurs datasets.
 
-    Appelée une fois par batch ; retourne une liste de ``np.ndarray`` (bytes JPEG).
+    Appelée une fois par batch ; retourne une liste de ``np.ndarray`` contenant
+    des bytes JPEG bruts (compressés).  DALI les décode via nvjpeg sur GPU.
+
+    Invariant critique
+    ------------------
+    ``__call__`` retourne des ``np.ndarray`` de dtype ``uint8`` contenant les
+    bytes JPEG compressés.  Le CPU ne décode **jamais** les images.  Décoder
+    sur CPU puis transférer des tenseurs denses vers GPU serait ≈ 10-50× plus
+    coûteux en bande passante PCIe et bloquerait les cœurs CPU pendant le
+    décodage.
 
     Pool d'extraction partagé
     --------------------------
@@ -520,7 +515,7 @@ class MixingSource:
     -----------------------
     ``__call__`` tient ``_rng_lock`` le moins longtemps possible : l'état RNG
     est copié sous lock, puis le draw ``np.random.choice`` s'effectue hors du
-    lock.  Cela évite de bloquer le thread DALI sur un draw potentiellement long.
+    lock.
 
     Args:
         specs: Liste ordonnée de spécifications de datasets.
@@ -603,20 +598,21 @@ class MixingSource:
         self._batch_count = 0
 
     def __call__(self) -> list[np.ndarray]:
-        """Retourne un batch de tableaux numpy de bytes JPEG (appelé par DALI).
+        """Retourne un batch de tableaux numpy de bytes JPEG compressés.
+
+        Les bytes JPEG ne sont pas décodés : DALI les décode via nvjpeg sur GPU.
 
         [PERF-LOCK] Le draw RNG s'effectue hors du lock pour ne pas bloquer
         le thread DALI pendant les N tirages.
 
         Returns:
-            Liste de ``batch_size`` tableaux numpy de dtype ``uint8``.
+            Liste de ``batch_size`` tableaux numpy de dtype ``uint8`` contenant
+            les bytes JPEG compressés.
 
         """
-        # Copier l'état RNG sous lock (O(1)), puis draw hors du lock.
         with self._rng_lock:
-            weights = self._weights.get()
-            rng_snapshot = np.random.default_rng(int(self._rng.integers(2**31)))
-        # Le draw lui-même — potentiellement coûteux — hors du lock.
+            weights       = self._weights.get()
+            rng_snapshot  = np.random.default_rng(int(self._rng.integers(2**31)))
         chosen_indices = rng_snapshot.choice(
             len(self._iters),
             size    = self._batch_size,
@@ -644,7 +640,6 @@ class MixingSource:
                 except Exception:  # noqa: BLE001
                     pass
 
-        # Métriques de queue échantillonnées 1/100 pour ne pas saturer le hot path.
         self._batch_count += 1
         if self._batch_count % 100 == 0:
             reg = get_registry()
@@ -656,13 +651,14 @@ class MixingSource:
                     if total_depth != current:
                         reg.inc(MetricField.MIXING_QUEUE_DEPTH, total_depth - current)
 
+        # Retourner les bytes JPEG compressés — ne jamais décoder sur CPU.
         return [np.frombuffer(rec.jpeg, dtype=np.uint8) for rec in records]
 
     def pop_last_metadata(self) -> list[dict | None]:
         """API de compatibilité — retourne une liste vide.
 
         L'alignement FIFO des métadonnées est géré par ``_ReaderAdapter``
-        dans ``shard_reader.py`` qui maintient sa propre queue.
+        dans ``shard_reader.py``.
         """
         return []
 

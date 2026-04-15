@@ -6,6 +6,14 @@ Ce module expose deux stratégies de lecture de shards WebDataset, toutes
 deux conformes à ``SourceProtocol`` et interchangeables du point de vue
 du reste du codebase.
 
+Invariant critique — bytes JPEG non décodés
+--------------------------------------------
+Toutes les sources retournent des bytes JPEG **bruts** (compressés) dans des
+``np.ndarray`` de dtype ``uint8``.  DALI les décode via nvjpeg (ASIC matériel
+GPU).  Le CPU ne décode **jamais** les images.  Ce contrat est fondamental pour
+la performance : décoder sur CPU puis transférer des tenseurs denses vers GPU
+serait ≈ 10-50× plus coûteux en bande passante PCIe.
+
 HPC source (``hpc_source``)
     Conçue pour les clusters HPC avec Lustre et beaucoup de rangs par nœud.
     Combine un cache ``/dev/shm`` (``NodeSharedShardCache``) avec un double-
@@ -16,6 +24,10 @@ WDS source (``wds_source``)
     Alternative basée sur ``webdataset``, plus simple, recommandée quand
     les shards sont déjà en mémoire rapide (NVMe local, Lustre MDS rapide)
     ou quand la simplicité prime sur la latence absolue.
+
+Utilitaires partagés
+    ``tar_utils`` — extraction de samples JPEG bruts depuis des archives tar
+    WebDataset.  Utilisé par ``hpc_source`` et testable de façon autonome.
 
 Interface commune
 -----------------
@@ -39,6 +51,7 @@ Exports publics
         MixingSource,
         WDSSource,
         WDSShardReaderNode,
+        extract_jpegs_with_meta,
     )
 """
 
@@ -46,6 +59,7 @@ from dino_loader.sources._weights import MixingWeights
 from dino_loader.sources.hpc_source import MixingSource, SampleRecord, ShardIterator
 from dino_loader.sources.protocol import SourceProtocol
 from dino_loader.sources.resolution import ResolutionSource
+from dino_loader.sources.tar_utils import extract_jpegs_with_meta
 from dino_loader.sources.wds_source import WDSShardReaderNode, WDSSource
 
 __all__ = [
@@ -57,4 +71,5 @@ __all__ = [
     "SourceProtocol",
     "WDSShardReaderNode",
     "WDSSource",
+    "extract_jpegs_with_meta",
 ]

@@ -3,33 +3,42 @@
 Source de données basée sur ``webdataset``, compatible avec l'interface de
 ``MixingSource``.
 
+Invariant critique — bytes JPEG non décodés
+--------------------------------------------
+``__call__`` retourne des bytes JPEG bruts (compressés) dans des ``np.ndarray``
+de dtype ``uint8``.  DALI les décode via nvjpeg (ASIC matériel GPU).
+
+La version précédente effectuait les opérations suivantes, **toutes incorrectes**:
+1. WDS décodait le JPEG avec PIL sur CPU (``decode("pil")``)
+2. PIL re-encodait l'image en JPEG (``img.save(..., format="JPEG")``)
+3. Les bytes re-encodés étaient transmis à DALI qui redécodait une troisième fois
+
+Ce triple décodage/ré-encodage était catastrophique :
+- Décodage CPU inutile : charge les cœurs CPU, ralentit le pipeline
+- Re-encodage avec perte (quality=95 ≠ original) : dégrade la qualité
+- Saturation PCIe avec des tenseurs denses (≈ 10-50× plus volumineux)
+- DALI re-décodait de toute façon côté GPU → travail triple pour rien
+
+La correction : WDS reste en mode "bytes bruts" (``decode(False)``), les
+bytes JPEG originaux sont transmis directement à DALI sans aucun décodage CPU.
+
 Motivation
 ----------
 ``MixingSource`` (``hpc_source.py``) est optimisée pour les clusters HPC avec
-Lustre lent et beaucoup de rangs par nœud : elle maintient un cache ``/dev/shm``
-et un double-buffering custom.  Cette complexité est justifiée quand 70+ rangs
-lisent depuis ``/dev/shm`` plutôt que depuis Lustre.
-
-``WDSSource`` est une alternative **plus simple** qui délègue le cycling, le
-shuffle et le mixing à ``webdataset``, en ajoutant uniquement le suivi des
-indices de dataset via ``IndexedRandomMixDataset`` (``_wds_mix.py``).
+Lustre lent et beaucoup de rangs par nœud.  ``WDSSource`` est une alternative
+**plus simple** qui délègue le cycling, le shuffle et le mixing à
+``webdataset``.
 
 Quand l'utiliser ?
 ------------------
 - Shards déjà en mémoire rapide (NVMe local, Lustre MDS rapide).
 - Peu de rangs par nœud (≤ 8).
 - Prototypage ou expériences où la simplicité prime.
-- Intégration avec ``torchdata.StatefulDataLoader`` via l'API WDS standard.
 
 Limites
 -------
 - Pas de cache ``/dev/shm`` : chaque rang lit directement depuis le filesystem.
 - ``set_weights()`` recrée l'itérateur (coût ~ms).
-
-Compatibilité avec ``ShardReaderNode``
----------------------------------------
-``WDSShardReaderNode`` expose la même interface que ``ShardReaderNode`` et peut
-être utilisé comme drop-in replacement dans ``_ReaderAdapter`` (``loader.py``).
 """
 
 import logging
@@ -38,12 +47,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 import numpy as np
-
-try:
-    import webdataset as wds
-    HAS_WDS = True
-except ImportError:
-    HAS_WDS = False
+import webdataset as wds
 
 from dino_datasets import DatasetSpec
 
@@ -55,16 +59,6 @@ log = logging.getLogger(__name__)
 _DEFAULT_SHUFFLE_BUFFER = 1000
 
 
-def _require_webdataset() -> None:
-    """Lève ``ImportError`` si ``webdataset`` n'est pas installé."""
-    if not HAS_WDS:
-        msg = (
-            "WDSSource requires the 'webdataset' library. "
-            "Install with: pip install webdataset"
-        )
-        raise ImportError(msg)
-
-
 # ---------------------------------------------------------------------------
 # WDSSource
 # ---------------------------------------------------------------------------
@@ -72,6 +66,9 @@ def _require_webdataset() -> None:
 
 class WDSSource:
     """Source de données basée sur ``webdataset``, compatible ``MixingSource``.
+
+    Retourne des bytes JPEG bruts (compressés) pour transmission à DALI.
+    Aucun décodage CPU n'est effectué.
 
     Args:
         specs:          Liste ordonnée de spécifications de datasets.
@@ -81,8 +78,8 @@ class WDSSource:
         seed:           Graine RNG de base.
         shuffle_buffer: Taille du buffer de shuffle WDS en nombre de samples.
         num_workers:    Nombre de workers WDS (0 = thread principal).
-        url_handler:    Handler URL personnalisé (ex. : client objet-store S3,
-            proxy vers le cache ``/dev/shm``). Si ``None``, lecture directe.
+        url_handler:    Handler URL personnalisé (ex. : proxy vers le cache
+            ``/dev/shm``). Si ``None``, lecture directe.
 
     """
 
@@ -98,7 +95,6 @@ class WDSSource:
         url_handler:    Callable[[str], Any] | None = None,
     ) -> None:
         """Initialise WDSSource."""
-        _require_webdataset()
 
         self._specs          = specs
         self._batch_size     = batch_size
@@ -117,7 +113,6 @@ class WDSSource:
         self._last_metadata:   list[dict | None] = []
         self._last_ds_indices: list[int] = []
 
-        # Pipeline WDS créé paresseusement au premier appel à __call__().
         self._iterator: Any | None  = None
         self._iter_lock = threading.Lock()
 
@@ -130,13 +125,17 @@ class WDSSource:
     ) -> Any:
         """Construit un pipeline WDS pour un seul dataset.
 
+        Le pipeline opère en mode bytes bruts : les JPEG ne sont pas décodés
+        sur CPU.  ``to_tuple("jpg;jpeg;png", "json")`` retourne les bytes
+        compressés tels quels depuis le tar.
+
         Args:
             spec:       Spécification du dataset.
             epoch_seed: Seed de base pour cette époque.
-            ds_index:   Index du dataset dans ``self._specs`` (pour le seed).
+            ds_index:   Index du dataset dans ``self._specs``.
 
         Returns:
-            Pipeline WDS (``webdataset.WebDataset``).
+            Pipeline WDS en mode bytes bruts, ou None si aucun shard assigné.
 
         """
         assigned_shards = [
@@ -167,39 +166,42 @@ class WDSSource:
         if self._url_handler is not None:
             pipe_kwargs["handler"] = self._url_handler
 
+        # CRITIQUE : decode(False) → bytes bruts, pas de décodage PIL sur CPU.
+        # Les bytes JPEG sont transmis à DALI qui les décode via nvjpeg sur GPU.
         pipeline = (
             wds.WebDataset(shard_source, **pipe_kwargs)
             .shuffle(self._shuffle_buffer, seed=epoch_seed + ds_index * 13)
-            .decode("pil")
+            .decode(False)                                # ← bytes bruts, pas PIL
             .to_tuple("jpg;jpeg;png", "json", handler=wds.warn_and_continue)
         )
 
         if spec.min_sample_quality is not None:
             min_quality = spec.min_sample_quality
-            pipeline = pipeline.select(
-                lambda sample, mq=min_quality: (
-                    sample[1].get("quality_score", 1.0) >= mq
-                    if sample[1] is not None else True
-                ),
-            )
+
+            def _quality_filter(sample: tuple) -> bool:
+                """Filtre qualité sur les bytes JSON bruts (avant décodage)."""
+                _, json_bytes = sample
+                if json_bytes is None:
+                    return True
+                try:
+                    import json  # noqa: PLC0415
+                    meta = json.loads(json_bytes)
+                    return meta.get("quality_score", 1.0) >= min_quality
+                except Exception:  # noqa: BLE001
+                    return True
+
+            pipeline = pipeline.select(_quality_filter)
 
         return pipeline
 
     def _build_pipeline(self, epoch: int) -> Any:
         """Construit le pipeline de mixing pour l'époque donnée.
 
-        Le seed est dérivé de l'époque pour garantir la reproductibilité :
-        même ``epoch`` + même ``seed`` → même ordre de shards et de samples.
-
-        Avec un seul dataset, retourne son itérateur directement en yielding
-        ``(sample, 0)``.  Avec plusieurs datasets, utilise
-        ``IndexedRandomMixDataset`` qui expose l'indice de dataset source.
-
         Args:
             epoch: Numéro d'époque (utilisé pour dériver le seed).
 
         Returns:
-            Itérateur de ``(sample, ds_index)``.
+            Itérateur de ``(jpeg_bytes, json_bytes_or_none, ds_index)``.
 
         Raises:
             RuntimeError: Si aucun shard n'est assigné à ce rang.
@@ -225,7 +227,6 @@ class WDSSource:
             raise RuntimeError(msg)
 
         if len(pipelines) == 1:
-            # Un seul dataset : wrap minimal pour exposer l'indice 0.
             return ((sample, 0) for sample in pipelines[0])
 
         mix = IndexedRandomMixDataset(
@@ -247,13 +248,17 @@ class WDSSource:
     # ------------------------------------------------------------------
 
     def __call__(self) -> list[np.ndarray]:
-        """Retourne un batch de tableaux numpy de bytes JPEG.
+        """Retourne un batch de tableaux numpy de bytes JPEG bruts (compressés).
+
+        Les bytes JPEG ne sont jamais décodés sur CPU.
+        DALI les décode via nvjpeg sur GPU.
 
         Returns:
-            Liste de ``batch_size`` tableaux numpy de dtype ``uint8``.
+            Liste de ``batch_size`` tableaux numpy de dtype ``uint8`` contenant
+            les bytes JPEG compressés.
 
         """
-        import io  # noqa: PLC0415
+        import json as _json  # noqa: PLC0415
 
         it = self._get_or_build_iterator()
 
@@ -270,12 +275,24 @@ class WDSSource:
                     it = self._iterator
                 sample, ds_idx = next(it)
 
-            img, meta = sample
+            # sample = (jpeg_bytes, json_bytes_or_none) en mode decode(False)
+            jpeg_bytes, json_bytes = sample
 
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=95)
-            jpegs.append(np.frombuffer(buf.getvalue(), dtype=np.uint8))
-            metadata.append(meta if isinstance(meta, dict) else None)
+            if jpeg_bytes is None:
+                continue
+
+            # Bytes JPEG bruts → np.ndarray uint8 pour DALI ExternalSource.
+            # Aucun décodage CPU — DALI fait le décodage GPU via nvjpeg.
+            jpegs.append(np.frombuffer(jpeg_bytes, dtype=np.uint8))
+
+            # Décoder le JSON sidecar (petit, peu coûteux) pour les métadonnées.
+            meta: dict | None = None
+            if json_bytes is not None:
+                try:
+                    meta = _json.loads(json_bytes)
+                except Exception:  # noqa: BLE001
+                    pass
+            metadata.append(meta)
             ds_indices.append(ds_idx)
 
         with self._lock:
@@ -288,12 +305,7 @@ class WDSSource:
         return jpegs
 
     def pop_last_metadata(self) -> list[dict | None]:
-        """Retourne les métadonnées du dernier :meth:`__call__`. Thread-safe.
-
-        Returns:
-            Copie de la liste des métadonnées du dernier batch.
-
-        """
+        """Retourne les métadonnées du dernier :meth:`__call__`. Thread-safe."""
         with self._lock:
             return list(self._last_metadata)
 
@@ -301,48 +313,24 @@ class WDSSource:
         self,
         cb: Callable[[list[int]], None],
     ) -> None:
-        """Enregistre un callback recevant les indices de dataset par sample.
-
-        Les indices sont exacts même avec plusieurs datasets : ils reflètent
-        le pipeline source réel dans ``IndexedRandomMixDataset``.
-
-        Args:
-            cb: Callable appelé avec ``list[int]`` après chaque batch.
-
-        """
+        """Enregistre un callback recevant les indices de dataset par sample."""
         self._ds_index_callbacks.append(cb)
 
     def set_epoch(self, epoch: int) -> None:
-        """Recrée le pipeline pour une nouvelle époque.
-
-        Args:
-            epoch: Numéro de la nouvelle époque.
-
-        """
+        """Recrée le pipeline pour une nouvelle époque."""
         with self._iter_lock:
             self._epoch    = epoch
             self._iterator = None
         log.debug("WDSSource: epoch set to %d, pipeline will be rebuilt.", epoch)
 
     def set_weights(self, weights: Sequence[float]) -> None:
-        """Met à jour les poids de mixage et recrée le pipeline.
-
-        Args:
-            weights: Nouveaux poids (re-normalisés automatiquement).
-
-        """
+        """Met à jour les poids de mixage et recrée le pipeline."""
         self._weights.set(weights)
         with self._iter_lock:
             self._iterator = None
 
     def set_by_name(self, name: str, weight: float) -> None:
-        """Met à jour le poids d'un dataset par son nom.
-
-        Args:
-            name:   Nom du dataset.
-            weight: Nouveau poids brut.
-
-        """
+        """Met à jour le poids d'un dataset par son nom."""
         self._weights.set_by_name(name, weight)
         with self._iter_lock:
             self._iterator = None
@@ -385,18 +373,15 @@ class WDSShardReaderNode:
         self._epoch  = 0
 
     def reset(self, initial_state: dict[str, Any] | None = None) -> None:
-        """Remet la source à zéro pour une nouvelle époque.
-
-        Args:
-            initial_state: État persisté optionnel (issu de :meth:`get_state`).
-
-        """
+        """Remet la source à zéro pour une nouvelle époque."""
         if initial_state is not None:
             self._epoch = initial_state.get("epoch", 0)
         self._source.set_epoch(self._epoch)
 
     def next(self) -> tuple[list[np.ndarray], list[dict | None]]:
-        """Retourne un batch ``(jpegs, metadata)``.
+        """Retourne un batch ``(jpegs_bytes, metadata)``.
+
+        Les bytes JPEG sont compressés — aucun décodage CPU.
 
         Returns:
             Tuple ``(liste de np.ndarray uint8, liste de dict | None)``.
@@ -407,12 +392,7 @@ class WDSShardReaderNode:
         return jpegs, metadata
 
     def get_state(self) -> dict[str, Any]:
-        """Retourne l'état persistable.
-
-        Returns:
-            Dict avec ``epoch``, ``mixing_weights``, ``dataset_names``.
-
-        """
+        """Retourne l'état persistable."""
         return {
             "epoch":          self._epoch,
             "mixing_weights": self._source.current_weights,
@@ -420,32 +400,16 @@ class WDSShardReaderNode:
         }
 
     def set_epoch(self, epoch: int) -> None:
-        """Avance à la nouvelle époque.
-
-        Args:
-            epoch: Numéro d'époque.
-
-        """
+        """Avance à la nouvelle époque."""
         self._epoch = epoch
         self._source.set_epoch(epoch)
 
     def set_weights(self, weights: list[float]) -> None:
-        """Met à jour les poids de mixage.
-
-        Args:
-            weights: Nouveaux poids bruts.
-
-        """
+        """Met à jour les poids de mixage."""
         self._source.set_weights(weights)
 
     def set_weight_by_name(self, name: str, weight: float) -> None:
-        """Met à jour le poids d'un dataset par son nom.
-
-        Args:
-            name:   Nom du dataset.
-            weight: Nouveau poids brut.
-
-        """
+        """Met à jour le poids d'un dataset par son nom."""
         self._source.set_by_name(name, weight)
 
     @property
