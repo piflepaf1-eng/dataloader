@@ -105,7 +105,7 @@ _INOTIFY_AVAILABLE: bool = True
 
 
 class _MmapEntry:
-    __slots__ = ("data_len", "fd", "mm", "refs", "pending_invalidate")
+    __slots__ = ("data_len", "fd", "mm", "pending_invalidate", "refs")
 
     def __init__(self, fd: int, mm: mmap.mmap, data_len: int) -> None:
         self.fd                = fd

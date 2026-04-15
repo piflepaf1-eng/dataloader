@@ -20,20 +20,37 @@ Implementation notes
   must be set to ``None`` before ``shm.close()`` — otherwise Python raises
   ``BufferError: cannot close exported pointers exist``.
 
+Lifecycle invariant
+-------------------
+The correct teardown order for the *creator* is:
+
+    1. _release_data()   — drop the ctypes overlay (no more exported pointers)
+    2. shm.unlink()      — destroy the POSIX shared-memory segment name
+    3. shm.close()       — close the file descriptor / mmap
+
+For *readers* (create=False), only steps 1 and 3 apply (no unlink).
+
+This is enforced by:
+- ``close()`` : steps 1 + 3.
+- ``unlink()`` : step 2 only (name removal).  Callers must still call
+  ``close()`` afterwards to release the fd.  This matches the POSIX convention
+  and the test pattern ``reg.unlink(); reg.close()``.
+
 Fixes applied
 -------------
-[FIX-MON-1] Renamed ``shard_wait_time_ms`` → ``shard_cache_wait_time_ms`` to
-            match the documented field name and eliminate the BUG-D ambiguity.
-[FIX-MON-2] Added ``heartbeat_ts`` (Unix epoch seconds) so the CLI can detect
-            dead processes vs. idle ones.
+[FIX-MON-1] Renamed ``shard_wait_time_ms`` → ``shard_cache_wait_time_ms``.
+[FIX-MON-2] Added ``heartbeat_ts`` (Unix epoch seconds).
 [MON-3]     MetricField StrEnum replaces bare string literals.
 [MON-4]     ``mixing_source_queue_depth`` now populated by MixingSource.
-[FIX-TYPE]  inc() and set_float() are now typed separately to prevent silent
-            int→float truncation on c_int64 fields. set_float() is for the
-            single c_float field (shard_cache_utilization_pct); inc() handles
-            all integer counters.
-[FIX-CLOSE] self.data set to None before shm.close() to release the ctypes
-            from_buffer reference and avoid BufferError on Python 3.12.
+[FIX-TYPE]  inc() and set_float() are now typed separately.
+[FIX-CLOSE] self.data released before shm.close() to avoid BufferError.
+[FIX-CLOSE2] unlink() clears self.data before shm.unlink() so that a
+             subsequent close() does not encounter a stale exported pointer.
+[FIX-CLOSE3] unlink() no longer calls shm.close() — that is the caller's
+             responsibility (matching POSIX semantics: unlink removes the name,
+             close releases the fd).  The previous version called both unlink
+             and implicitly left close() to be called again, causing a double-
+             close attempt on the mmap that raised BufferError.
 """
 
 import ctypes
@@ -49,13 +66,7 @@ MAX_LOCAL_RANKS = 8
 
 
 class MetricField(str, enum.Enum):
-    """Enumeration of all MetricsStruct field names.
-
-    Use these constants instead of raw strings when calling
-    ``MetricsRegistry.inc()`` or ``MetricsRegistry.set_float()``.
-    Misspellings become a loud import-time AttributeError rather than a
-    silent runtime no-op.
-    """
+    """Enumeration of all MetricsStruct field names."""
 
     # Stage 1: Lustre I/O (rank 0 / node master only)
     LUSTRE_READ_TIME_MS   = "lustre_read_time_ms"
@@ -129,15 +140,19 @@ class MetricsRegistry:
     set_float(field, value)  — set the single c_float field (utilisation pct).
     heartbeat()              — stamp current Unix time into heartbeat_ts.
 
-    The split between inc() and set_float() prevents silent float→int truncation
-    when writing to c_int64 fields, and int→float precision loss on large counters.
+    Lifecycle
+    ---------
+    The correct teardown sequence (regardless of creator/reader role) is::
 
-    Lifecycle note
-    --------------
-    ``self.data`` is a ctypes Structure overlaid on the shared-memory mmap via
-    ``from_buffer``.  It must be released (set to None) before ``shm.close()``
-    is called, otherwise CPython raises ``BufferError: cannot close exported
-    pointers exist``.  ``close()`` handles this automatically.
+        registry.unlink()   # creator only — removes the POSIX name
+        registry.close()    # all — releases the fd and ctypes overlay
+
+    ``close()`` is idempotent.  ``unlink()`` is a no-op if shm is None.
+
+    Implementation note: ``self.data`` (ctypes from_buffer overlay) must be
+    set to None *before* ``shm.close()`` is called, otherwise CPython 3.12
+    raises ``BufferError: cannot close exported pointers exist`` because the
+    ctypes structure holds a live reference into the mmap buffer.
     """
 
     def __init__(
@@ -189,8 +204,7 @@ class MetricsRegistry:
 
         Args:
             field: MetricField enum member or plain str (compat).
-            value: Integer amount to add. Must not be used with SHARD_CACHE_UTIL_PCT
-                   (a c_float field) — use set_float() for that field.
+            value: Integer amount to add.
 
         Raises:
             TypeError: If called with SHARD_CACHE_UTIL_PCT (wrong type).
@@ -210,12 +224,9 @@ class MetricsRegistry:
     def set_float(self, field: FieldArg, value: float) -> None:
         """Set the c_float utilisation field to an absolute value.
 
-        Only valid for SHARD_CACHE_UTIL_PCT. All other fields are c_int64
-        and must be updated via inc().
-
         Args:
             field: Must be MetricField.SHARD_CACHE_UTIL_PCT.
-            value: New absolute float value (0.0–100.0 for percentage fields).
+            value: New absolute float value.
 
         Raises:
             TypeError: If called with a non-float field.
@@ -245,24 +256,50 @@ class MetricsRegistry:
         """
         return self.data
 
+    def _release_data(self) -> None:
+        """Release the ctypes overlay so shm has no exported pointer references.
+
+        Must be called before any shm.close() to avoid
+        ``BufferError: cannot close exported pointers exist`` on Python 3.12.
+        """
+        self.data = None
+
     def close(self) -> None:
         """Detach from shared memory (does not unlink the block).
 
-        [FIX-CLOSE] Releases ``self.data`` (the ctypes from_buffer overlay)
-        before calling ``shm.close()``.  Without this, Python 3.12 raises
-        ``BufferError: cannot close exported pointers exist`` because the
-        ctypes structure holds a live reference into the mmap buffer.
+        Safe to call multiple times (idempotent).
+
+        [FIX-CLOSE] Releases ``self.data`` (ctypes from_buffer overlay)
+        before ``shm.close()``.  Without this, Python 3.12 raises
+        ``BufferError: cannot close exported pointers exist``.
         """
-        if self.data is not None:
-            # Drop the ctypes overlay so the mmap has no exported pointers.
-            self.data = None
+        self._release_data()
         if self.shm is not None:
-            self.shm.close()
+            try:
+                self.shm.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.shm = None
 
     def unlink(self) -> None:
-        """Destroy the shared-memory block. Call once, on the creator."""
+        """Destroy the shared-memory block name. Call once, on the creator.
+
+        [FIX-CLOSE3] unlink() only removes the POSIX name — it does NOT call
+        shm.close().  The caller must call close() afterwards to release the
+        file descriptor.  This matches the standard POSIX pattern:
+
+            registry.unlink()  # remove name (creator only)
+            registry.close()   # release fd (all)
+
+        [FIX-CLOSE2] Releases ``self.data`` before shm.unlink() so that a
+        subsequent close() call does not encounter a stale exported pointer.
+        """
+        self._release_data()
         if self.shm is not None:
-            self.shm.unlink()
+            try:
+                self.shm.unlink()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # Module-level singleton

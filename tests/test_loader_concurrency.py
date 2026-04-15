@@ -78,7 +78,12 @@ class TestSetEpochThreadSafety:
 
 
 class TestDoubleIterGuard:
-    """Starting __iter__ while already iterating must raise [FIX-ACTIVE-ITER]."""
+    """Starting __iter__ while already iterating must raise [FIX-ACTIVE-ITER].
+
+    Le test active le flag _active_iter manuellement pour simuler une itération
+    en cours sans avoir besoin que le loader produise réellement des batches
+    (ce qui serait lent et sujet aux timeouts sur les shards).
+    """
 
     def test_double_iter_raises_runtime_error(self, tmp_path):
         loader = _small_loader(tmp_path)
@@ -90,6 +95,7 @@ class TestDoubleIterGuard:
 
         try:
             with pytest.raises(RuntimeError, match="déjà en cours d'itération"):
+                # __iter__ doit lever immédiatement sans produire de batch.
                 iter(loader)
         finally:
             # Clean up so the loader doesn't stay locked.
@@ -97,18 +103,27 @@ class TestDoubleIterGuard:
                 loader._active_iter = False
 
     def test_iter_resets_guard_after_completion(self, tmp_path):
-        """After iteration ends, the guard must be cleared for re-use."""
+        """After iteration ends, the guard must be cleared for re-use.
+
+        [FIX] Le test ferme le générateur explicitement via .close() pour
+        déclencher le bloc finally de __iter__ qui remet _active_iter à False.
+        On ne consomme pas de batch pour ne pas bloquer sur les shards.
+        """
         loader = _small_loader(tmp_path)
         loader.set_epoch(0)
 
-        # Consume one batch only — then stop early.
-        it = loader.__iter__()
-        try:
-            next(it)
-        except StopIteration:
-            pass
+        # Vérifier que le flag est bien False initialement.
+        with loader._active_iter_lock:
+            assert not loader._active_iter
 
-        # Force exit from the generator to trigger the finally block.
+        # Démarrer une itération et la fermer immédiatement.
+        it = loader.__iter__()
+
+        # Le flag doit être True pendant l'itération.
+        with loader._active_iter_lock:
+            assert loader._active_iter, "Guard should be True while iterating"
+
+        # Fermer le générateur déclenche le finally qui remet le flag à False.
         it.close()
 
         with loader._active_iter_lock:
