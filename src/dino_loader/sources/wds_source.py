@@ -45,6 +45,7 @@ import logging
 import threading
 from collections.abc import Callable, Sequence
 from typing import Any
+import json
 
 import numpy as np
 import webdataset as wds
@@ -184,7 +185,6 @@ class WDSSource:
                 if json_bytes is None:
                     return True
                 try:
-                    import json  # noqa: PLC0415
                     meta = json.loads(json_bytes)
                     return meta.get("quality_score", 1.0) >= min_quality
                 except Exception:  # noqa: BLE001
